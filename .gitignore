@@ -1,0 +1,12 @@
+# Whitelist: only the agent itself is tracked. Everything else in the
+# working tree (RetroPatch reference code, experiments, docs, receipts,
+# virtualenvs, run outputs) stays out of this repository.
+/*
+!/aosp_agent
+!/scripts
+!/README.md
+aosp_agent/**/__pycache__/
+aosp_agent/oracles/
+**/__pycache__/
+*.pyc
+!/.gitignore

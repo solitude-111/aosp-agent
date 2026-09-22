@@ -1,0 +1,9 @@
+{
+  "validated_at": "2026-09-14",
+  "source": "portgpt:/data/junjie/aosp",
+  "checks": [
+    {"cve": "CVE-2025-48550", "repository": "frameworks/base", "source_commit": "5f0874dde8c0572e078ebb9d74d8f891e3103175", "source_parent": "2d2c1fa2213b9032689512741b07c1d181047972", "target_commit": "cebf5c06997b64f4e47a1611edb5f97044509d76", "status": "PASS"},
+    {"cve": "CVE-2025-48595", "repository": "external/sqlite", "source_commit": "aaebce3d8fd545d05f16cc9a137f22da8cad52c8", "source_parent": "1612b56a5b4092f8256dfaa2096e9680d3f47f98", "target_commit": "734246b3029d245d6e5f9649f36acaf5ed36581d", "status": "PASS"},
+    {"cve": "CVE-2025-48533", "repository": "frameworks/base", "source_commit": "4cf89bd148795ef1d83c45497c96c5330b4f96ba", "source_parent": "7e8e08a4614f60190eda167a5ba335dffcf45ad6", "target_commit": "cebf5c06997b64f4e47a1611edb5f97044509d76", "status": "PASS"}
+  ]
+}

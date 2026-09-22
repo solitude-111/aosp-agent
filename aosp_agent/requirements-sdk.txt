@@ -1,0 +1,3 @@
+# Official Python SDK includes its pinned Codex CLI; do not replace a user's CLI.
+openai-codex==0.154.0
+jsonschema>=4.23,<5
