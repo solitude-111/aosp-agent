@@ -16,6 +16,7 @@ from .case import Case, validate_relative_path
 from .discovery import Locator, diff_units, local_git, repositories
 from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt, migration_prompt
 from .engine import AospBackportAgent, AssessmentError
+from .glm_runtime import DEFAULT_GLM_MODEL
 from .prompts import SYSTEM
 
 
@@ -43,10 +44,12 @@ def _excerpt(lines, evidence):
 
 
 class DiffBackportAgent:
-    def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model='gpt-5.6-sol',
-                 model_provider=None, turn_timeout=900, runtime_factory=None, validation=None):
+    def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model=DEFAULT_GLM_MODEL,
+                 model_provider=None, turn_timeout=900, runtime_factory=None, validation=None,
+                 api_base_url=None, api_key_env=None):
         self.patch_bytes = patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
+        self.target_root = target_root.resolve()
         self.units = diff_units(self.diff)
         self.digest = hashlib.sha256(self.patch_bytes).hexdigest()
         self.task_id = 'patch-' + self.digest[:16]
@@ -56,7 +59,9 @@ class DiffBackportAgent:
         if any(self.run_dir.is_relative_to(r.root) for r in self.repos):
             raise ValueError('run directory must be outside original repositories')
         self.workspace = self.run_dir / 'workspace'
-        self.model, self.provider, self.timeout = model, model_provider or os.environ.get('AOSP_AGENT_MODEL_PROVIDER'), turn_timeout
+        self.model, self.provider, self.timeout = model, model_provider or 'bigmodel', turn_timeout
+        self.api_base_url = api_base_url or os.environ.get('AOSP_AGENT_GLM_BASE_URL')
+        self.api_key_env = api_key_env or os.environ.get('AOSP_AGENT_GLM_API_KEY_ENV') or 'GLM_API_KEY'
         self.factory, self.validation = runtime_factory, validation or {}
         unknown = set(self.validation) - set(self.by_key)
         if unknown:
@@ -64,7 +69,7 @@ class DiffBackportAgent:
         self.before = {r.key: r.state() for r in self.repos}
         self.children = {}
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZED',
-                       'backend': 'codex_sdk', 'model': model, 'model_execution': 'not_run',
+                       'backend': 'glm_api', 'model': model, 'model_execution': 'not_run',
                        'impact_decision': 'UNKNOWN', 'patch_replay': 'not_run',
                        'verification_scope': 'configured_commands_only', 'runtime_security_proven': False,
                        'android_module_build': 'NOT_CONFIGURED', 'android_runtime': 'NOT_CONFIGURED',
@@ -188,19 +193,20 @@ class DiffBackportAgent:
 
     def _runtime(self, name):
         if self.factory is None:
-            from .sdk_runtime import CodexRuntime
-            factory = CodexRuntime
+            from .glm_runtime import GLMRuntime
+            factory = GLMRuntime
         else:
             factory = self.factory
-        return factory(events_path=self.run_dir / f'sdk-{name}.jsonl', model=self.model,
+        return factory(events_path=self.run_dir / f'glm-{name}.jsonl', model=self.model,
                        model_provider=self.provider, turn_timeout=self.timeout,
-                       env={'GIT_NO_LAZY_FETCH': '1'})
+                       api_base_url=self.api_base_url, api_key_env=self.api_key_env,
+                       env={'GIT_NO_LAZY_FETCH': '1', 'AOSP_AGENT_ENABLE_SEARCH': '1'})
 
     def _turn(self, runtime, prompt, schema, *, read_only):
         result = runtime.run(prompt, read_only=read_only, output_schema=schema)
         self._audit()
         if result.get('status') != 'completed':
-            raise RuntimeError(f'SDK turn did not complete: {result.get("status")}')
+            raise RuntimeError(f'GLM turn did not complete: {result.get("status")}')
         self.record.setdefault('turns', []).append({k: result.get(k) for k in ('thread_id', 'turn_id', 'usage', 'events_path')})
         return json.loads(result['final_response'])
 
@@ -292,7 +298,7 @@ class DiffBackportAgent:
             if inspect_only:
                 return self.record
             with self._runtime('assessment') as runtime:
-                runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
+                runtime.start(self.target_root, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
                 prompt = assessment_prompt(self.diff, inventory, location)
                 for attempt in range(1, max_attempts + 1):
                     raw = self._turn(runtime, prompt, ASSESSMENT_SCHEMA, read_only=True)

@@ -1,4 +1,4 @@
-"""Small, local Git fixtures for orchestration tests; no SDK calls or vulnerability PoCs."""
+"""Small, local Git fixtures for orchestration tests; no model calls or vulnerability PoCs."""
 from __future__ import annotations
 
 import json
