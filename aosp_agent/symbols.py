@@ -103,7 +103,7 @@ def locate_in_revision(repo_args: list[str], revision: str, name: str, limit: in
         candidate = Path(repo_args[1])
         cwd = candidate if candidate.is_dir() else None
     result = local_git(cwd or Path.cwd(), *repo_args, "grep", "-n", "-I", "-w", "-F",
-                       "-e", name, "--", revision, *pathspecs, check=False, timeout=timeout)
+                       "-e", name, revision, "--", *pathspecs, check=False, timeout=timeout)
     if result.returncode not in (0, 1):
         return {"name": name, "found": False, "matches": [], "error": result.stderr[-400:]}
     matches = []

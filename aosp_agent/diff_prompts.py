@@ -45,6 +45,14 @@ KNOWLEDGE = '''AOSP investigation guide (hypotheses, never reference answers):
 - A new helper in the diff may express protection that belongs inside an old function. A missing name
   may be renamed, moved across repositories, split, merged or inlined. Compare callers, fields,
   constants, control flow and local history; file/name similarity alone proves nothing.
+- A security-policy deletion can be a conflict-resolution change rather than removal of protection:
+  newer code may delete a caller-side service registration because a connection helper now owns the
+  requirement. If the old target moved that policy into a helper, inspect whether the old caller still
+  writes or clears process-global security state keyed by an identifier shared with unrelated
+  connections. Such cross-connection mutation is an editable relocation, not proof of feature absence.
+  A map keyed only by a service channel (without peer address, DLCI, port handle, or another
+  connection-owner key) remains process-global shared state; do not describe it as per-connection
+  protection merely because it is referenced through RFCOMM.
 - Enumerate every change unit, including new/deleted files, tests and configuration. Explain dependencies
   between units. Equivalent existing protection is ALREADY_FIXED. NOT_AFFECTED requires affirmative
   target evidence about the feature/call path; failed search or missing Git objects is not absence.
@@ -105,6 +113,9 @@ behavior. Apply the protection across all mapped old functions, including splits
 implementations, vendored copies, new dependencies, tests and configuration described in the plan.
 Do not mechanically copy donor hunk contexts or skip a missing function. If the plan proves insufficient,
 return unresolved coverage and explain the missing mapping; do not edit outside the allowlist.
+When the donor deletes caller-side security registration because the target-version helper owns the
+requirement, preserve the helper call that carries sec_mask and remove only incompatible old caller-side
+bookkeeping that mutates or clears shared security state for other connections.
 
 The controller will generate patches and independently replay them on fresh target worktrees. Runtime
 validation is NOT_CONFIGURED unless explicit controller checks are present; do not claim test PASS.

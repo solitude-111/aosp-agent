@@ -169,6 +169,33 @@ class DiffWorkflowTest(unittest.TestCase):
             self.assertEqual(result['status'], 'ALREADY_FIXED')
             self.assertFalse(agent.workspace.exists())
 
+    def test_shared_rfcomm_security_record_cannot_prove_already_fixed(self):
+        with GitFixture() as fx:
+            target = 'def normalize_count(value):\n    rfcomm_security_records[scn] = sec_mask\n    return value\n'
+            before = 'def normalize_count(value):\n    BTM_SetSecurityLevel(sec_mask)\n    return value\n'
+            after = 'def normalize_count(value):\n    return value\n'
+            (fx.repo / 'counter.py').write_text(target)
+            git(fx.repo, 'add', 'counter.py')
+            git(fx.repo, 'commit', '-qm', 'old shared rfcomm security record')
+            agent = self.agent(fx, patch=diff('new/security.py', before, after))
+            raw = self.assessment(agent, 'ALREADY_FIXED')
+            raw['units'][0]['absence_basis'] = 'equivalent_protection'
+            raw['units'][0]['targets'][0]['action'] = 'read_dependency'
+            raw['units'][0]['targets'][0]['line_end'] = 3
+            raw['units'][0]['evidence'][0]['line_end'] = 3
+            raw['units'][0]['evidence'][0]['excerpt'] = target.strip()
+            raw['units'][0]['evidence'][1]['excerpt'] = after.strip()
+            with self.assertRaisesRegex(AssessmentError, 'shared only by SCN'):
+                agent.ground(raw)
+
+    def test_interior_function_mapping_is_normalized_to_symbol_boundary(self):
+        with GitFixture() as fx:
+            agent = self.agent(fx)
+            raw = self.assessment(agent)
+            raw['units'][0]['targets'][0]['line_start'] = 2
+            raw['units'][0]['targets'][0]['line_end'] = 2
+            self.assertEqual(agent.ground(raw)['writable_paths'], ['repo/counter.py'])
+
     def test_model_can_map_one_unit_to_split_functions(self):
         with GitFixture() as fx:
             (fx.repo / 'second.py').write_text(BASELINE.replace('normalize_count', 'normalize_other_count'))

@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 
 from .case import Case, validate_relative_path
-from .discovery import Locator, diff_units, local_git, repositories
+from .discovery import Locator, diff_units, functions, local_git, repositories
 from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt, migration_prompt
 from .engine import AospBackportAgent, AssessmentError
 from .glm_runtime import DEFAULT_GLM_MODEL
@@ -41,6 +41,17 @@ def _excerpt(lines, evidence):
         raise AssessmentError(f'invalid range: {evidence["path"]}:{start}-{end}')
     if '\n'.join(lines[start - 1:end]).strip() != evidence['excerpt'].strip():
         raise AssessmentError(f'excerpt mismatches exact range: {evidence["path"]}:{start}-{end}')
+
+
+def _claims_relocated_bt_security_is_fixed(unit, item):
+    deleted_security_policy = any('BTM_SetSecurityLevel' in line for line in unit['before'].values())
+    target_uses_shared_rfcomm_record = any(
+        evidence['origin'] == 'target' and (
+            'rfcomm_security_records[' in evidence['excerpt']
+            or 'RFCOMM_ClearSecurityRecord(' in evidence['excerpt']
+        ) for evidence in item['evidence']
+    )
+    return deleted_security_policy and target_uses_shared_rfcomm_record
 
 
 class DiffBackportAgent:
@@ -123,12 +134,19 @@ class DiffBackportAgent:
                 raise AssessmentError('unsupported change units require UNKNOWN')
             for target in item['targets']:
                 repo, path = self._owner(target['path'])
-                lines = repo.read(path).splitlines()
+                content = repo.read(path)
+                lines = content.splitlines()
                 start, end = target['line_start'], target['line_end']
                 if start < 1 or end < start or end > len(lines):
                     raise AssessmentError(f'invalid target mapping range: {target["path"]}')
                 if target['relationship'] not in ('dependency', 'test', 'data_or_configuration'):
                     symbol = re.split(r'[.#]|::', target['symbol'])[-1]
+                    function_ranges = [function for function in functions(content, Path(path).suffix)
+                                       if function['symbol'] == symbol
+                                       and function['line_start'] <= start <= end <= function['line_end']]
+                    if function_ranges:
+                        start, end = target['line_start'], target['line_end'] = (
+                            function_ranges[0]['line_start'], function_ranges[0]['line_end'])
                     if (not re.fullmatch(r'[A-Za-z_$][\w$]*', symbol)
                             or not re.search(r'\b' + re.escape(symbol) + r'\s*\(', '\n'.join(lines[start - 1:end]))):
                         raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
@@ -159,6 +177,11 @@ class DiffBackportAgent:
                 origins = {e['origin'] for e in item['evidence']}
                 if 'target' not in origins or not origins & {'patch_before', 'patch_after'}:
                     raise AssessmentError('determinate unit requires target AND diff evidence')
+            if item['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED') and _claims_relocated_bt_security_is_fixed(unit, item):
+                raise AssessmentError(
+                    'BTM security relocation cannot be declared unaffected when cited target state is an '
+                    'RFCOMM record shared only by SCN; map the incompatible caller-side lifecycle for editing'
+                )
             if item['status'] == 'NOT_AFFECTED':
                 if item['absence_basis'] != 'feature_absent':
                     raise AssessmentError('equivalent protection belongs to ALREADY_FIXED; absence requires feature_absent')
