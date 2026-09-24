@@ -19,7 +19,8 @@ def main() -> int:
                       help="standalone target Git checkout or AOSP root containing Git checkouts; pins each HEAD")
     diff.add_argument("--run-root", type=Path, default=Path("runs/diff-input"))
     diff.add_argument("--inspect-only", action="store_true")
-    diff.add_argument("--model", default="gpt-5.6-sol")
+    diff.add_argument("--model", default=None,
+                      help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
     diff.add_argument("--model-provider")
     diff.add_argument("--turn-timeout", type=float, default=900)
     diff.add_argument("--max-attempts", type=int, default=3)
@@ -31,7 +32,8 @@ def main() -> int:
     run.add_argument("--source-root", type=Path, required=True)
     run.add_argument("--run-root", type=Path, required=True)
     run.add_argument("--donor-root", type=Path, help="directory containing <repo-path with slashes replaced by hyphens>.git")
-    run.add_argument("--model", default="gpt-5.6-sol")
+    run.add_argument("--model", default=None,
+                     help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
     run.add_argument("--model-provider", help="Codex model provider id, or AOSP_AGENT_MODEL_PROVIDER")
     run.add_argument("--no-codex", "--inspect-only", dest="no_codex", action="store_true",
                      help="prepare and inspect without starting a model; reports PREPARED")

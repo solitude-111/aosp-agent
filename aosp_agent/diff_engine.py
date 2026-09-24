@@ -43,7 +43,7 @@ def _excerpt(lines, evidence):
 
 
 class DiffBackportAgent:
-    def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model='gpt-5.6-sol',
+    def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model=None,
                  model_provider=None, turn_timeout=900, runtime_factory=None, validation=None):
         self.patch_bytes = patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
@@ -64,7 +64,7 @@ class DiffBackportAgent:
         self.before = {r.key: r.state() for r in self.repos}
         self.children = {}
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZED',
-                       'backend': 'codex_sdk', 'model': model, 'model_execution': 'not_run',
+                       'backend': 'codex_sdk', 'model': model or 'codex_config_default', 'model_execution': 'not_run',
                        'impact_decision': 'UNKNOWN', 'patch_replay': 'not_run',
                        'verification_scope': 'configured_commands_only', 'runtime_security_proven': False,
                        'android_module_build': 'NOT_CONFIGURED', 'android_runtime': 'NOT_CONFIGURED',
@@ -202,7 +202,12 @@ class DiffBackportAgent:
         if result.get('status') != 'completed':
             raise RuntimeError(f'SDK turn did not complete: {result.get("status")}')
         self.record.setdefault('turns', []).append({k: result.get(k) for k in ('thread_id', 'turn_id', 'usage', 'events_path')})
-        return json.loads(result['final_response'])
+        # Prefer the runtime's parsed (possibly tail-repaired) structured output;
+        # fall back to parsing the raw text for runtimes that omit it.
+        output = result.get('output')
+        if output is None:
+            output = json.loads(result['final_response'])
+        return output
 
     def _prepare_children(self, assessment):
         # Read dependencies in the same workspace; only AFFECTED mappings/new files become writable.

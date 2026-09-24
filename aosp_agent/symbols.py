@@ -103,7 +103,8 @@ def locate_in_revision(repo_args: list[str], revision: str, name: str, limit: in
         candidate = Path(repo_args[1])
         cwd = candidate if candidate.is_dir() else None
     result = local_git(cwd or Path.cwd(), *repo_args, "grep", "-n", "-I", "-w", "-F",
-                       "-e", name, "--", revision, *pathspecs, check=False, timeout=timeout)
+                       "-e", name, *([revision] if revision else []), "--", *pathspecs,
+                       check=False, timeout=timeout)
     if result.returncode not in (0, 1):
         return {"name": name, "found": False, "matches": [], "error": result.stderr[-400:]}
     matches = []
@@ -127,9 +128,9 @@ def _harvest_candidates(repo_args: list[str], revision: str, name: str, *,
     if len(name) < 4:
         return []
     stem = re.escape(name[:4])
-    result = local_git(cwd or Path.cwd(), *repo_args, "grep", "h", "-o", "-I", "-E",
-                       "-e", rf"\b{stem}\w+", "--", revision, *DEFAULT_PATHSPECS,
-                       check=False, timeout=45)
+    result = local_git(cwd or Path.cwd(), *repo_args, "grep", "-h", "-o", "-I", "-E",
+                       "-e", rf"\b{stem}\w+", *([revision] if revision else []),
+                       "--", *DEFAULT_PATHSPECS, check=False, timeout=45)
     if result.returncode not in (0, 1):
         return []
     return result.stdout.split()[:2000]

@@ -31,7 +31,7 @@ class AssessmentError(ValueError):
 class AospBackportAgent:
     """Run independent AOSP impact assessment and a guarded SDK backport."""
 
-    def __init__(self, source_root: Path, run_root: Path, case: Case, model: str = "gpt-5.6-sol",
+    def __init__(self, source_root: Path, run_root: Path, case: Case, model: str | None = None,
                  donor_root: Path | None = None, model_provider: str | None = None,
                  api_base_url: str | None = None, api_key_env: str | None = None, *,
                  runtime_factory: Callable | None = None, turn_timeout: float = 900,
@@ -68,7 +68,7 @@ class AospBackportAgent:
         self._last_audit: dict[str, Any] | None = None
         self._events_swept = 0
         self.record: dict[str, Any] = {"cve": case.cve, "status": "INITIALIZED", "backend": "codex_sdk",
-            "model": model, "events": [], "verification_scope": "configured_commands_only",
+            "model": model or "codex_config_default", "events": [], "verification_scope": "configured_commands_only",
             "runtime_security_proven": False,
             "model_execution": "not_run", "impact_decision": "uncertain",
             "source_review": "not_run", "patch_replay": "not_run",
@@ -500,7 +500,10 @@ class AospBackportAgent:
                                     schema=IMPACT_SCHEMA)
                 self.record["impact_report"] = result.get("final_response", "")
                 try:
-                    assessment = self._ground_assessment(result["final_response"])
+                    # Prefer the runtime's parsed (possibly tail-repaired) object;
+                    # re-parsing the raw text would bypass that repair.
+                    assessment = self._ground_assessment(result.get("output",
+                                                                    result["final_response"]))
                     break
                 except AssessmentError as exc:
                     self._event("impact_evidence_rejected", attempt=impact_attempt, error=str(exc))
@@ -548,12 +551,29 @@ class AospBackportAgent:
             diagnosis_json: dict[str, Any] | None = None
             claim_feedback: str | None = None
             failing_stages: list[str] = []
+            previous_patch_shas: list[str] = []
             for attempt, level in enumerate(plan, 1):
                 self.record["attempt"] = attempt
                 prompt = base_prompt + "\n" + (strategy_prompt(
                     level["index"], {**ladder_ctx, "diagnosis_json": diagnosis_json,
                                      "claim_feedback": claim_feedback,
                                      "failing_stages": failing_stages}) or "")
+                if diagnosis_json is not None:
+                    # The structured diagnosis must ride EVERY retry strategy,
+                    # not only T2: without it the model never sees which
+                    # javac/grep failure to fix and re-exports identical
+                    # patches (mb-007 lesson: three byte-identical candidates).
+                    rendered = json.dumps(diagnosis_json, ensure_ascii=False)
+                    prompt += ("\nStructured diagnosis of the verification failures your LAST "
+                               "candidate must fix (controller's independent checks):\n"
+                               + (rendered if len(rendered) < 12000 else
+                                  json.dumps({"summary": diagnosis_json.get("summary", ""),
+                                              "truncated": True}, ensure_ascii=False))
+                               + "\n")
+                if len(previous_patch_shas) >= 2 and previous_patch_shas[-1] == previous_patch_shas[-2]:
+                    prompt += ("\nIMPORTANT: your previous two turns produced byte-identical patches, "
+                               "so every failure above is still unfixed. Re-submitting the same files "
+                               "cannot pass. You MUST actually change the workspace this turn.\n")
                 result = self._turn(runtime, prompt, read_only=False,
                                     phase=f"backport_{level['strategy']}")
                 self.record.setdefault("backport_reports", []).append(result.get("final_response", ""))
@@ -562,6 +582,7 @@ class AospBackportAgent:
                      "patch_sha256": None})
                 patch = self.export_patch(attempt)
                 self.record["attempts"][-1]["patch_sha256"] = self.record["patch_sha256"]
+                previous_patch_shas.append(self.record["patch_sha256"])
                 if not patch.strip():
                     raise RuntimeError("AFFECTED assessment produced no actual patch")
                 claims = self._check_hunk_results(result.get("final_response", ""),

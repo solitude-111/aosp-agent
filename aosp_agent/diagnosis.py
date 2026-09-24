@@ -101,9 +101,13 @@ def apply_diagnosis(hunk: dict[str, Any], worktree_error: str,
 def verification_diagnosis(checks: list[dict[str, Any]]) -> dict[str, Any]:
     """Distill verify() command results into a structured diagnosis (R13 port).
 
-    {"stage_results": [{"stage", "returncode", "error_lines", "log_tail",
-                        "missing_artifacts", "symbols"}],
+    {"stage_results": [{"stage", "returncode", "argv" (failed checks only),
+                        "error_lines", "log_tail", "missing_artifacts", "symbols"}],
      "summary": str}
+
+    Silent commands (grep -q, test -f) fail without any output; for those the
+    failing argv is the only actionable fact, so it is included in both the
+    per-stage entry and the summary sentence the model reads.
     """
     stage_results = []
     all_symbols: list[str] = []
@@ -111,6 +115,7 @@ def verification_diagnosis(checks: list[dict[str, Any]]) -> dict[str, Any]:
     for check in checks:
         code = check.get("returncode", 0)
         stage = check.get("stage", "configured")
+        argv = list(check.get("argv") or [])
         combined = ((check.get("stdout") or "") + "\n" + (check.get("stderr") or "")).splitlines()
         error_lines = [line for line in combined if _ERROR_LINE_RE.search(line)][:40]
         symbols = []
@@ -124,15 +129,22 @@ def verification_diagnosis(checks: list[dict[str, Any]]) -> dict[str, Any]:
                              if not item.get("exists")]
         entry = {"stage": stage, "returncode": code, "error_lines": error_lines,
                  "missing_artifacts": missing_artifacts, "symbols": symbols}
+        if code:
+            entry["argv"] = argv
         if code and not error_lines and not missing_artifacts:
             # r2 revision 5: never hand the model an empty diagnosis.
             entry["log_tail"] = "\n".join(combined[-_LOG_TAIL_LINES:])
         stage_results.append(entry)
         if code:
             all_symbols.extend(symbols)
-            detail = error_lines[0] if error_lines else (
-                f"missing artifacts: {', '.join(missing_artifacts)}" if missing_artifacts
-                else "see the log tail excerpt")
+            if error_lines:
+                detail = error_lines[0]
+            elif missing_artifacts:
+                detail = f"missing artifacts: {', '.join(missing_artifacts)}"
+            elif argv:
+                detail = f"command failed with no diagnostic output: {' '.join(argv)}"
+            else:
+                detail = "see the log tail excerpt"
             sentences.append(f"Stage '{stage}' failed (exit {code}): {detail[:200]}.")
     failed = [entry for entry in stage_results if entry["returncode"]]
     if not failed:

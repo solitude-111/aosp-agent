@@ -31,15 +31,25 @@ class CodexRuntime:
     """One Codex conversation with explicit sandbox changes and durable events.
 
     ``output`` is parsed and schema-validated JSON if output_schema is supplied;
-    otherwise it is the final response text. Errors never become success results.
+    otherwise it is the final response text. When structured output is requested
+    and the reply fails JSON parsing or schema validation, exactly one
+    corrective re-ask is issued (same sandbox mode) before INVALID_OUTPUT is
+    raised — a malformed reply is a transport defect, not a spent attempt.
+    Errors never become success results.
     Timeout closes the runtime; construct a new instance for a later attempt.
     Environment overrides are passed to the SDK, never written to disk or logged.
+
+    ``model``, ``model_provider`` and ``reasoning_effort`` default to None,
+    meaning "not specified": the SDK then falls back to the Codex config
+    (~/.codex/config.toml), which is where the GLM backend (ZAI provider,
+    e.g. glm-5.3 with model_reasoning_effort) is selected and authenticated.
+    Pass them explicitly only to override the config for one run.
     """
 
-    def __init__(self, events_path: Path, model: str = "gpt-5.6-sol",
+    def __init__(self, events_path: Path, model: str | None = None,
                  model_provider: str | None = None, turn_timeout: float = 900,
                  codex_path: str | None = None, env: dict[str, str] | None = None,
-                 reasoning_effort: str | None = "low"):
+                 reasoning_effort: str | None = None):
         if turn_timeout <= 0:
             raise ValueError("turn_timeout must be positive")
         self.events_path = Path(events_path).resolve()
@@ -101,9 +111,11 @@ class CodexRuntime:
         self._cwd = Path(cwd).resolve()
         if not self._cwd.is_dir():
             raise ValueError("cwd must be an existing directory")
-        kwargs = dict(cwd=str(self._cwd), base_instructions=instructions, model=self.model,
+        kwargs = dict(cwd=str(self._cwd), base_instructions=instructions,
                       sandbox=self._sandbox.read_only, approval_mode=self._approval,
                       ephemeral=True)
+        if self.model:
+            kwargs["model"] = self.model
         if self.model_provider:
             kwargs["model_provider"] = self.model_provider
         self._thread = self._call(self._codex.thread_start(**kwargs),
@@ -131,26 +143,74 @@ class CodexRuntime:
                   sandbox="read_only" if read_only else "workspace_write",
                   output_schema=output_schema)
         result = self._call(self._consume(prompt, read_only, output_schema), timeout=self.turn_timeout)
-        try:
-            output = json.loads(result["final_response"]) if output_schema is not None else result["final_response"]
-            if validator is not None:
-                validator.validate(output)
-        except Exception as exc:
-            error = CodexRuntimeError("Codex output does not satisfy the requested JSON schema: "
-                                      + str(exc), kind="INVALID_OUTPUT", details=result)
-            self._log("runtime_error", kind=error.kind, message=str(error))
-            raise error from exc
+        output, failure = self._validated_output(result, output_schema, validator)
+        if failure is not None:
+            # One corrective re-ask: a malformed structured reply is a
+            # transport-level defect (e.g. a closing-brace slip), not a
+            # reasoned answer, so it must not consume the caller's retry
+            # budget or kill the run. Second failure is terminal.
+            self._log("output_retry", thread_id=self._thread.id, error=failure)
+            correction = ("Your previous reply failed machine parsing/validation:\n"
+                          + failure
+                          + "\nReturn the complete corrected reply now. Match the requested "
+                            "JSON schema exactly: one JSON object only, valid syntax, no Markdown "
+                            "fences, no commentary, no trailing characters.")
+            result = self._call(self._consume(correction, read_only, output_schema),
+                                timeout=self.turn_timeout)
+            output, failure = self._validated_output(result, output_schema, validator)
+            if failure is not None:
+                error = CodexRuntimeError("Codex output does not satisfy the requested JSON schema: "
+                                          + failure, kind="INVALID_OUTPUT", details=result)
+                self._log("runtime_error", kind=error.kind, message=str(error))
+                raise error
+            result["corrected_after"] = True
         result.update(output=output, elapsed_seconds=round(time.monotonic() - started, 3),
                       events_path=str(self.events_path))
         self._log("turn_result", **result)
         return result
 
+    def _validated_output(self, result: dict[str, Any], output_schema, validator):
+        """Return (parsed_output, None) on success or (None, compact_error)."""
+        if output_schema is None:
+            return result["final_response"], None
+        text = result["final_response"]
+        try:
+            output = json.loads(text)
+        except ValueError as exc:
+            error_text = f"{type(exc).__name__}: {exc}"[:500]
+            # Deterministic repair for the known GLM slip (misordered trailing
+            # closers, e.g. '"}]}' instead of '"]}' ); anything structurally
+            # broken mid-body or truncated is left for the corrective re-ask.
+            repaired = _repair_json_tail(text)
+            output = None
+            if repaired is not None:
+                try:
+                    output = json.loads(repaired)
+                except ValueError:
+                    output = None
+            if output is None:
+                return None, error_text
+            self._log("output_json_repaired", thread_id=self._thread.id,
+                      original_tail=text[-40:], repaired_tail=repaired[-16:])
+            result["json_repaired"] = True
+        if validator is not None:
+            try:
+                validator.validate(output)
+            except Exception as exc:
+                return None, f"{type(exc).__name__}: {exc}"[:500]
+        return output, None
+
+
     async def _consume(self, prompt: str, read_only: bool, output_schema) -> dict[str, Any]:
+        turn_options: dict[str, Any] = {}
+        if self.model:
+            turn_options["model"] = self.model
+        if self.reasoning_effort:
+            turn_options["effort"] = self.reasoning_effort
         self._handle = await self._thread.turn(
-            prompt, cwd=str(self._cwd), model=self.model, approval_mode=self._approval,
+            prompt, cwd=str(self._cwd), approval_mode=self._approval,
             sandbox=self._sandbox.read_only if read_only else self._sandbox.workspace_write,
-            output_schema=output_schema,
-            **({"effort": self.reasoning_effort} if self.reasoning_effort else {}))
+            output_schema=output_schema, **turn_options)
         self._log("turn_started", thread_id=self._thread.id, turn_id=self._handle.id)
         items, usage, completed = [], None, None
         async for notification in self._handle.stream():
@@ -235,6 +295,54 @@ class CodexRuntime:
         fd = os.open(self.events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
         with os.fdopen(fd, "a", encoding="utf-8") as stream:
             stream.write(encoded + "\n")
+
+
+def _repair_json_tail(text: str) -> str | None:
+    """Rewrite a misordered closing run at the very end of a JSON document.
+
+    Observed GLM behaviour: a structurally complete body followed by a wrong
+    tail such as '"}]}' where '"]}' belongs. The repair recomputes the
+    canonical closers from the body's bracket stack and only applies when
+    the body is perfectly balanced outside strings and ends inside no
+    string — so truncated or mid-body-broken documents are never touched.
+    Returns the repaired text or None when the slip is not this pattern.
+    """
+    stripped = text.rstrip()
+    index = len(stripped)
+    while index > 0 and stripped[index - 1] in "}]":
+        index -= 1
+    body, closers = stripped[:index], stripped[index:]
+    if not body or not closers or not body.endswith('"'):
+        return None
+    stack: list[str] = []
+    in_string = False
+    escaped = False
+    for char in body:
+        if escaped:
+            escaped = False
+            continue
+        if in_string:
+            if char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "{[":
+            stack.append(char)
+        elif char == "}":
+            if not stack or stack[-1] != "{":
+                return None
+            stack.pop()
+        elif char == "]":
+            if not stack or stack[-1] != "[":
+                return None
+            stack.pop()
+        # every other character outside strings is structurally inert
+    if in_string or not stack:
+        return None
+    return body + "".join("}" if item == "{" else "]" for item in reversed(stack))
 
 
 def _plain(value):

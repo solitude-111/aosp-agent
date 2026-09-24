@@ -15,10 +15,12 @@ python3 -m venv .venv-sdk
   --source-root /home/guolei/aosp-agent-48550/source \
   --donor-root /home/guolei/aosp-agent-48550/donor-git \
   --run-root /home/guolei/aosp-agent-48550/runs/<新的实验名> \
-  --model gpt-5.6-sol --verify --max-attempts 2
+  --model glm-5.3 --model-provider ZAI --verify --max-attempts 2
 ```
 
 每次使用新的运行目录。`--inspect-only`（兼容名 `--no-codex`）只做 Git 准备与 hunk 检查，不调用模型。`--turn-timeout` 默认 900 秒。认证由运行账户的 Codex SDK 环境提供，不把凭据放入项目。33 机器现有 Codex 程序和配置仍受用户“不操作”的约束，私有 SDK 依赖与实际认证需先确认。
+
+模型后端为 GLM（智谱）：`~/.codex/config.toml` 配置 ZAI provider（`glm-5.3`、`model_reasoning_effort`）与 `~/.codex/models.json` 模型目录，API key 写在 config.toml 的 `experimental_bearer_token`。agent 不指定 `--model`/`--model-provider`/effort 时全部回落到该配置；显式传参仅用于单次覆盖。
 
 SDK 执行层为 `sdk_runtime.py`，使用 `AsyncCodex`、官方 streaming turn、明确 sandbox、结构化输出、超时中断和 JSONL 事件。它没有 Chat Completions 自动降级；旧 `direct_api.py` 仅保留历史代码，不由当前主流程调用。官方说明：[Codex SDK](https://learn.chatgpt.com/docs/codex-sdk)。
 

@@ -107,7 +107,19 @@ class VerificationDiagnosisTest(unittest.TestCase):
         tail = entry["log_tail"].splitlines()
         self.assertEqual(len(tail), 80)
         self.assertEqual(tail[-1], "progress line 199")
-        self.assertIn("log tail", result["summary"])
+        self.assertIn("make services", result["summary"])
+
+    def test_silent_failure_reports_argv(self):
+        # grep -q / test -f fail with zero output; the failing argv is the
+        # only actionable fact the model can act on (mb-005 lesson).
+        result = verification_diagnosis([self.check(
+            argv=["grep", "-Fq", "deferStartingWindowRemovalForKeyguardUnoccluding",
+                  "services/tests/wmtests/src/com/android/server/wm/ActivityRecordTests.java"])])
+        entry = result["stage_results"][0]
+        self.assertEqual(entry["argv"][0], "grep")
+        self.assertIn("no diagnostic output", result["summary"])
+        self.assertIn("deferStartingWindowRemovalForKeyguardUnoccluding", result["summary"])
+        self.assertIn("ActivityRecordTests.java", result["summary"])
 
     def test_passing_checks_summarize_cleanly(self):
         result = verification_diagnosis([self.check(returncode=0)])

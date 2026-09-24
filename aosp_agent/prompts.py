@@ -66,17 +66,25 @@ IMPACT_SCHEMA = {
 }
 
 
-def parse_impact_response(text: str) -> dict[str, Any]:
-    """Validate output shape; callers must separately ground evidence against Git blobs."""
-    text = text.strip()
-    if text.startswith("```json\n") and text.endswith("```"):
-        text = text[8:-3].strip()
-    elif text.startswith("```\n") and text.endswith("```"):
-        text = text[4:-3].strip()
-    try:
-        raw = json.loads(text)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("impact response must be one JSON object") from exc
+def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
+    """Validate output shape; callers must separately ground evidence against Git blobs.
+
+    ``payload`` is either the already-parsed JSON object (the SDK runtime's
+    schema-validated ``output``, which may have gone through the deterministic
+    tail repair) or the raw reply text.
+    """
+    if isinstance(payload, dict):
+        raw = payload
+    else:
+        text = payload.strip()
+        if text.startswith("```json\n") and text.endswith("```"):
+            text = text[8:-3].strip()
+        elif text.startswith("```\n") and text.endswith("```"):
+            text = text[4:-3].strip()
+        try:
+            raw = json.loads(text)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("impact response must be one JSON object") from exc
     if not isinstance(raw, dict) or set(raw) != set(IMPACT_SCHEMA["required"]):
         raise ValueError("impact response has missing or unexpected fields")
     if raw["status"] not in ("AFFECTED", "NOT_AFFECTED", "UNKNOWN", "ALREADY_FIXED"):
