@@ -441,10 +441,18 @@ class AospBackportAgent:
             if hunk:
                 by_path.setdefault(hunk["path"], []).append(claim["status"])
         changed = set(changed_files)
+        allowlist = set(self.case.files)
         for path, statuses in sorted(by_path.items()):
             if "implemented" in statuses and path not in changed:
-                contradictions.append(
-                    f"{path}: declared implemented but the final diff does not touch it")
+                if path in allowlist:
+                    contradictions.append(
+                        f"{path}: declared implemented but the final diff does not touch it")
+                # A donor path outside the allowlist does not exist at the
+                # target baseline; its fix content can only be semantically
+                # ported into a different allowlisted file (CVE-2025-32348:
+                # "Adapted in ActivityStarter..."). The path-literal audit
+                # cannot verify that mapping — the case's validation checks
+                # (source contracts, module build) carry the semantic burden.
             if statuses and all(s == "need_not_ported" for s in statuses) and path in changed:
                 contradictions.append(
                     f"{path}: declared need_not_ported but the final diff modifies it")

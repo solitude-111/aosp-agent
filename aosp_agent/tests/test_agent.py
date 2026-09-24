@@ -356,6 +356,25 @@ class AgentTest(unittest.TestCase):
             self.assertIn("contradict", runtime.calls[2]["prompt"])
             self.assertEqual(result["hunk_results"][0]["status"], "need_not_ported")
 
+    def test_cross_file_mapping_claim_is_not_path_audited(self):
+        # CVE-2025-32348 lesson: a donor path absent at the target baseline can
+        # only be semantically ported into another allowlisted file; an
+        # "implemented Adapted in <other file>" claim must not be rejected by
+        # the path-literal audit (the case validation checks carry semantics).
+        with GitFixture() as fixture:
+            agent = self.agent(fixture, case=fixture.case(validation=True))
+            agent._current_hunks = [{"id": "f001-h008", "path": "wm/AbsentController.java"}]
+            claims = agent._check_hunk_results(
+                "HUNK-RESULT f001-h008 implemented Adapted in ActivityStarter.java",
+                changed_files=["ActivityStarter.java"])
+            self.assertTrue(claims["ok"])
+            self.assertEqual(claims["claims"][0]["status"], "implemented")
+            # The strict rule still holds for paths the diff could touch.
+            agent._current_hunks = [{"id": "f001-h001", "path": "counter.py"}]
+            strict = agent._check_hunk_results(
+                "HUNK-RESULT f001-h001 implemented trust me", changed_files=[])
+            self.assertFalse(strict["ok"])
+
     def test_impact_turn_sees_clean_baseline_before_mechanical_landing(self):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
