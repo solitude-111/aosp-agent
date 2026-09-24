@@ -3,7 +3,7 @@
 # 用法: module-build-r760.sh [soong 目标 ...]    默认目标: services FrameworksUiServicesTests
 #
 # 流程（2026-09-23 在 48550 上全链路验证过）:
-#   基线快照 → 真树 frameworks/base 临时 apply 候选补丁 → 树外 OUT_DIR 增量编译
+#   基线快照 → 真树目标仓库临时 apply 候选补丁 → 树外 OUT_DIR 增量编译
 #   → 产物拷回 <worktree>/out-artifacts/（供引擎哈希）→ EXIT trap 强制还原 + 四项验证
 #
 # 固化的教训:
@@ -13,8 +13,11 @@
 WORKTREE="$(pwd)"
 RUN_DIR="$(cd "$WORKTREE/../.." && pwd)"
 PATCH="$RUN_DIR/backport.patch"
+# 通用仓库推导：worktree 路径 = RUN_DIR/<仓库相对路径>（引擎布局），
+# 例如 frameworks/base、external/sqlite —— 不再硬编码任何仓库
+SUBPATH="${WORKTREE#"$RUN_DIR"/}"
 AOSP=/data/junjie/aosp
-FB="$AOSP/frameworks/base"
+REAL_REPO="$AOSP/$SUBPATH"
 OUT=/data/junjie/out-48550          # 共享增量产物（真树 sdk_phone_x86_64-userdebug 基线）
 # 关键：envsetup/lunch/m 会把通用变量名 OUT 改写为 ANDROID_PRODUCT_OUT（实测
 # OUT 变成 .../target/product/emulator_x86_64），必须在 source 之前固化产物根，
@@ -27,19 +30,19 @@ if [ $# -eq 0 ]; then
 fi
 
 [ -f "$PATCH" ] || { echo "candidate patch not found: $PATCH" >&2; exit 121; }
-[ -d "$FB" ] || { echo "frameworks/base missing: $FB" >&2; exit 122; }
+[ -d "$REAL_REPO" ] || { echo "target repository missing: $REAL_REPO" >&2; exit 122; }
 mkdir -p "$SNAP" "$WORKTREE/out-artifacts"
 
 snapshot() {
-  cd "$FB" || return 1
+  cd "$REAL_REPO" || return 1
   git rev-parse HEAD > "$SNAP/HEAD"
   git status --porcelain=v1 -z --untracked-files=all > "$SNAP/status-z"
   git ls-files -s | sha256sum > "$SNAP/lsfiles-sha"
 }
 
 restore() {
-  echo "[module-build restore] 还原真树 frameworks/base"
-  cd "$FB" || return 1
+  echo "[module-build restore] 还原真树 $SUBPATH"
+  cd "$REAL_REPO" || return 1
   git diff --name-only -z HEAD | xargs -0 -r -- git checkout --
   if ! git diff --cached --quiet; then
     git reset -q
@@ -63,12 +66,12 @@ trap 'restore; exit 130' INT TERM
 snapshot || { echo "baseline snapshot failed" >&2; exit 123; }
 if [ -s "$SNAP/status-z" ]; then
   echo "真树基线不干净，拒绝构建" >&2
-  git -C "$FB" status --porcelain | head >&2
+  git -C "$REAL_REPO" status --porcelain | head >&2
   exit 120
 fi
 
-cd "$FB" && git apply --binary "$PATCH" || {
-  echo "candidate patch does not apply to the real tree" >&2
+cd "$REAL_REPO" && git apply --binary "$PATCH" || {
+  echo "candidate patch does not apply to the real tree ($SUBPATH)" >&2
   exit 118
 }
 echo "[module-build] 补丁已临时应用于真树，开始增量编译: $*"
@@ -88,7 +91,11 @@ for t in "$@"; do
   if [ "$t" = "services" ]; then
     src=$(find "$PRODUCT_OUT_ROOT" -name "services.jar" 2>/dev/null | head -1)
   else
-    src=$(find "$PRODUCT_OUT_ROOT" -name "$t.apk" 2>/dev/null | head -1)
+    # 通用产物查找：apk(jar) → jar(库) → so(动态库) → 同名(可执行文件等)
+    for pat in "$t.apk" "$t.jar" "lib$t.so" "$t.so" "$t"; do
+      src=$(find "$PRODUCT_OUT_ROOT" -name "$pat" -type f 2>/dev/null | head -1)
+      [ -n "$src" ] && break
+    done
   fi
   if [ -n "$src" ]; then
     cp "$src" "$WORKTREE/out-artifacts/" && echo "artifact collected: $(basename "$src")"
