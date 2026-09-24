@@ -88,6 +88,29 @@ class GLMRuntimeTest(unittest.TestCase):
             self.run_runtime([message("not json")], schema=schema)
         self.assertEqual(raised.exception.kind, "INVALID_OUTPUT")
 
+    def test_redundant_glm_overall_summary_is_merged(self):
+        schema = {"type": "object", "required": ["reasoning"], "additionalProperties": False,
+                  "properties": {"reasoning": {"type": "string"}}}
+        result, client, _, _ = self.run_runtime(
+            [message('{"reasoning":"target evidence","overall":"not affected"}')], schema=schema)
+        self.assertEqual(result["output"], {
+            "reasoning": "target evidence\n\nOverall: not affected"
+        })
+        self.assertEqual(client.requests[0]["reasoning_effort"], "low")
+
+    def test_invalid_schema_triggers_one_json_repair_turn(self):
+        schema = {"type": "object", "required": ["reasoning"], "additionalProperties": False,
+                  "properties": {"reasoning": {"type": "string"}}}
+        result, client, _, _ = self.run_runtime([
+            message('{"summary":"wrong shape"}'),
+            message('{"reasoning":"repaired"}'),
+        ], schema=schema)
+        self.assertEqual(result["output"], {"reasoning": "repaired"})
+        repair_request = client.requests[1]
+        self.assertEqual(repair_request["tools"], [])
+        self.assertEqual(repair_request["tool_choice"], "none")
+        self.assertIn("required JSON schema", repair_request["messages"][-1]["content"])
+
     def test_workspace_traversal_is_rejected(self):
         result, client, _, _ = self.run_runtime([
             message(tool_calls=[tool_call("view_file", {"path": "../secret", "start": 1, "end": 1})]),

@@ -38,7 +38,7 @@ class GLMRuntime:
                  model_provider: str | None = None, turn_timeout: float = 900,
                  env: dict[str, str] | None = None,
                  reasoning_effort: str | None = None, api_base_url: str | None = None,
-                 api_key_env: str | None = None, max_tool_calls: int = 64,
+                 api_key_env: str | None = None, max_tool_calls: int = 16,
                  max_output_tokens: int = 16384):
         if turn_timeout <= 0:
             raise ValueError("turn_timeout must be positive")
@@ -51,7 +51,7 @@ class GLMRuntime:
         self.model_provider = model_provider or "bigmodel"
         self.turn_timeout = float(turn_timeout)
         self.env = dict(env or {})
-        self.reasoning_effort = reasoning_effort
+        self.reasoning_effort = reasoning_effort or ("low" if model == "glm-5.3" else None)
         self.api_base_url = (api_base_url or self.env.get("AOSP_AGENT_GLM_BASE_URL")
                              or os.environ.get("AOSP_AGENT_GLM_BASE_URL")
                              or GLM_DEFAULT_BASE_URL).rstrip("/")
@@ -142,16 +142,27 @@ class GLMRuntime:
                 raise GLMRuntimeError(f"GLM turn exceeded {self.turn_timeout} seconds", kind="TIMEOUT")
             assert self._client is not None
             self._client.timeout = min(self.turn_timeout, remaining)
+            force_final = tool_calls_made >= self.max_tool_calls
+            available_tools = [schema for schema in _TOOL_SCHEMAS
+                               if schema["function"]["name"] != "run_controlled_command"
+                               or self.env.get("AOSP_AGENT_TOOL_BIN_DIR")]
+            request_messages_for_call = request_messages
+            if force_final:
+                request_messages_for_call = [*request_messages, {
+                    "role": "user",
+                    "content": "Tool-call limit reached. Stop calling tools and return the final structured JSON now.",
+                }]
             payload = {
-                "messages": request_messages,
-                "tools": _TOOL_SCHEMAS,
-                "tool_choice": "auto",
+                "messages": request_messages_for_call,
+                "tools": [] if force_final else available_tools,
+                "tool_choice": "none" if force_final else "auto",
                 "temperature": 0,
                 "max_tokens": self.max_output_tokens,
             }
-            if self.reasoning_effort:
-                payload["thinking"] = {"type": "enabled"} if self.reasoning_effort != "none" else {"type": "disabled"}
-            self._log("glm_request", turn_id=turn_id, message_count=len(request_messages), tools=len(_TOOL_SCHEMAS))
+            self._apply_reasoning_effort(payload)
+            self._log("glm_request", turn_id=turn_id, message_count=len(request_messages),
+                      tools=len(available_tools), force_final=force_final,
+                      available_tools=[schema["function"]["name"] for schema in available_tools])
             try:
                 body = self._client.chat(payload)
             except Exception as exc:
@@ -213,12 +224,31 @@ class GLMRuntime:
         try:
             output = _json_output(final_content) if output_schema is not None else final_content
             if validator is not None:
+                output = _merge_redundant_glm_summary(output, output_schema)
                 validator.validate(output)
         except Exception as exc:
-            error = GLMRuntimeError("GLM output does not satisfy the requested JSON schema: "
-                                    + str(exc), kind="INVALID_OUTPUT", details={"response": final_content})
-            self._log("runtime_error", kind=error.kind, message=str(error))
-            raise error from exc
+            repaired = (self._repair_structured_output(request_messages, final_content,
+                                                       output_schema, str(exc), turn_id,
+                                                       deadline, items)
+                        if validator is not None else None)
+            if repaired is None:
+                error = GLMRuntimeError("GLM output does not satisfy the requested JSON schema: "
+                                        + str(exc), kind="INVALID_OUTPUT",
+                                        details={"response": final_content})
+                self._log("runtime_error", kind=error.kind, message=str(error))
+                raise error from exc
+            final_content, repaired_usage, finish_reason = repaired
+            usage = repaired_usage or usage
+            try:
+                output = _json_output(final_content)
+                output = _merge_redundant_glm_summary(output, output_schema)
+                validator.validate(output)
+            except Exception as repair_exc:
+                error = GLMRuntimeError("GLM schema-repair output is invalid: "
+                                        + str(repair_exc), kind="INVALID_OUTPUT",
+                                        details={"response": final_content})
+                self._log("runtime_error", kind=error.kind, message=str(error))
+                raise error from repair_exc
         response_text = json.dumps(output, ensure_ascii=False) if output_schema is not None else final_content
         result = {"thread_id": self._thread_id, "turn_id": turn_id, "status": "completed",
                   "finish_reason": finish_reason, "final_response": response_text, "output": output,
@@ -252,6 +282,61 @@ class GLMRuntime:
         if name == "run_controlled_command":
             return self._run_controlled_command(arguments, deadline)
         raise ValueError(f"unsupported GLM tool: {name}")
+
+    def _repair_structured_output(self, request_messages: list[dict[str, Any]],
+                                  invalid_response: str, output_schema: dict[str, Any],
+                                  validation_error: str, turn_id: str, deadline: float,
+                                  items: list[dict[str, Any]]) -> tuple[str, dict[str, Any] | None,
+                                                                         str] | None:
+        assert self._client is not None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        self._client.timeout = min(self.turn_timeout, remaining)
+        repair_message = {
+            "role": "user",
+            "content": ("The previous answer did not satisfy the required JSON schema. "
+                         f"Validation error:\n{validation_error}\n\n"
+                         "Convert the evidence and decisions from the previous answer into "
+                         "an object that exactly satisfies this schema. Do not invent facts, "
+                         "omit required fields, add fields, or return prose/markdown.\n"
+                         "Return valid JSON only:\n"
+                         + json.dumps(output_schema, ensure_ascii=False)),
+        }
+        self._messages.append(repair_message)
+        payload = {
+            "messages": [*request_messages, repair_message],
+            "tools": [],
+            "tool_choice": "none",
+            "temperature": 0,
+            "max_tokens": self.max_output_tokens,
+        }
+        self._apply_reasoning_effort(payload)
+        self._log("glm_schema_repair_request", turn_id=turn_id)
+        try:
+            body = self._client.chat(payload)
+        except Exception:
+            return None
+        choice = _choice(body)
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        finish_reason = str(choice.get("finish_reason") or "")
+        final_message = {"role": "assistant", "content": content}
+        self._messages.append(final_message)
+        items.append({"type": "glmMessage", "phase": "schema_repair", "content": content})
+        return content, _usage(body.get("usage")), finish_reason
+
+    def _apply_reasoning_effort(self, payload: dict[str, Any]) -> None:
+        if not self.reasoning_effort:
+            return
+        if self.reasoning_effort == "none":
+            payload["thinking"] = {"type": "disabled"}
+        elif self.reasoning_effort in {"low", "high", "max"}:
+            payload["reasoning_effort"] = self.reasoning_effort
+        else:
+            payload["thinking"] = {"type": "enabled"}
 
     def _run_controlled_command(self, arguments: dict[str, Any], deadline: float) -> dict[str, Any]:
         command = arguments.get("command")
@@ -335,6 +420,23 @@ def _mode_instructions(read_only: bool) -> str:
                 "run_controlled_command; write_file attempts will fail.")
     return ("Current phase is WORKSPACE_WRITE. Make edits only with write_file, and only "
             "inside the current workspace. Controlled history commands remain read-only.")
+
+
+def _merge_redundant_glm_summary(output: Any, output_schema: dict[str, Any]) -> Any:
+    if (not isinstance(output, dict) or not isinstance(output_schema.get("properties"), dict)
+            or "reasoning" not in output_schema["properties"] or "overall" not in output
+            or not isinstance(output["overall"], str)):
+        return output
+    allowed_properties = set(output_schema["properties"])
+    if set(output) - allowed_properties != {"overall"}:
+        return output
+    summary = output.pop("overall")
+    reasoning = output.get("reasoning")
+    if not isinstance(reasoning, str) or not reasoning:
+        output["reasoning"] = summary
+    else:
+        output["reasoning"] = f"{reasoning}\n\nOverall: {summary}"
+    return output
 
 
 _TOOL_INSTRUCTIONS = """GLM tool protocol:
