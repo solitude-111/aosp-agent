@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from aosp_agent.case import Case
-from aosp_agent.engine import AospBackportAgent, _assert_patch_paths, _codex_error_kind, _extract_unified_diff
+from aosp_agent.engine import AospBackportAgent, _assert_patch_paths, _extract_unified_diff, _model_error_kind
 from aosp_agent.tests.engine_fixtures import (
     BASELINE, FIXED, PARTIAL, GitFixture, ScriptedRuntime, git, write_counter,
 )
@@ -22,10 +22,10 @@ class AgentTest(unittest.TestCase):
             agent.run(**kwargs)
         self.assertEqual(fixture.record()["status"], "FAILED")
 
-    def test_codex_error_classification(self):
-        self.assertEqual(_codex_error_kind("unexpected status 401 Unauthorized"), "AUTH_REQUIRED")
-        self.assertEqual(_codex_error_kind("unexpected status 403 Forbidden"), "AUTH_REQUIRED")
-        self.assertEqual(_codex_error_kind("thread failed"), "CODEX_ERROR")
+    def test_glm_error_classification(self):
+        self.assertEqual(_model_error_kind("unexpected status 401 Unauthorized"), "AUTH_REQUIRED")
+        self.assertEqual(_model_error_kind("unexpected status 403 Forbidden"), "AUTH_REQUIRED")
+        self.assertEqual(_model_error_kind("request failed"), "GLM_ERROR")
 
     def test_direct_patch_is_limited_to_allowed_files(self):
         patch = "diff --git a/src.cc b/src.cc\n--- a/src.cc\n+++ b/src.cc\n@@ -1 +1 @@\n-a\n+b\n"
@@ -47,7 +47,7 @@ class AgentTest(unittest.TestCase):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment())
             agent = self.agent(fixture, runtime)
-            result = agent.run(use_codex=False)
+            result = agent.run(use_model=False)
             self.assertEqual(result["status"], "PREPARED")
             self.assertFalse(runtime.calls)
             self.assertEqual((agent.worktree / "counter.py").read_text(), BASELINE)
@@ -260,7 +260,7 @@ class AgentTest(unittest.TestCase):
             case = Case(**{**case.__dict__, "repositories": ({"path": "repo", "files": []},
                                                                {"path": "other", "files": []})})
             with self.assertRaises(ValueError):
-                self.agent(fixture, case=case).run(use_codex=False)
+                self.agent(fixture, case=case).run(use_model=False)
             self.assertEqual(fixture.record()["error"]["kind"], "UNSUPPORTED_MULTI_REPOSITORY")
 
     def _conflict_fixture(self):
@@ -442,7 +442,7 @@ class AgentTest(unittest.TestCase):
                      "payload": {"item": {"type": "commandExecution",
                                           "command": "view-code ...",
                                           "aggregatedOutput": captured.getvalue()}}}
-            (run_dir / "sdk-events.jsonl").write_text(json.dumps(event) + "\n")
+            (run_dir / "glm-events.jsonl").write_text(json.dumps(event) + "\n")
             agent._events_swept = 0
             agent._sweep_tool_usage()
             swept = [json.loads(line) for line in usage.read_text().splitlines()]

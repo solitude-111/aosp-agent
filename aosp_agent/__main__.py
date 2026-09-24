@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .case import load_cases
 from .engine import AospBackportAgent
+from .glm_runtime import DEFAULT_GLM_MODEL
 
 
 def main() -> int:
@@ -19,8 +20,11 @@ def main() -> int:
                       help="standalone target Git checkout or AOSP root containing Git checkouts; pins each HEAD")
     diff.add_argument("--run-root", type=Path, default=Path("runs/diff-input"))
     diff.add_argument("--inspect-only", action="store_true")
-    diff.add_argument("--model", default="gpt-5.6-sol")
-    diff.add_argument("--model-provider")
+    diff.add_argument("--model", default=DEFAULT_GLM_MODEL)
+    diff.add_argument("--api-base-url", default=None,
+                      help="GLM OpenAI-compatible base URL, or AOSP_AGENT_GLM_BASE_URL")
+    diff.add_argument("--api-key-env", default=None,
+                      help="environment variable containing the GLM API key (default GLM_API_KEY)")
     diff.add_argument("--turn-timeout", type=float, default=900)
     diff.add_argument("--max-attempts", type=int, default=3)
     diff.add_argument("--verify", action="store_true")
@@ -31,9 +35,12 @@ def main() -> int:
     run.add_argument("--source-root", type=Path, required=True)
     run.add_argument("--run-root", type=Path, required=True)
     run.add_argument("--donor-root", type=Path, help="directory containing <repo-path with slashes replaced by hyphens>.git")
-    run.add_argument("--model", default="gpt-5.6-sol")
-    run.add_argument("--model-provider", help="Codex model provider id, or AOSP_AGENT_MODEL_PROVIDER")
-    run.add_argument("--no-codex", "--inspect-only", dest="no_codex", action="store_true",
+    run.add_argument("--model", default=DEFAULT_GLM_MODEL)
+    run.add_argument("--api-base-url", default=None,
+                      help="GLM OpenAI-compatible base URL, or AOSP_AGENT_GLM_BASE_URL")
+    run.add_argument("--api-key-env", default=None,
+                      help="environment variable containing the GLM API key (default GLM_API_KEY)")
+    run.add_argument("--no-model", "--inspect-only", dest="no_model", action="store_true",
                      help="prepare and inspect without starting a model; reports PREPARED")
     run.add_argument("--no-mechanical", action="store_true",
                      help="skip the pre-model mechanical hunk application (debug)")
@@ -41,14 +48,15 @@ def main() -> int:
     run.add_argument("--max-attempts", type=int, default=6,
                      help="maximum turns per assessment/backport phase, including the initial turn")
     run.add_argument("--turn-timeout", type=float, default=900,
-                     help="timeout in seconds for each SDK turn")
+                     help="timeout in seconds for each GLM turn")
     args = parser.parse_args()
     if args.command == "diff":
         from .diff_engine import DiffBackportAgent
         agent = None
         try:
             agent = DiffBackportAgent(args.patch, args.target_root, args.run_root, model=args.model,
-                model_provider=args.model_provider, turn_timeout=args.turn_timeout,
+                turn_timeout=args.turn_timeout, api_base_url=args.api_base_url,
+                api_key_env=args.api_key_env,
                 validation=json.loads(args.validation.read_text()) if args.validation else None)
             result = agent.run(inspect_only=args.inspect_only, max_attempts=args.max_attempts, verify=args.verify)
         except Exception as exc:
@@ -68,8 +76,9 @@ def main() -> int:
     case = cases[args.cve]
     try:
         result = AospBackportAgent(args.source_root, args.run_root, case, args.model, args.donor_root,
-                                   args.model_provider, turn_timeout=args.turn_timeout).run(
-            use_codex=not args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
+                                   turn_timeout=args.turn_timeout, api_base_url=args.api_base_url,
+                                   api_key_env=args.api_key_env).run(
+            use_model=not args.no_model, verify=args.verify, max_attempts=args.max_attempts,
             mechanical=not args.no_mechanical)
     except Exception as exc:
         print(json.dumps({"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}},

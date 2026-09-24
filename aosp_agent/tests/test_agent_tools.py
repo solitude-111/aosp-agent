@@ -11,7 +11,7 @@ from aosp_agent.tests.engine_fixtures import GitFixture, git
 
 
 class PreparedRun:
-    """A completed --no-codex run with a separate donor bare store."""
+    """A completed inspect-only run with a separate donor bare store."""
 
     def __enter__(self):
         self.fixture = GitFixture()
@@ -22,7 +22,7 @@ class PreparedRun:
                         str(self.donor_root / "repo.git")], check=True, capture_output=True)
         agent = AospBackportAgent(self.fixture.source_root, self.fixture.run_root,
                                   self.fixture.case(), donor_root=self.donor_root)
-        agent.run(use_codex=False)
+        agent.run(use_model=False)
         self.agent = agent
         self.run_dir = self.fixture.run_root / "CVE-2099-2000"
         self.record = json.loads((self.run_dir / "run.json").read_text())
@@ -184,7 +184,7 @@ class ThreeCommitRun:
             "target_commit": self.target, "files": ["widget.py"], "validation": []})
         self.agent = AospBackportAgent(root / "source", root / "runs", case,
                                        donor_root=donor_root)
-        self.agent.run(use_codex=False)
+        self.agent.run(use_model=False)
         self.run_dir = root / "runs" / "CVE-2099-2002"
         return self
 

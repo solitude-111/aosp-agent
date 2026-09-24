@@ -113,8 +113,8 @@ class RunContext:
     def check_sha(self, sha: str) -> str:
         if sha in self.allowed_refs or sha in self.history_shas():
             return sha
-        # The Codex sandbox blocks cross-process file writes inside a turn,
-        # so SHAs reported by hunk-history in the SAME turn cannot reach
+        # A sandboxed runtime can block cross-process file writes inside a turn,
+        # so SHAs reported by hunk-history in the SAME turn may not reach
         # history-commits.jsonl before show-commit runs. Range-bounded
         # acceptance keeps the chain usable without enabling free history
         # roaming: only commits inside the donor's own target..fix window
@@ -170,10 +170,9 @@ def _finish(ctx: RunContext, cmd: str, args, output: str, code: int = 0,
              "returncode": code, "bytes_out": len(output.encode(errors="replace"))}
     if extra:
         entry.update(extra)
-    # Best-effort durable log. Under the Codex sandbox this write is denied
-    # (run_dir lies outside the sandboxed workspace); the stdout marker below
-    # is always emitted and the controller sweeps it from sdk-events into
-    # tool-usage.jsonl after the turn, so no invocation goes unlogged.
+    # Best-effort durable log. The GLM runtime also records command output;
+    # this marker lets the controller recover an entry if the direct append
+    # fails, so no invocation goes unlogged.
     try:
         with (ctx.run_dir / "tool-usage.jsonl").open("a") as stream:
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")

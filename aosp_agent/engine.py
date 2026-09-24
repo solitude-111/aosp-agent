@@ -16,6 +16,7 @@ from .ladder import ladder_plan, strategy_prompt
 from .patch_repair import repair_hunk
 from .patches import split_hunks
 from .prompts import IMPACT_SCHEMA, SYSTEM, backport_prompt, impact_prompt, parse_impact_response
+from .glm_runtime import DEFAULT_GLM_MODEL
 from . import symbols
 
 _HUNK_RESULT_RE = re.compile(
@@ -29,19 +30,19 @@ class AssessmentError(ValueError):
 
 
 class AospBackportAgent:
-    """Run independent AOSP impact assessment and a guarded SDK backport."""
+    """Run independent AOSP impact assessment and a guarded GLM backport."""
 
-    def __init__(self, source_root: Path, run_root: Path, case: Case, model: str = "gpt-5.6-sol",
+    def __init__(self, source_root: Path, run_root: Path, case: Case, model: str = DEFAULT_GLM_MODEL,
                  donor_root: Path | None = None, model_provider: str | None = None,
                  api_base_url: str | None = None, api_key_env: str | None = None, *,
                  runtime_factory: Callable | None = None, turn_timeout: float = 900,
                  source_diff: str | None = None):
-        if api_base_url or api_key_env:
-            raise ValueError("AOSP agent requires Codex SDK; direct API arguments are unsupported")
         self.source_root, self.run_root = source_root.resolve(), run_root.resolve()
         self.case, self.model = case, model
         self.input_diff = source_diff
-        self.model_provider = model_provider or os.environ.get("AOSP_AGENT_MODEL_PROVIDER")
+        self.model_provider = model_provider or "bigmodel"
+        self.api_base_url = api_base_url or os.environ.get("AOSP_AGENT_GLM_BASE_URL")
+        self.api_key_env = api_key_env or os.environ.get("AOSP_AGENT_GLM_API_KEY_ENV") or "GLM_API_KEY"
         self.repo = (self.source_root / validate_relative_path(case.repository)).resolve()
         self.donor_root = donor_root.resolve() if donor_root else None
         self.donor_repo = ((self.donor_root / _donor_slug(case.repository)).resolve()
@@ -67,7 +68,7 @@ class AospBackportAgent:
         self._current_hunks: list[dict[str, Any]] = []
         self._last_audit: dict[str, Any] | None = None
         self._events_swept = 0
-        self.record: dict[str, Any] = {"cve": case.cve, "status": "INITIALIZED", "backend": "codex_sdk",
+        self.record: dict[str, Any] = {"cve": case.cve, "status": "INITIALIZED", "backend": "glm_api",
             "model": model, "events": [], "verification_scope": "configured_commands_only",
             "runtime_security_proven": False,
             "model_execution": "not_run", "impact_decision": "uncertain",
@@ -248,23 +249,21 @@ class AospBackportAgent:
     def _turn(self, runtime, prompt: str, *, read_only: bool, phase: str, schema=None) -> dict:
         result = runtime.run(prompt, read_only=read_only, output_schema=schema)
         if result.get("status") != "completed":
-            raise RuntimeError(f"SDK turn did not complete: {result.get('status')}")
-        self._event("codex_turn", phase=phase, thread_id=result.get("thread_id"), turn_id=result.get("turn_id"),
+            raise RuntimeError(f"GLM turn did not complete: {result.get('status')}")
+        self._event("glm_turn", phase=phase, thread_id=result.get("thread_id"), turn_id=result.get("turn_id"),
                     status=result["status"], events_path=result.get("events_path"), usage=result.get("usage"))
         self._sweep_tool_usage()
         self.audit_diff(require_clean=read_only)
         return result
 
     def _sweep_tool_usage(self) -> None:
-        """Recover tool-usage markers from sdk-events into run-dir logs.
+        """Recover tool-usage markers from GLM events into run-dir logs.
 
-        The Codex sandbox denies the tools' direct appends to
-        tool-usage.jsonl (run_dir is outside the sandboxed workspace), so
-        every tool invocation also prints an AOSP-TOOL-USAGE marker on
-        stdout; those markers appear in commandExecution events and are
-        swept here after each turn. Deduplication is by the marker's uid.
+        The GLM runtime records controller-mediated command output. If the
+        controlled tool could not append its durable log directly, markers in
+        commandExecution events are recovered here. Deduplication is by uid.
         """
-        events_path = self.run_dir / "sdk-events.jsonl"
+        events_path = self.run_dir / "glm-events.jsonl"
         if not events_path.is_file():
             return
         data = events_path.read_text(errors="replace")
@@ -456,11 +455,11 @@ class AospBackportAgent:
                  + "\n- ".join(contradictions)
                  + "\nReconcile the declarations with the actual diff in your next turn.")}
 
-    def _codex_workflow(self, inspection: dict[str, Any], verify: bool, max_attempts: int,
+    def _glm_workflow(self, inspection: dict[str, Any], verify: bool, max_attempts: int,
                         mechanical: bool = True) -> None:
         if self.runtime_factory is None:
-            from .sdk_runtime import CodexRuntime
-            factory = CodexRuntime
+            from .glm_runtime import GLMRuntime
+            factory = GLMRuntime
         else:
             factory = self.runtime_factory
         tools_context = ""
@@ -487,9 +486,11 @@ class AospBackportAgent:
                               "\nMissing symbols: " +
                               ", ".join(e["name"] for e in symbol_report.get("missing", []))
                               ) if symbol_report else None
-        with factory(events_path=self.run_dir / "sdk-events.jsonl", model=self.model,
-                     model_provider=self.model_provider, turn_timeout=self.turn_timeout,
-                     env={"GIT_NO_LAZY_FETCH": "1"}) as runtime:
+        with factory(events_path=self.run_dir / "glm-events.jsonl", model=self.model,
+                     turn_timeout=self.turn_timeout, api_base_url=self.api_base_url,
+                     api_key_env=self.api_key_env,
+                     env={"GIT_NO_LAZY_FETCH": "1",
+                          "AOSP_AGENT_TOOL_BIN_DIR": str(self.run_dir / "bin")}) as runtime:
             self.record["thread_id"] = runtime.start(str(self.worktree), SYSTEM + context)
             impact_request = impact_prompt(self.case, source_diff, self.commit_message,
                                            symbol_report_text) + context
@@ -595,24 +596,24 @@ class AospBackportAgent:
             self.record["status"] = "VALIDATION_FAILED"
             return
 
-    def run(self, *, use_codex: bool = True, verify: bool = False, max_attempts: int = 6,
+    def run(self, *, use_model: bool = True, verify: bool = False, max_attempts: int = 6,
             mechanical: bool = True) -> dict[str, Any]:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
         try:
             if not self._owns_run: self.prepare()
             inspection = self.inspect()
-            if not use_codex:
+            if not use_model:
                 self.record.update(status="PREPARED", model_skipped=True)
             else:
-                self._codex_workflow(inspection, verify, max_attempts, mechanical=mechanical)
-            self.audit_diff(require_clean=not use_codex)
+                self._glm_workflow(inspection, verify, max_attempts, mechanical=mechanical)
+            self.audit_diff(require_clean=not use_model)
             self._write_record(); return self.record
         except Exception as exc:
             if self._owns_run:
                 message = re.sub(r"sk-[A-Za-z0-9_-]{16,}", "[REDACTED]", str(exc))
                 existing_kind = self.record.get("error", {}).get("kind")
-                self.record.update(status="FAILED", model_execution=("failed" if self.record.get("model_execution") == "not_run" else self.record.get("model_execution")), error={"kind": existing_kind or getattr(exc, "kind", _codex_error_kind(message)),
+                self.record.update(status="FAILED", model_execution=("failed" if self.record.get("model_execution") == "not_run" else self.record.get("model_execution")), error={"kind": existing_kind or getattr(exc, "kind", _model_error_kind(message)),
                                "type": type(exc).__name__, "message": message})
                 self._event("failed", **self.record["error"])
             raise
@@ -791,8 +792,8 @@ def _safe_env() -> dict[str, str]:
 
 def _donor_slug(repository: str) -> str: return repository.replace("/", "-") + ".git"
 
-def _codex_error_kind(message: str) -> str:
-    return "AUTH_REQUIRED" if "401 Unauthorized" in message or "403 Forbidden" in message else "CODEX_ERROR"
+def _model_error_kind(message: str) -> str:
+    return "AUTH_REQUIRED" if "401" in message or "403" in message else "GLM_ERROR"
 
 def _extract_unified_diff(response: str) -> str:
     text = response.strip()

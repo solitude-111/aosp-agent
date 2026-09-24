@@ -67,8 +67,9 @@ def assessment_prompt(diff, inventory, location):
     return '''Locate the target implementation and independently assess this higher-version patch.
 Only the original diff and repositories are supplied. No CVE identity, donor SHA, target paths,
 reference conclusion or migration recipe is provided. Repository HEADs below are pinned baselines.
-Work READ ONLY. Use git -C <original_root> show <head>:<path> and bounded git grep/log to investigate.
-Never checkout/reset/clean/commit/stage/fetch or modify an original repository. Set GIT_NO_LAZY_FETCH=1.
+Work READ ONLY. Use the provided view_file, list_dir, and search_files tools to investigate
+the pinned checkout. Never checkout/reset/clean/commit/stage/fetch or modify an original
+repository; the controller supplies pinned target history and diff-side evidence.
 Do not read sibling project files, prior runs, oracles, credentials or reference patches.
 
 ''' + KNOWLEDGE + '''
