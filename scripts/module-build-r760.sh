@@ -11,7 +11,13 @@
 #     且 || 兜底分支不会执行；还原必须用 trap，不能用分支。
 #   - 还原验证四项: HEAD / status 字节相等 / 索引指纹 / diff HEAD 为空。
 WORKTREE="$(pwd)"
-RUN_DIR="$(cd "$WORKTREE/../.." && pwd)"
+# 引擎布局 run_root/<CVE>/<仓库路径>，补丁在 CVE 目录。仓库路径段数不一
+# （frameworks/base 两段、kernel 一段），固定层级推导会 overshoot——改为
+# 向上搜索 backport.patch（最多 4 层），对任意仓库深度都正确。
+RUN_DIR=""
+for d in "$PWD" "$PWD/.." "$PWD/../.." "$PWD/../../.."; do
+  [ -f "$d/backport.patch" ] && { RUN_DIR="$(cd "$d" && pwd)"; break; }
+done
 PATCH="$RUN_DIR/backport.patch"
 # 通用仓库推导：worktree 路径 = RUN_DIR/<仓库相对路径>（引擎布局），
 # 例如 frameworks/base、external/sqlite —— 不再硬编码任何仓库
