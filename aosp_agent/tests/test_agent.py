@@ -6,7 +6,7 @@ from pathlib import Path
 from aosp_agent.case import Case
 from aosp_agent.engine import AospBackportAgent, _assert_patch_paths, _codex_error_kind, _extract_unified_diff
 from aosp_agent.tests.engine_fixtures import (
-    BASELINE, FIXED, PARTIAL, FlippingScriptedRuntime, GitFixture, ScriptedRuntime, git, write_counter,
+    BASELINE, FIXED, PARTIAL, GitFixture, ScriptedRuntime, git, write_counter,
 )
 
 
@@ -61,35 +61,17 @@ class AgentTest(unittest.TestCase):
             runtime = ScriptedRuntime(fixture.assessment("UNKNOWN"))
             agent = self.agent(fixture, runtime)
             self.assertEqual(agent.run()["status"], "INCONCLUSIVE")
-            self.assertEqual([call["read_only"] for call in runtime.calls], [True, True])
+            self.assertEqual([call["read_only"] for call in runtime.calls], [True])
             self.assertEqual(git(agent.worktree, "status", "--porcelain"), "")
 
-    def test_counter_agreement_proceeds_to_migration(self):
-        # 反方复核与正方结论一致 → 正常进入迁移（影响+反方+编辑 三回合）
-        with GitFixture() as fixture:
-            runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
-            result = self.agent(fixture, runtime, fixture.case(validation=True)).run(verify=True)
-            self.assertEqual(result["status"], "VALIDATED")
-            self.assertEqual(result["counter_assessment"]["status"], "AFFECTED")
-            self.assertEqual(len(runtime.calls), 3)
-            self.assertIn("adversarial", runtime.calls[1]["prompt"])
 
-    def test_counter_flip_becomes_inconclusive(self):
-        # 反方翻转结论（判定方差被抓到）→ INCONCLUSIVE 交人工，不进迁移
-        with GitFixture() as fixture:
-            runtime = FlippingScriptedRuntime(fixture.assessment())
-            agent = self.agent(fixture, runtime)
-            self.assertEqual(agent.run(verify=False)["status"], "INCONCLUSIVE")
-            self.assertEqual(agent.record["impact_decision"], "counter_flipped")
-            self.assertEqual(len(runtime.calls), 2)  # 影响 + 反方，无编辑
-            self.assertEqual(git(agent.worktree, "status", "--porcelain"), "")
 
     def test_not_affected_stops_before_patch_phase(self):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment("NOT_AFFECTED", already_fixed=True))
             agent = self.agent(fixture, runtime, fixture.case(already_fixed=True))
             self.assertEqual(agent.run()["status"], "NOT_AFFECTED")
-            self.assertEqual(len(runtime.calls), 2)
+            self.assertEqual(len(runtime.calls), 1)
             self.assertEqual(git(agent.worktree, "status", "--porcelain"), "")
 
     def test_affected_without_actual_changes_fails(self):
@@ -98,7 +80,7 @@ class AgentTest(unittest.TestCase):
             # mechanical=False isolates "no changes at all": with the mechanical
             # pass on, the donor hunk lands before the model ever edits.
             self.assert_failed(fixture, self.agent(fixture, runtime), mechanical=False)
-            self.assertEqual(len(runtime.calls), 3)
+            self.assertEqual(len(runtime.calls), 2)
 
     def test_mechanical_landing_alone_yields_candidate(self):
         with GitFixture() as fixture:
@@ -115,7 +97,7 @@ class AgentTest(unittest.TestCase):
             agent = self.agent(fixture, runtime, fixture.case(validation=True))
             result = agent.run(verify=False)
             self.assertEqual(result["status"], "PATCH_UNVERIFIED")
-            self.assertEqual([call["read_only"] for call in runtime.calls], [True, True, False])
+            self.assertEqual([call["read_only"] for call in runtime.calls], [True, False])
             self.assertIsNotNone(runtime.calls[0]["output_schema"])
             self.assertEqual((fixture.repo / "counter.py").read_text(), BASELINE)
             self.assertIn("+    return max(0, min(value, 10))", Path(result["patch_file"]).read_text())
@@ -134,7 +116,7 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(result["status"], "VALIDATED")
             self.assertEqual(result["final_verification"]["status"], "PASS")
             self.assertIn("contract verified", result["final_verification"]["commands"][0]["stdout"])
-            self.assertEqual(len(runtime.calls), 3)
+            self.assertEqual(len(runtime.calls), 2)
 
     def test_validation_failure_guides_revision_and_rechecks_it(self):
         with GitFixture() as fixture:
@@ -142,8 +124,8 @@ class AgentTest(unittest.TestCase):
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2)
             self.assertEqual(result["status"], "VALIDATED")
-            self.assertEqual(len(runtime.calls), 4)
-            self.assertIn("upper bound missing", runtime.calls[3]["prompt"])
+            self.assertEqual(len(runtime.calls), 3)
+            self.assertIn("upper bound missing", runtime.calls[2]["prompt"])
             self.assertEqual(result["final_verification"]["status"], "PASS")
             self.assertIn("+    return max(0, min(value, 10))", Path(result["patch_file"]).read_text())
 
@@ -154,7 +136,7 @@ class AgentTest(unittest.TestCase):
                 verify=True, max_attempts=2)
             self.assertEqual(result["status"], "VALIDATION_FAILED")
             self.assertEqual(result["final_verification"]["status"], "FAIL")
-            self.assertEqual(len(runtime.calls), 4)
+            self.assertEqual(len(runtime.calls), 3)
             self.assertTrue(Path(result["patch_file"]).is_file())
 
     def test_forged_target_evidence_is_rejected_before_editing(self):
@@ -345,7 +327,7 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(migration["failed"], ["f001-h001"])
             self.assertEqual(migration["starting_state"], "none")
             self.assertEqual(migration["hunks"][0]["diagnosis"]["kind"], "context_mismatch")
-            first_turn = runtime.calls[2]["prompt"]
+            first_turn = runtime.calls[1]["prompt"]
             self.assertIn("Failed to apply mechanically", first_turn)
             self.assertIn("f001-h001", first_turn)
             self.assertIn("context_mismatch", first_turn)
@@ -359,9 +341,9 @@ class AgentTest(unittest.TestCase):
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2)
             self.assertEqual(result["status"], "VALIDATION_FAILED")
-            self.assertEqual([call["read_only"] for call in runtime.calls], [True, True, False, False])
-            self.assertIn("no HUNK-RESULT declaration", runtime.calls[3]["prompt"])
-            self.assertIn("Strategy T2", runtime.calls[3]["prompt"])
+            self.assertEqual([call["read_only"] for call in runtime.calls], [True, False, False])
+            self.assertIn("no HUNK-RESULT declaration", runtime.calls[2]["prompt"])
+            self.assertIn("Strategy T2", runtime.calls[2]["prompt"])
             self.assertEqual(result["hunk_results"], [])
             self.assertTrue(result["attempts"])
 
@@ -373,7 +355,7 @@ class AgentTest(unittest.TestCase):
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2)
             self.assertEqual(result["status"], "VALIDATION_FAILED")
-            self.assertIn("contradict", runtime.calls[3]["prompt"])
+            self.assertIn("contradict", runtime.calls[2]["prompt"])
             self.assertEqual(result["hunk_results"][0]["status"], "need_not_ported")
 
     def test_cross_file_mapping_claim_is_not_path_audited(self):
@@ -445,7 +427,7 @@ class AgentTest(unittest.TestCase):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
             self.agent(fixture, runtime).run(verify=False)
-            impact, backport = runtime.calls[0]["prompt"], runtime.calls[2]["prompt"]
+            impact, backport = runtime.calls[0]["prompt"], runtime.calls[1]["prompt"]
             self.assertIn("bound ordinary count values", impact)  # donor commit message (R1)
             self.assertIn("Existence first", impact)
             self.assertIn("locate-symbol", impact)

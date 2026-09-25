@@ -199,27 +199,6 @@ ellipses or invented line numbers.
 """
 
 
-def counter_assessment_prompt(assessment: dict[str, Any]) -> str:
-    """方案二：结论对抗复核。正方判定已过证据锚定，此提示词要求模型站到反方立场。"""
-    return f"""You previously produced this grounded impact assessment:
-
-{json.dumps(assessment, ensure_ascii=False)}
-
-Your task now is adversarial self-review. Argue the STRONGEST case for the OPPOSITE verdict:
-- If the assessment says AFFECTED, hunt for evidence the target is actually protected or the
-  harmful path cannot execute (missing trigger, gate, caller, or configuration).
-- If it says NOT_AFFECTED or ALREADY_FIXED, hunt for the target code path where the harm DOES
-  occur in an older form — remember that absence of the donor fix's symbols is not evidence of
-  safety, only that the protection is missing.
-- If it says UNKNOWN, try to resolve it in either direction with concrete code.
-
-Then decide honestly: does the counter-case survive your own scrutiny better than the original?
-Return the verdict you now believe is correct (it may be the original, the opposite, or UNKNOWN
-if genuinely balanced) with fresh grounded evidence for the deciding point. Same JSON schema as
-before, same citation rules (exact contiguous excerpts from real Git blobs).
-"""
-
-
 def backport_prompt(case: Case, source_diff: str = "",
                     impact_assessment: dict[str, Any] | None = None,
                     commit_message: str = "",
