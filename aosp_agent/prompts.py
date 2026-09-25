@@ -166,7 +166,23 @@ CRITICAL disambiguation rule (absence of protection is NOT absence of vulnerabil
 - To conclude AFFECTED when the vulnerable construct differs from the donor's, you must trace the
   actual target code path that exhibits the flaw end-to-end; structural similarity or "could
   possibly" reasoning is insufficient — name the exact statements and data flow that realize the
-  harm. Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
+  harm.
+
+Behavioral-equivalence search (when symbols differ, search by behavior):
+- When the donor's symbols/keywords do not exist at the target, do NOT stop there. The target may
+  implement the same vulnerability through a completely different mechanism after cross-version
+  refactoring. Derive the harmful *behavior* from the donor diff (what data persists, what gets
+  inherited, what check is missing) and search the target for that behavior.
+- Example: if the donor registers a security requirement in a service table and the fix deletes it,
+  ask "where does the target persist per-channel/per-SCN security requirements, and can they be
+  inherited by later connections on the same identifier?" — not just "does the donor's registration
+  function exist here?" The persistence mechanism may be a static map, a struct field, or a
+  callback chain with no name overlap at all.
+- Always search from both ends: (a) symbol match (fast but insufficient alone), and (b) behavioral
+  match (start from the donor's harm scenario, trace where that scenario is realized at the target
+  even if every intermediate name has changed).
+
+Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
 Limit exploration to the named candidate files and a small number of directly referenced API files;
 do not grep the whole checkout or run history commands that can expand to thousands of lines; use
 the four controlled tools under <run_dir>/bin instead. After you have one contiguous target excerpt
