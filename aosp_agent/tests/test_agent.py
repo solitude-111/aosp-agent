@@ -305,7 +305,11 @@ class AgentTest(unittest.TestCase):
                 })
 
             def assessment(self):
-                return {"status": "AFFECTED", "evidence": [
+                return {"status": "AFFECTED",
+                    "root_cause": {"category": "logic_error",
+                                    "description": "Old context lacks the protective change.",
+                                    "attack_vector": "Missing guard on the widget path."},
+                    "evidence": [
                     {"revision": "target", "path": "widget.py", "line_start": 1, "line_end": 3,
                      "excerpt": "alpha\nctx\nomega", "claim": "Target still has the old context."},
                     {"revision": "source_fix", "path": "widget.py", "line_start": 1, "line_end": 4,

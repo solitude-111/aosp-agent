@@ -83,7 +83,11 @@ class GitFixture:
             {"revision": "source_fix", "path": "counter.py", "line_start": 1, "line_end": 2,
              "excerpt": FIXED.rstrip("\n"), "claim": "Donor caps ordinary count values."},
         ]
-        return {"status": status, "evidence": evidence,
+        return {"status": status,
+                "root_cause": {"category": "input_validation",
+                               "description": "Unbounded count accepted without range clamping.",
+                               "attack_vector": "Caller passes a crafted count that bypasses the intended bounds."},
+                "evidence": evidence,
                 "reasoning": "Compare the target's ordinary count handling with the donor's bounds.",
                 "limitations": ["This is an orchestration fixture, not Android runtime evidence."]}
 

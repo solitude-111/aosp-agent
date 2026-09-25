@@ -38,11 +38,33 @@ regressions.
 """
 
 
+ROOT_CAUSE_CATEGORIES = [
+    "permission_bypass",     # 权限绕过/提权
+    "memory_safety",         # 内存越界/UAF/溢出
+    "race_condition",        # 竞态/并发
+    "integer_overflow",      # 整数溢出/截断
+    "input_validation",      # 输入校验缺失/注入
+    "logic_error",           # 逻辑缺失/状态管理错误
+    "info_leak",             # 信息泄露
+    "denial_of_service",     # 拒绝服务
+    "other",                 # 其他
+]
+
 IMPACT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
         "status": {"type": "string", "enum": ["AFFECTED", "NOT_AFFECTED", "UNKNOWN", "ALREADY_FIXED"]},
+        "root_cause": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "category": {"type": "string", "enum": ROOT_CAUSE_CATEGORIES},
+                "description": {"type": "string", "minLength": 1},
+                "attack_vector": {"type": "string", "minLength": 1},
+            },
+            "required": ["category", "description", "attack_vector"],
+        },
         "evidence": {
             "type": "array",
             "items": {
@@ -62,7 +84,7 @@ IMPACT_SCHEMA = {
         "reasoning": {"type": "string", "minLength": 1},
         "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}},
     },
-    "required": ["status", "evidence", "reasoning", "limitations"],
+    "required": ["status", "root_cause", "evidence", "reasoning", "limitations"],
 }
 
 
@@ -96,6 +118,14 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
         raise ValueError("impact limitations must be a list of nonempty strings")
     if not isinstance(raw["evidence"], list):
         raise ValueError("impact evidence must be a list")
+    rc = raw.get("root_cause")
+    if not isinstance(rc, dict) or set(rc) != {"category", "description", "attack_vector"}:
+        raise ValueError("impact root_cause must have exactly category, description, attack_vector")
+    if rc["category"] not in ROOT_CAUSE_CATEGORIES:
+        raise ValueError(f"impact root_cause category must be one of {ROOT_CAUSE_CATEGORIES}")
+    for key in ("description", "attack_vector"):
+        if not isinstance(rc[key], str) or not rc[key].strip():
+            raise ValueError(f"impact root_cause {key} is required")
     fields = set(IMPACT_SCHEMA["properties"]["evidence"]["items"]["required"])
     for item in raw["evidence"]:
         if not isinstance(item, dict) or set(item) != fields:
@@ -190,6 +220,20 @@ and one source excerpt, return the JSON response immediately.
 Keep product reachability and runtime validation claims separate from source-level conclusions;
 record unverified reachability, missing dependencies, and unexecuted regressions in limitations.
 Do not edit production source or tests, read evaluation oracles, or download/run PoCs.
+
+Root cause classification (required in the root_cause field):
+Categorize the vulnerability by its fundamental nature, not by the surface symptom:
+- permission_bypass: missing permission check, privilege escalation, unauthorized access
+- memory_safety: buffer overflow, use-after-free, out-of-bounds access, double free
+- race_condition: TOCTOU, missing lock, concurrent state corruption
+- integer_overflow: numeric truncation, sign confusion, wraparound leading to corruption
+- input_validation: injection, path traversal, unvalidated external input
+- logic_error: missing state check, incorrect transition, invariant violation
+- info_leak: sensitive data exposure through logs, side channels, or return values
+- denial_of_service: resource exhaustion, infinite loop, crash from crafted input
+- other: none of the above fits
+The attack_vector should describe the exploitation path in one sentence: what an attacker
+provides or triggers, and what the vulnerability enables them to achieve.
 
 Return only a JSON object matching this schema (no Markdown or additional fields):
 {json.dumps(IMPACT_SCHEMA, ensure_ascii=False)}

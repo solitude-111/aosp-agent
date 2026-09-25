@@ -53,7 +53,10 @@ class ContractTest(unittest.TestCase):
 
     def test_structured_impact_requires_target_evidence(self):
         raw = {"status": "AFFECTED", "evidence": [], "reasoning": "The target lacks the guard.",
-               "limitations": ["Runtime reachability is unverified."]}
+               "limitations": ["Runtime reachability is unverified."],
+               "root_cause": {"category": "logic_error",
+                               "description": "Missing guard allows unbounded values.",
+                               "attack_vector": "Caller passes an out-of-range value."}}
         with self.assertRaises(ValueError):
             parse_impact_response(json.dumps(raw))
         raw["status"] = "UNKNOWN"
@@ -106,6 +109,24 @@ class ContractTest(unittest.TestCase):
             self.assertIn(claims[0]["status"], ("implemented", "need_not_ported"))
             self.assertEqual(result["verification_memory"]["passed_stages"],
                              ["configured"])
+
+    def test_root_cause_category_validated(self):
+        """根因分析：分类必须来自预定义列表；缺 root_cause 整体拒绝。"""
+        base = {"status": "AFFECTED", "reasoning": "x", "limitations": [],
+                "evidence": [{"revision": "target", "path": "a.java", "line_start": 1,
+                              "line_end": 1, "excerpt": "x", "claim": "x"}]}
+        # 缺 root_cause → 拒绝
+        with self.assertRaises(ValueError):
+            parse_impact_response(json.dumps(base))
+        # 非法分类 → 拒绝
+        bad = {**base, "root_cause": {"category": "not_a_category", "description": "x",
+                                        "attack_vector": "x"}}
+        with self.assertRaises(ValueError):
+            parse_impact_response(json.dumps(bad))
+        # 合法分类 → 通过
+        for cat in ("permission_bypass", "memory_safety", "race_condition", "logic_error"):
+            good = {**base, "root_cause": {"category": cat, "description": "d", "attack_vector": "a"}}
+            self.assertEqual(parse_impact_response(json.dumps(good))["root_cause"]["category"], cat)
 
 
 if __name__ == "__main__":
