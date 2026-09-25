@@ -116,7 +116,8 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(result["status"], "VALIDATED")
             self.assertEqual(result["final_verification"]["status"], "PASS")
             self.assertIn("contract verified", result["final_verification"]["commands"][0]["stdout"])
-            self.assertEqual(len(runtime.calls), 2)
+            self.assertEqual(len(runtime.calls), 3)
+            self.assertEqual(result["post_fix_impact"]["overall_risk"], "low")
 
     def test_validation_failure_guides_revision_and_rechecks_it(self):
         with GitFixture() as fixture:
@@ -124,7 +125,7 @@ class AgentTest(unittest.TestCase):
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2)
             self.assertEqual(result["status"], "VALIDATED")
-            self.assertEqual(len(runtime.calls), 3)
+            self.assertEqual(len(runtime.calls), 4)
             self.assertIn("upper bound missing", runtime.calls[2]["prompt"])
             self.assertEqual(result["final_verification"]["status"], "PASS")
             self.assertIn("+    return max(0, min(value, 10))", Path(result["patch_file"]).read_text())

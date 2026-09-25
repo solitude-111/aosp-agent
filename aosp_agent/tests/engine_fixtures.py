@@ -144,6 +144,18 @@ class ScriptedRuntime:
             response = (json.dumps(self.assessment) if isinstance(self.assessment, dict)
                         else self.assessment)
         elif read_only:
+            if self._write_index > 0 and "business impact" in prompt.lower():
+                # 功能二：post-fix 评估回合（补丁验证通过后的只读分析）
+                pf = {"overall_risk": "low",
+                      "affected_callers": ["direct callers of the changed function"],
+                      "behavior_changes": ["bounds are now enforced"],
+                      "compatibility_risks": [],
+                      "performance_notes": [],
+                      "test_recommendations": ["verify existing callers still behave correctly"],
+                      "reasoning": "Fixture post-fix assessment."}
+                return {"status": "completed", "final_response": json.dumps(pf), "output": pf,
+                        "thread_id": "fixture-thread", "turn_id": f"fixture-turn-{len(self.calls)}",
+                        "usage": None, "elapsed_seconds": 0.0}
             # Evidence correction turns remain read-only and repeat the scripted
             # response when this fixture is testing exhaustion.
             response = (json.dumps(self.assessment) if isinstance(self.assessment, dict)

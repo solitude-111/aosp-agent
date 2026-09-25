@@ -15,7 +15,8 @@ from .diagnosis import apply_diagnosis, verification_diagnosis
 from .ladder import ladder_plan, strategy_prompt
 from .patch_repair import repair_hunk
 from .patches import split_hunks
-from .prompts import IMPACT_SCHEMA, SYSTEM, backport_prompt, impact_prompt, parse_impact_response
+from .prompts import (IMPACT_SCHEMA, POST_FIX_SCHEMA, SYSTEM, backport_prompt,
+                      impact_prompt, parse_impact_response, post_fix_prompt)
 from . import symbols
 
 _HUNK_RESULT_RE = re.compile(
@@ -612,7 +613,26 @@ class AospBackportAgent:
                 verification = self.verify()
                 self.record["final_verification"] = verification
                 if verification["status"] == "PASS":
-                    self.record["status"] = "VALIDATED"; return
+                    self.record["status"] = "VALIDATED"
+                    # 功能二：修复后业务影响评估（doc E 类）。补丁验证通过后，
+                    # 用一个只读回合分析补丁对系统的业务影响。评估失败不回退
+                    # VALIDATED 终态（评估是附加分析，不是门禁）。
+                    # 注意：不能用 self._turn(read_only=True) 因为那会做
+                    # "worktree 未变"审计——而此时 worktree 已包含最终补丁。
+                    try:
+                        pf_prompt = post_fix_prompt(self.case, patch) + context
+                        pf_result = runtime.run(pf_prompt, read_only=True,
+                                                output_schema=POST_FIX_SCHEMA)
+                        pf_output = pf_result.get("output") or json.loads(
+                            pf_result.get("final_response", "{}"))
+                        self.record["post_fix_impact"] = pf_output
+                        self._json("post-fix-impact.json", pf_output)
+                        self._event("post_fix_impact_assessed",
+                                    overall_risk=pf_output.get("overall_risk"))
+                    except Exception as exc:
+                        self.record["post_fix_impact"] = {"error": str(exc)[:200]}
+                        self._event("post_fix_impact_failed", error=str(exc)[:200])
+                    return
                 if verification["status"] == "NOT_CONFIGURED":
                     self.record["status"] = "PATCH_UNVERIFIED"; return
                 self.record["status"] = "VALIDATION_FAILED"

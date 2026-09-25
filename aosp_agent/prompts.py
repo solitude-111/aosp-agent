@@ -243,6 +243,67 @@ ellipses or invented line numbers.
 """
 
 
+POST_FIX_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "overall_risk": {"type": "string", "enum": ["low", "medium", "high"]},
+        "affected_callers": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "behavior_changes": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "compatibility_risks": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "performance_notes": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "test_recommendations": {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1},
+        },
+        "reasoning": {"type": "string", "minLength": 1},
+    },
+    "required": ["overall_risk", "affected_callers", "behavior_changes",
+                 "compatibility_risks", "performance_notes",
+                 "test_recommendations", "reasoning"],
+}
+
+
+def post_fix_prompt(case: Case, patch_diff: str = "") -> str:
+    return f"""Assess the business impact of the backported patch for {case.cve} on the AOSP 12 target system.
+
+The following patch has been generated and validated (compiles, passes contract checks):
+```diff
+{patch_diff}
+```
+
+Analyze the patch's implications for the target system. This is a READ-ONLY assessment —
+do NOT edit any files. Use the controlled tools (view-code, locate-symbol) to explore
+callers and context. Consider:
+
+1. Affected callers: who calls the changed functions/APIs? What breaks or changes for them?
+2. Behavior changes: what was possible before that is now blocked (or vice versa)?
+   Is any legitimate use case restricted by this fix?
+3. Compatibility risks: does the patch change any public API signature, AIDL interface,
+   file format, or externally observable behavior?
+4. Performance: does the patch add locks, allocations, or change hot paths?
+5. Test recommendations: what should be tested beyond the already-passed contract checks?
+
+Return a JSON object with this schema:
+{json.dumps(POST_FIX_SCHEMA, ensure_ascii=False)}
+
+Be honest and specific. An empty list is a valid answer if there are genuinely no items
+in a category. The overall_risk should reflect the worst-case business impact.
+"""
+
+
 def backport_prompt(case: Case, source_diff: str = "",
                     impact_assessment: dict[str, Any] | None = None,
                     commit_message: str = "",
