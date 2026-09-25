@@ -155,7 +155,18 @@ source contains the missing protection addressed by the fix. ALREADY_FIXED means
 contains an equivalent fix at the selected revision and should not be migrated. NOT_AFFECTED requires affirmative
 source evidence that equivalent protection already exists or the relevant logic is absent. UNKNOWN
 means evidence is insufficient; never infer NOT_AFFECTED merely from missing files or unavailable
-source. Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
+source.
+
+CRITICAL disambiguation rule (absence of protection is NOT absence of vulnerability):
+- The donor fix's symbols, mechanisms, or helper structures being absent at the target only means
+  the protection has not been introduced there yet. It is NEVER by itself a basis for NOT_AFFECTED.
+- To conclude NOT_AFFECTED you must point at the target's corresponding code path and demonstrate
+  concretely that the harmful behavior cannot occur there (cite the target lines that make it
+  impossible), not merely that the fix's target machinery is missing.
+- To conclude AFFECTED when the vulnerable construct differs from the donor's, you must trace the
+  actual target code path that exhibits the flaw end-to-end; structural similarity or "could
+  possibly" reasoning is insufficient — name the exact statements and data flow that realize the
+  harm. Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
 Limit exploration to the named candidate files and a small number of directly referenced API files;
 do not grep the whole checkout or run history commands that can expand to thousands of lines; use
 the four controlled tools under <run_dir>/bin instead. After you have one contiguous target excerpt
@@ -169,6 +180,27 @@ Return only a JSON object matching this schema (no Markdown or additional fields
 A determinate status requires at least one target evidence entry and one donor evidence entry.
 A citation is an exact contiguous excerpt from the stated revision and line range; do not use
 ellipses or invented line numbers.
+"""
+
+
+def counter_assessment_prompt(assessment: dict[str, Any]) -> str:
+    """方案二：结论对抗复核。正方判定已过证据锚定，此提示词要求模型站到反方立场。"""
+    return f"""You previously produced this grounded impact assessment:
+
+{json.dumps(assessment, ensure_ascii=False)}
+
+Your task now is adversarial self-review. Argue the STRONGEST case for the OPPOSITE verdict:
+- If the assessment says AFFECTED, hunt for evidence the target is actually protected or the
+  harmful path cannot execute (missing trigger, gate, caller, or configuration).
+- If it says NOT_AFFECTED or ALREADY_FIXED, hunt for the target code path where the harm DOES
+  occur in an older form — remember that absence of the donor fix's symbols is not evidence of
+  safety, only that the protection is missing.
+- If it says UNKNOWN, try to resolve it in either direction with concrete code.
+
+Then decide honestly: does the counter-case survive your own scrutiny better than the original?
+Return the verdict you now believe is correct (it may be the original, the opposite, or UNKNOWN
+if genuinely balanced) with fresh grounded evidence for the deciding point. Same JSON schema as
+before, same citation rules (exact contiguous excerpts from real Git blobs).
 """
 
 

@@ -15,7 +15,7 @@ from .diagnosis import apply_diagnosis, verification_diagnosis
 from .ladder import ladder_plan, strategy_prompt
 from .patch_repair import repair_hunk
 from .patches import split_hunks
-from .prompts import IMPACT_SCHEMA, SYSTEM, backport_prompt, impact_prompt, parse_impact_response
+from .prompts import IMPACT_SCHEMA, SYSTEM, backport_prompt, counter_assessment_prompt, impact_prompt, parse_impact_response
 from . import symbols
 
 _HUNK_RESULT_RE = re.compile(
@@ -522,6 +522,33 @@ class AospBackportAgent:
                                       "\nRe-read the exact blobs and line ranges. Return only the same "
                                       "JSON schema with corrected contiguous excerpts; do not edit files.\n" + context)
             assert assessment is not None
+            # 方案二（retest-r1 两例判定翻转的对策）：结论对抗复核。正方判定
+            # 过证据锚定后，再跑一个只读反方回合；结论一致才采纳，翻转判
+            # INCONCLUSIVE 交人工——随机抖动被自己的反方审视抓住，弱论证
+            # （如"推测可能泄漏"）在反方追问具体触发路径时露馅。
+            counter_request = counter_assessment_prompt(assessment) + context
+            counter = None
+            for counter_attempt in range(1, 3):
+                counter_result = self._turn(runtime, counter_request, read_only=True,
+                                            phase="impact_counter",
+                                            schema=IMPACT_SCHEMA)
+                self.record["impact_counter_report"] = counter_result.get("final_response", "")
+                try:
+                    counter = self._ground_assessment(counter_result.get("output",
+                                                                        counter_result["final_response"]))
+                    break
+                except AssessmentError as exc:
+                    self._event("counter_evidence_rejected", attempt=counter_attempt, error=str(exc))
+                    if counter_attempt == 2:
+                        # 反方自身证据不实且两轮未纠正：视为无有效反方意见，采纳正方
+                        counter = assessment
+            self.record["counter_assessment"] = counter
+            self._event("impact_counter", original=assessment["status"], counter=counter["status"])
+            if counter["status"] != assessment["status"]:
+                self.record["status"] = "INCONCLUSIVE"
+                self.record["impact_decision"] = "counter_flipped"
+                self._json("impact.json", assessment)
+                return
             self.record["assessment"] = assessment
             self.record["impact_decision"] = assessment["status"].lower()
             self.record["model_execution"] = "succeeded"

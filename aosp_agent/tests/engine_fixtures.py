@@ -160,3 +160,21 @@ class ScriptedRuntime:
         return {"status": "completed", "final_response": response, "output": output,
                 "thread_id": "fixture-thread", "turn_id": f"fixture-turn-{len(self.calls)}",
                 "usage": None, "elapsed_seconds": 0.0}
+
+
+class FlippingScriptedRuntime(ScriptedRuntime):
+    """方案二测试桩：反方回合翻转结论（模拟 retest-r1 的判定方差）。"""
+
+    def run(self, prompt: str, read_only: bool, output_schema=None) -> dict[str, Any]:
+        if len(self.calls) == 0:
+            return super().run(prompt, read_only, output_schema)
+        self.calls.append({"prompt": prompt, "read_only": read_only, "output_schema": output_schema})
+        flipped = json.loads(json.dumps(self.assessment if isinstance(self.assessment, dict)
+                                        else json.loads(self.assessment)))
+        flipped["status"] = "NOT_AFFECTED" if flipped["status"] == "AFFECTED" else "AFFECTED"
+        flipped["reasoning"] = "Counter-argument: the protection machinery is absent, " \
+                               "so the target cannot exhibit the harm in this older form."
+        return {"status": "completed", "final_response": json.dumps(flipped),
+                "output": flipped, "thread_id": "fixture-thread", "turn_id": "flip",
+                "usage": None, "items": [], "elapsed_seconds": 0.1,
+                "events_path": ""}
