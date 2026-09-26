@@ -44,6 +44,17 @@ def main() -> int:
                      help="maximum turns per assessment/backport phase, including the initial turn")
     run.add_argument("--turn-timeout", type=float, default=900,
                      help="timeout in seconds for each SDK turn")
+    inherit = sub.add_parser("inherit", help="cross-tag test inheritance analysis")
+    inherit.add_argument("cve")
+    inherit.add_argument("--dataset", dest="inherit_dataset", type=Path)
+    inherit.add_argument("--source-root", type=Path, required=True)
+    inherit.add_argument("--fix-patch", type=Path, required=True,
+                         help="path to a validated backport.patch from a previous run")
+    inherit.add_argument("--tag1", required=True, help="newer tag (already validated)")
+    inherit.add_argument("--tag2", required=True, help="older tag (inheritance target)")
+    inherit.add_argument("--model", default=None)
+    inherit.add_argument("--model-provider")
+    inherit.add_argument("--turn-timeout", type=float, default=900)
     args = parser.parse_args()
     if args.command == "diff":
         from .diff_engine import DiffBackportAgent
@@ -67,6 +78,24 @@ def main() -> int:
         for case in cases.values():
             print(f"{case.cve}\t{case.project}\t{case.repository}")
         return 0
+    if args.command == "inherit":
+        from .inherit import analyze_inheritance
+        case = cases[args.cve]
+        try:
+            result = analyze_inheritance(
+                args.cve, args.fix_patch, args.source_root, case.repository,
+                list(case.files), args.tag1, args.tag2,
+                model=args.model, model_provider=args.model_provider,
+                turn_timeout=args.turn_timeout)
+        except Exception as exc:
+            result = {"verdict": "ERROR", "reasoning": str(exc)}
+        output_path = args.fix_patch.parent / "inherit-result.json"
+        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+        summary = {k: result[k] for k in ("verdict", "confidence", "tag_diff_summary",
+                                           "tests_to_rerun") if k in result}
+        summary["result_file"] = str(output_path)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        return {"INHERIT": 0, "CONDITIONAL": 1, "RE_TEST": 2}.get(result.get("verdict"), 3)
     case = cases[args.cve]
     try:
         result = AospBackportAgent(args.source_root, args.run_root, case, args.model, args.donor_root,
