@@ -500,8 +500,23 @@ class AospBackportAgent:
                      model_provider=self.model_provider, turn_timeout=self.turn_timeout,
                      env={"GIT_NO_LAZY_FETCH": "1"}) as runtime:
             self.record["thread_id"] = runtime.start(str(self.worktree), SYSTEM + context)
+            # Diff 预处理：版本拷贝型 donor diff 提取安全修复 hunks +
+            # 推断漏洞类别，为影响判断提供定向搜索策略
+            from .diff_analysis import preprocess_donor_diff
+            preprocessed = preprocess_donor_diff(source_diff, self.commit_message)
+            if preprocessed["preprocessed"]:
+                source_diff = preprocessed["security_diff"]
+                self.record["donor_diff_preprocessed"] = {
+                    "type": preprocessed["type"],
+                    "vulnerability_class": preprocessed["vulnerability_class"],
+                    "extracted_hunks": preprocessed["extracted_hunks"],
+                    "filtered_hunks": preprocessed["filtered_hunks"],
+                    "original_diff_lines": preprocessed["original_diff_lines"]}
+                self._event("donor_diff_preprocessed", **self.record["donor_diff_preprocessed"])
             impact_request = impact_prompt(self.case, source_diff, self.commit_message,
-                                           symbol_report_text) + context
+                                           symbol_report_text,
+                                           vulnerability_class=preprocessed.get("vulnerability_class"),
+                                           preprocessed=preprocessed["preprocessed"]) + context
             assessment = None
             for impact_attempt in range(1, max_attempts + 1):
                 result = self._turn(runtime, impact_request, read_only=True,
