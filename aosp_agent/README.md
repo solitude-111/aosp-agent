@@ -29,7 +29,7 @@ SDK 执行层为 `sdk_runtime.py`，使用 `AsyncCodex`、官方 streaming turn�
 1. 固定 donor 修复及其真实父提交，创建干净的 Android 12 detached worktree。
 2. 分解 donor hunk，用独立临时 Git index 检查文本可应用性，保留冲突信息。
 3. SDK 以只读权限分析目标源码与相关 API，返回 AFFECTED、NOT_AFFECTED、ALREADY_FIXED 或 UNKNOWN 及源码证据。
-4. 控制器检查引用的 Git blob、文件、行范围和连续摘录；不一致时在同一线程请求只读纠正。
+4. 控制器检查引用的 Git blob、文件、行范围和连续摘录；`AFFECTED` 还必须索引覆盖 donor 故障、donor 修复、目标等价故障和目标危害的因果链证据。不一致时在同一线程请求只读纠正。
 5. 仅 AFFECTED 进入迁移。SDK 在独立工作树修改允许文件；每回合后审计路径、HEAD、符号链接和原始 checkout。
 6. 导出暂存、未暂存及新增测试文件，在新的干净 detached worktree 中独立重放补丁；执行控制器持有的分层验证命令并按失败反馈修订。
 

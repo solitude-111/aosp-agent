@@ -34,6 +34,19 @@ class AgentTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             _assert_patch_paths(patch.replace("src.cc", "other.cc"), {"src.cc"})
 
+    def test_impact_evidence_may_use_directly_referenced_tracked_file(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            agent.prepare()
+            inspection = agent.inspect()
+            agent._current_hunks = inspection["hunks"]
+            assessment = fixture.assessment()
+            assessment["evidence"][0].update({
+                "path": "verify_contract.py", "line_start": 2, "line_end": 2,
+                "excerpt": "assert normalize_count(4) == 4, 'ordinary count changed'",
+            })
+            self.assertEqual(agent._ground_assessment(assessment)["status"], "AFFECTED")
+
     def test_dataset_rejects_shell_validation(self):
         with GitFixture() as fixture:
             raw = {"cve": "CVE-2099-1", "project": "AOSP", "repository": "repo",
@@ -151,7 +164,7 @@ class AgentTest(unittest.TestCase):
     def test_wrong_source_revision_evidence_is_rejected(self):
         with GitFixture() as fixture:
             assessment = fixture.assessment()
-            assessment["evidence"][1]["revision"] = "source_parent"
+            assessment["evidence"][2]["revision"] = "source_parent"
             runtime = ScriptedRuntime(assessment)
             self.assert_failed(fixture, self.agent(fixture, runtime), max_attempts=3)
             self.assertEqual(len(runtime.calls), 3)
@@ -313,8 +326,19 @@ class AgentTest(unittest.TestCase):
                     "evidence": [
                     {"revision": "target", "path": "widget.py", "line_start": 1, "line_end": 3,
                      "excerpt": "alpha\nctx\nomega", "claim": "Target still has the old context."},
+                    {"revision": "source_parent", "path": "widget.py", "line_start": 1, "line_end": 4,
+                     "excerpt": "alpha\nctx\nbeta\nomega", "claim": "Donor parent has the old context."},
                     {"revision": "source_fix", "path": "widget.py", "line_start": 1, "line_end": 4,
                      "excerpt": "alpha\nchanged\nbeta\nomega", "claim": "Donor fix changes the line."}],
+                    "causal_chain": {
+                        "donor_fault_evidence": [2],
+                        "donor_fix_evidence": [3],
+                        "target_fault_evidence": [1],
+                        "target_harm_evidence": [1],
+                        "target_fault_state": "The target consumes the old context.",
+                        "donor_to_target_mapping": "Both paths consume the same contextual value.",
+                        "external_behavior_assumptions": [],
+                    },
                     "reasoning": "The protective change applies to the target's counterpart.",
                     "limitations": ["fixture"]}
         return _Conflict()

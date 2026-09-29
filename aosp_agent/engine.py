@@ -215,8 +215,6 @@ class AospBackportAgent:
         refs = {"target": self.case.target_commit, "source_parent": self.case.source_parent,
                 "source_fix": self.case.source_commit}
         for evidence in assessment["evidence"]:
-            if evidence["revision"] == "target" and evidence["path"] not in self.case.files:
-                raise AssessmentError(f"target evidence path is outside the case allowlist: {evidence['path']}")
             if (evidence["revision"] != "target"
                     and evidence["path"] not in self.case.files
                     and evidence["path"] not in getattr(self, "_source_changed_paths", set())):
@@ -244,7 +242,98 @@ class AospBackportAgent:
                     {"revision": evidence["revision"], "path": evidence["path"],
                      "requested": [start, end], "grounded": [actual_start, actual_end]})
                 evidence["line_start"], evidence["line_end"] = actual_start, actual_end
+        self._validate_impact_causality(assessment)
         return assessment
+
+    @staticmethod
+    def _changed_hunk_lines(hunk: dict[str, Any], revision: str) -> set[int]:
+        """Return changed line numbers in a donor hunk for parent or fix."""
+        changed: set[int] = set()
+        line_number = int(hunk.get("old_start", 0) if revision == "source_parent"
+                          else hunk.get("new_start", 0))
+        for line in hunk.get("patch", "").splitlines():
+            if line.startswith(("diff --git", "--- ", "+++ ", "@@")):
+                continue
+            marker = line[:1]
+            if marker == " ":
+                line_number += 1
+            elif marker == "-" and revision == "source_parent":
+                changed.add(line_number)
+                line_number += 1
+            elif marker == "+" and revision == "source_fix":
+                changed.add(line_number)
+                line_number += 1
+        return changed
+
+    @staticmethod
+    def _is_executable_evidence(evidence: dict[str, Any]) -> bool:
+        text = evidence["excerpt"]
+        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+        lines = []
+        for line in text.splitlines():
+            line = line.split("//", 1)[0].split("#", 1)[0].strip()
+            if line:
+                lines.append(line)
+        if not lines:
+            return False
+        non_executable_prefixes = ("package ", "import ", "include ", "from ", "@")
+        return any(not line.startswith(non_executable_prefixes) for line in lines)
+
+    def _validate_impact_causality(self, assessment: dict[str, Any]) -> None:
+        """Reject affected claims not tied to the fix-defined causal chain."""
+        status = assessment["status"]
+        causal = assessment.get("causal_chain")
+        if status != "AFFECTED":
+            if causal is not None:
+                raise AssessmentError("causal_chain is only valid for AFFECTED assessments")
+            return
+        if not isinstance(causal, dict):
+            raise AssessmentError("AFFECTED assessment requires causal_chain")
+
+        evidence = assessment["evidence"]
+        roles = {
+            "donor_fault_evidence": "source_parent",
+            "donor_fix_evidence": "source_fix",
+            "target_fault_evidence": "target",
+            "target_harm_evidence": "target",
+        }
+        selected: dict[str, list[dict[str, Any]]] = {}
+        for field, expected_revision in roles.items():
+            indices = causal.get(field, [])
+            if (not isinstance(indices, list) or not indices
+                    or any(type(index) is not int or not 1 <= index <= len(evidence) for index in indices)):
+                raise AssessmentError(f"causal_chain {field} contains an invalid evidence index")
+            entries = [evidence[index - 1] for index in indices]
+            if any(entry["revision"] != expected_revision for entry in entries):
+                raise AssessmentError(f"causal_chain {field} requires {expected_revision} evidence")
+            selected[field] = entries
+
+        for field, revision in (("donor_fault_evidence", "source_parent"),
+                                ("donor_fix_evidence", "source_fix")):
+            grounded = False
+            for entry in selected[field]:
+                for hunk in self._current_hunks:
+                    if hunk.get("path") != entry["path"]:
+                        continue
+                    changed_lines = self._changed_hunk_lines(hunk, revision)
+                    if any(entry["line_start"] <= line <= entry["line_end"] for line in changed_lines):
+                        grounded = True
+                        break
+                if grounded:
+                    break
+            if not grounded:
+                raise AssessmentError(
+                    f"causal_chain {field} must overlap the donor fix's changed lines")
+
+        for field in ("target_fault_evidence", "target_harm_evidence"):
+            if not all(self._is_executable_evidence(entry) for entry in selected[field]):
+                raise AssessmentError(f"causal_chain {field} must cite executable target statements")
+
+        assumptions = causal.get("external_behavior_assumptions", [])
+        if assumptions:
+            raise AssessmentError(
+                "AFFECTED cannot depend on external API behavior assumptions; use UNKNOWN, "
+                "or NOT_AFFECTED only if the donor-defined faulty data flow is affirmatively absent")
 
     def _turn(self, runtime, prompt: str, *, read_only: bool, phase: str, schema=None) -> dict:
         result = runtime.run(prompt, read_only=read_only, output_schema=schema)
@@ -535,8 +624,14 @@ class AospBackportAgent:
                         raise
                     impact_request = ("Your previous JSON assessment failed deterministic Git evidence "
                                       "grounding with this error:\n" + str(exc) +
-                                      "\nRe-read the exact blobs and line ranges. Return only the same "
-                                      "JSON schema with corrected contiguous excerpts; do not edit files.\n" + context)
+                                      "\nRe-read the exact blobs and line ranges. For AFFECTED, also supply "
+                                      "a valid causal_chain: source_parent changed-line evidence for the donor "
+                                      "fault, source_fix changed-line evidence for the fix delta, executable "
+                                      "target evidence for the equivalent faulty state, executable target "
+                                      "evidence for downstream harm, and no external behavior assumptions. "
+                                      "If equivalent target impact depends on uncited API behavior, return "
+                                      "UNKNOWN; return NOT_AFFECTED only when the donor-defined faulty data "
+                                      "flow is affirmatively absent. Do not edit files.\n" + context)
             assert assessment is not None
             self.record["assessment"] = assessment
             self.record["impact_decision"] = assessment["status"].lower()

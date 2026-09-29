@@ -81,6 +81,22 @@ IMPACT_SCHEMA = {
                 "required": ["revision", "path", "line_start", "line_end", "excerpt", "claim"],
             },
         },
+        "causal_chain": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "donor_fault_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+                "donor_fix_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+                "target_fault_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+                "target_harm_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+                "target_fault_state": {"type": "string", "minLength": 1},
+                "donor_to_target_mapping": {"type": "string", "minLength": 1},
+                "external_behavior_assumptions": {"type": "array", "items": {"type": "string", "minLength": 1}},
+            },
+            "required": ["donor_fault_evidence", "donor_fix_evidence", "target_fault_evidence",
+                         "target_harm_evidence", "target_fault_state", "donor_to_target_mapping",
+                         "external_behavior_assumptions"],
+        },
         "reasoning": {"type": "string", "minLength": 1},
         "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}},
     },
@@ -107,7 +123,9 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
             raw = json.loads(text)
         except (TypeError, ValueError) as exc:
             raise ValueError("impact response must be one JSON object") from exc
-    if not isinstance(raw, dict) or set(raw) != set(IMPACT_SCHEMA["required"]):
+    required = set(IMPACT_SCHEMA["required"])
+    optional = {"causal_chain"}
+    if not isinstance(raw, dict) or not set(raw).issubset(required | optional) or not required.issubset(raw):
         raise ValueError("impact response has missing or unexpected fields")
     if raw["status"] not in ("AFFECTED", "NOT_AFFECTED", "UNKNOWN", "ALREADY_FIXED"):
         raise ValueError("invalid impact status")
@@ -126,6 +144,24 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
     for key in ("description", "attack_vector"):
         if not isinstance(rc[key], str) or not rc[key].strip():
             raise ValueError(f"impact root_cause {key} is required")
+    causal_fields = set(IMPACT_SCHEMA["properties"]["causal_chain"]["required"])
+    if "causal_chain" in raw:
+        causal = raw["causal_chain"]
+        if not isinstance(causal, dict) or set(causal) != causal_fields:
+            raise ValueError("impact causal_chain has missing or unexpected fields")
+        for key in ("donor_fault_evidence", "donor_fix_evidence",
+                    "target_fault_evidence", "target_harm_evidence"):
+            values = causal[key]
+            if (not isinstance(values, list) or not values
+                    or any(type(value) is not int or value < 1 for value in values)):
+                raise ValueError(f"impact causal_chain {key} must be nonempty 1-based evidence indices")
+        for key in ("target_fault_state", "donor_to_target_mapping"):
+            if not isinstance(causal[key], str) or not causal[key].strip():
+                raise ValueError(f"impact causal_chain {key} is required")
+        assumptions = causal["external_behavior_assumptions"]
+        if (not isinstance(assumptions, list)
+                or any(not isinstance(item, str) or not item.strip() for item in assumptions)):
+            raise ValueError("impact causal_chain external_behavior_assumptions must be a list of nonempty strings")
     fields = set(IMPACT_SCHEMA["properties"]["evidence"]["items"]["required"])
     for item in raw["evidence"]:
         if not isinstance(item, dict) or set(item) != fields:
@@ -145,6 +181,19 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
 
 
 SEARCH_STRATEGIES = {
+    "logic_error": """
+Vulnerability-class search strategy (logic_error, target is many versions older):
+The donor fix changes a state/eligibility decision. Reconstruct the exact causal chain before
+deciding:
+1. donor parent: identify the concrete faulty state and the decision that consumes it;
+2. donor fix: identify the changed decision/invariant, not merely a stronger-looking API;
+3. target: find the same faulty state and show how target statements consume it;
+4. downstream harm: cite the target path that reaches the protected operation.
+The target's use of an older API is not a faulty state. If the donor's faulty value is produced by
+an API/mechanism absent from the target, AFFECTED requires positive evidence that the target's
+different mechanism produces the same bad value in the target source. A historical comment about an
+old API bug is only a search lead, never sufficient evidence.
+""",
     "integer_overflow": """
 Vulnerability-class search strategy (integer_overflow, target is many versions older):
 The donor fix widens narrow-type fields and/or adds bounds checks. The specific macro names
@@ -258,6 +307,24 @@ Behavioral-equivalence search (when symbols differ, search by behavior):
   match (start from the donor's harm scenario, trace where that scenario is realized at the target
   even if every intermediate name has changed).
 
+Fix-defined causal chain (required for every AFFECTED conclusion):
+- Define the vulnerability from the actual source_parent → source_fix semantic delta. Code and
+  comments outside that delta may guide investigation, but are context rather than the vulnerability
+  being assessed.
+- The mandatory causal_chain field must index evidence that establishes all four links:
+  donor parent faulty state, donor fix delta, target equivalent faulty state, and target downstream
+  harm. Indices are 1-based positions in the evidence array.
+- Donor fault evidence must come from source_parent and overlap a donor-removed/changed line.
+  Donor fix evidence must come from source_fix and overlap a donor-added/changed line.
+- Target fault and harm evidence must be executable target statements, not comments, imports,
+  declarations alone, or a historical note.
+- A target mechanism missing the donor's newer protection is not sufficient. Prove the target already
+  reaches the same faulty value/decision before the donor fix would apply.
+- Put every assumption about behavior of an API/type whose implementation is not cited from the
+  supplied repository in external_behavior_assumptions. If such an assumption is required to prove
+  target impact, do not return AFFECTED: use UNKNOWN when impact is unresolved, or NOT_AFFECTED only
+  when the donor fix's faulty data flow is affirmatively absent from the target.
+
 Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
 Limit exploration to the named candidate files and a small number of directly referenced API files;
 do not grep the whole checkout or run history commands that can expand to thousands of lines; use
@@ -284,6 +351,8 @@ provides or triggers, and what the vulnerability enables them to achieve.
 Return only a JSON object matching this schema (no Markdown or additional fields):
 {json.dumps(IMPACT_SCHEMA, ensure_ascii=False)}
 A determinate status requires at least one target evidence entry and one donor evidence entry.
+AFFECTED additionally requires the causal_chain field. NOT_AFFECTED, ALREADY_FIXED, and UNKNOWN
+must omit causal_chain.
 A citation is an exact contiguous excerpt from the stated revision and line range; do not use
 ellipses or invented line numbers.
 """

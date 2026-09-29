@@ -76,6 +76,12 @@ class ExtractTest(unittest.TestCase):
         hunks = ["+  if (!checkPermission(perm)) {\n+    return;\n+  }\n"]
         self.assertEqual(infer_vulnerability_class(hunks), "permission_bypass")
 
+    def test_infer_plain_eligibility_change_as_logic_error(self):
+        hunks = ["- return roleHolders.size() > 0;\n",
+                 "+ ApplicationInfo info = packageManager.getApplicationInfo(pkg, 0);\n",
+                 "+ return info.enabled;\n"]
+        self.assertEqual(infer_vulnerability_class(hunks), "logic_error")
+
 
 class PreprocessTest(unittest.TestCase):
     def test_surgical_passthrough(self):

@@ -70,7 +70,7 @@ def infer_vulnerability_class(hunks: list[str]) -> str:
         if _PERMISSION.search(line):
             scores["permission_bypass"] += 2
     best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "input_validation"
+    return best if scores[best] > 0 else "logic_error"
 
 
 def extract_security_hunks(diff_text: str) -> dict[str, Any]:

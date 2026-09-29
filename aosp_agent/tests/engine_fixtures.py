@@ -80,16 +80,29 @@ class GitFixture:
             {"revision": "target", "path": "counter.py", "line_start": 1, "line_end": 2,
              "excerpt": (FIXED if already_fixed else BASELINE).rstrip("\n"),
              "claim": "Target implementation at the selected baseline."},
+            {"revision": "source_parent", "path": "counter.py", "line_start": 1, "line_end": 2,
+             "excerpt": BASELINE.rstrip("\n"), "claim": "Donor parent accepts every count."},
             {"revision": "source_fix", "path": "counter.py", "line_start": 1, "line_end": 2,
              "excerpt": FIXED.rstrip("\n"), "claim": "Donor caps ordinary count values."},
         ]
-        return {"status": status,
+        assessment = {"status": status,
                 "root_cause": {"category": "input_validation",
                                "description": "Unbounded count accepted without range clamping.",
                                "attack_vector": "Caller passes a crafted count that bypasses the intended bounds."},
                 "evidence": evidence,
                 "reasoning": "Compare the target's ordinary count handling with the donor's bounds.",
                 "limitations": ["This is an orchestration fixture, not Android runtime evidence."]}
+        if status == "AFFECTED":
+            assessment["causal_chain"] = {
+                "donor_fault_evidence": [2],
+                "donor_fix_evidence": [3],
+                "target_fault_evidence": [1],
+                "target_harm_evidence": [1],
+                "target_fault_state": "The target returns the caller's count without clamping it.",
+                "donor_to_target_mapping": "Both normalize_count functions consume the same count value and return it to the caller.",
+                "external_behavior_assumptions": [],
+            }
+        return assessment
 
     def record(self) -> dict[str, Any]:
         return json.loads((self.run_root / "CVE-2099-2000" / "run.json").read_text())
@@ -176,4 +189,3 @@ class ScriptedRuntime:
         return {"status": "completed", "final_response": response, "output": output,
                 "thread_id": "fixture-thread", "turn_id": f"fixture-turn-{len(self.calls)}",
                 "usage": None, "elapsed_seconds": 0.0}
-
