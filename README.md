@@ -54,7 +54,7 @@ aosp_agent/
   inherit.py            跨标签继承分析
   case.py               案例输入契约和路径安全校验
   dataset/cases/        原始轻量案例
-  dataset/cases-r760/   R760 使用的 13 个 Android 安全案例描述
+  dataset/cases-r760/   R760 使用的 16 个 Android 安全案例描述
   tests/                单元测试（真实临时 Git 仓 + mock runtime）
 scripts/
   deepen_donor.sh       手动 donor 历史加深

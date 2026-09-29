@@ -51,6 +51,15 @@ class ContractTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             Case.from_dict(raw)
 
+    def test_donor_repository_mapping_is_explicit_and_defaults_to_target(self):
+        raw = self.case_data()
+        self.assertEqual(Case.from_dict(raw).donor_repository, raw["repository"])
+        raw["donor_repository"] = "packages/modules/IntentResolver"
+        self.assertEqual(Case.from_dict(raw).donor_repository, "packages/modules/IntentResolver")
+        raw["donor_repository"] = "../donor"
+        with self.assertRaises(ValueError):
+            Case.from_dict(raw)
+
     def test_structured_impact_requires_target_evidence(self):
         raw = {"status": "AFFECTED", "evidence": [], "reasoning": "The target lacks the guard.",
                "limitations": ["Runtime reachability is unverified."],

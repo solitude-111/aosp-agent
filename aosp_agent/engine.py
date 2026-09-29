@@ -45,7 +45,8 @@ class AospBackportAgent:
         self.model_provider = model_provider or os.environ.get("AOSP_AGENT_MODEL_PROVIDER")
         self.repo = (self.source_root / validate_relative_path(case.repository)).resolve()
         self.donor_root = donor_root.resolve() if donor_root else None
-        self.donor_repo = ((self.donor_root / _donor_slug(case.repository)).resolve()
+        donor_repository = case.donor_repository or case.repository
+        self.donor_repo = ((self.donor_root / _donor_slug(donor_repository)).resolve()
                            if self.donor_root else self.repo)
         if not self.repo.is_dir() or not self.repo.is_relative_to(self.source_root):
             raise ValueError("repository must be an existing directory below source_root")
@@ -77,6 +78,7 @@ class AospBackportAgent:
             "android_runtime": "NOT_CONFIGURED", "poc_execution": "NOT_RUN"}
         self.record["capabilities"] = {
             "multi_repository": "single_repository" if not case.repositories else "declared_not_orchestrated",
+            "donor_repository_mapping": "enabled" if case.donor_repository else "same_as_target",
             "repo_manifest": "declared" if case.manifest else "not_configured",
             "device_validation": "not_configured",
         }

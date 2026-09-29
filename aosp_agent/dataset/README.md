@@ -7,3 +7,5 @@
 `files` 同时列生产文件和允许新增的聚焦测试文件，必须是准确的仓库相对路径，不允许 Git 元数据目录、路径穿越或 glob。`validation` 必须是可信管理员提供的 argv 数组；加载器拒绝直接 shell 调用，但这不构成通用命令安全沙箱。PoC 不进入运行输入，也不会作为验证命令执行。
 
 新增案例时应先确认 Android 16 修复提交和父提交、Android 12 基线的 Git 对象都可读取。结构化影响报告由 `prompts.IMPACT_SCHEMA` 定义；`parse_impact_response` 检查格式，运行引擎还需对照相应 Git blob 验证引用的路径、行号和代码片段。
+
+`repository` 表示 Android 12 目标仓库。若 Android 16 donor 补丁来自模块化拆分后的不同仓库，可额外填写 `donor_repository`；donor 根会按该路径查找 `<donor_repository with slashes replaced by hyphens>.git`。该字段只描述输入来源，不向模型提供影响结论或迁移答案。

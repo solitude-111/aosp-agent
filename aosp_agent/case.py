@@ -29,6 +29,7 @@ class Case:
     target_version: str = ""
     manifest: str = ""
     repositories: tuple[dict[str, Any], ...] = ()
+    donor_repository: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "Case":
@@ -43,6 +44,7 @@ class Case:
         if not re.fullmatch(r"CVE-\d{4}-\d+", cve):
             raise ValueError(f"invalid CVE identifier: {cve}")
         repository = validate_relative_path(raw["repository"])
+        donor_repository = validate_relative_path(raw.get("donor_repository", repository))
         if not isinstance(raw["files"], list) or not raw["files"]:
             raise ValueError(f"case {cve} files must be a nonempty list")
         files = tuple(validate_relative_path(path) for path in raw["files"])
@@ -111,7 +113,8 @@ class Case:
                    source_url=str(raw.get("source_url", "")),
                    source_version=str(raw.get("source_version", "")),
                    target_version=str(raw.get("target_version", "")),
-                   manifest=str(raw.get("manifest", "")), repositories=tuple(repositories))
+                   manifest=str(raw.get("manifest", "")), repositories=tuple(repositories),
+                   donor_repository=donor_repository)
 
 
 def validate_relative_path(value: Any) -> str:
