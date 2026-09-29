@@ -41,12 +41,44 @@ def find_most_similar_block(pattern: list[str], main: list[str],
     utils.find_most_similar_block including the offset-alignment pass that
     snaps the window onto an exactly matching (whitespace-stripped) line.
     """
-    if p_len <= 0 or len(main) < p_len:
+    if p_len <= 0:
+        return 1, 0
+    if len(main) < p_len:
         return 1, 0 if p_len <= 0 else _distance("\n".join(pattern), "\n".join(main[:p_len]))
     joined_pattern = "\n".join(pattern)
+
+    # Exhaustive SequenceMatcher matching is quadratic in target length and is
+    # prohibitively slow for large framework files. Exact (whitespace-normalized)
+    # rare lines anchor the search; otherwise a bounded uniform sample keeps the
+    # diagnosis useful without making controller runtime depend on tree size.
+    starts: range | list[int]
+    if len(main) <= 512:
+        starts = range(len(main) - p_len + 1)
+    else:
+        positions: dict[str, list[int]] = {}
+        for index, line in enumerate(main):
+            normalized = line.strip()
+            if len(normalized) >= 3:
+                positions.setdefault(normalized, []).append(index)
+        anchor = min(
+            ((len(indices), -len(line.strip()), line) for line, indices in positions.items()
+             if len(indices) <= 256 and any(line == candidate.strip() for candidate in pattern)),
+            default=None,
+        )
+        candidates: set[int] = set()
+        if anchor is not None:
+            indices = positions[anchor[2]]
+            for pattern_index, candidate in enumerate(pattern):
+                if candidate.strip() == anchor[2]:
+                    candidates.update(index - pattern_index for index in indices)
+        step = max(1, (len(main) - p_len) // 1024)
+        candidates.update(range(0, len(main) - p_len + 1, step))
+        candidates.add(len(main) - p_len)
+        starts = sorted(index for index in candidates if 0 <= index <= len(main) - p_len)
+
     min_distance = None
     best_start_index = 1
-    for index in range(len(main) - p_len + 1):
+    for index in starts:
         candidate = "\n".join(main[index:index + p_len])
         distance = _distance(candidate, joined_pattern)
         if min_distance is None or distance < min_distance:

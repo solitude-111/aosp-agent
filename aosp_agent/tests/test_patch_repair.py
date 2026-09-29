@@ -7,6 +7,7 @@ split_hunks parser would reject such malformed hunks before repair ever
 sees them; through the engine those repairs are defensive no-ops).
 """
 import unittest
+from time import monotonic
 
 from aosp_agent.patches import split_hunks
 from aosp_agent.patch_repair import (
@@ -40,6 +41,16 @@ class FindMostSimilarBlockTest(unittest.TestCase):
 
     def test_empty_pattern_returns_start(self):
         self.assertEqual(find_most_similar_block([], TARGET, 0), (1, 0))
+
+    def test_large_target_search_is_anchored_and_bounded(self):
+        main = [f"line {index}" for index in range(20000)]
+        main[12345:12348] = ["rare anchor", "second anchor", "third anchor"]
+        pattern = ["rare anchor", "second anchor", "third anchor"]
+        started = monotonic()
+        start, distance = find_most_similar_block(pattern, main, len(pattern))
+        elapsed = monotonic() - started
+        self.assertEqual((start, distance), (12346, 0))
+        self.assertLess(elapsed, 2.0)
 
 
 class ExtractContextTest(unittest.TestCase):
