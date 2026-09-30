@@ -307,6 +307,25 @@ Behavioral-equivalence search (when symbols differ, search by behavior):
   match (start from the donor's harm scenario, trace where that scenario is realized at the target
   even if every intermediate name has changed).
 
+Multi-flow donor diffs:
+- Audit every distinct production behavior changed by the donor diff, not only the largest hunk or
+  the first vulnerable flow. Different hunks may harden different entry points that reach different
+  target equivalents.
+- Before returning NOT_AFFECTED, explicitly compare each donor-hardened production sink (for example
+  a provider query, thumbnail load, persistence write, or callback dispatch) with its target
+  counterpart. A single absent donor flow does not clear the remaining flows.
+- For a hunk that only adds an authorization/validation guard, the donor parent's unguarded call to
+  the protected sink is the faulty state; search the target for that same sink even when its wrapper
+  class, module, or language has changed.
+- A hardened sink that accepts caller-influenced data (for example URI query, thumbnail load,
+  provider call, persistence write, or callback dispatch) is input-agnostic. Its donor-era caller or
+  input mode may be newer than the target, but an older target caller using standard extras, ClipData,
+  direct arguments, or another wrapper can still reach the same vulnerable sink.
+- To clear such a sink as NOT_AFFECTED, prove either that the target has no equivalent executable
+  sink invocation at all or that an equivalent target guard already protects it. The absence of the
+  donor's newer input mode/wrapper is not sufficient. If target caller-controlled data reaches the
+  same unguarded sink, classify that flow as AFFECTED.
+
 Fix-defined causal chain (required for every AFFECTED conclusion):
 - Define the vulnerability from the actual source_parent → source_fix semantic delta. Code and
   comments outside that delta may guide investigation, but are context rather than the vulnerability
@@ -316,6 +335,8 @@ Fix-defined causal chain (required for every AFFECTED conclusion):
   harm. Indices are 1-based positions in the evidence array.
 - Donor fault evidence must come from source_parent and overlap a donor-removed/changed line.
   Donor fix evidence must come from source_fix and overlap a donor-added/changed line.
+  For a pure addition/deletion hunk with no changed line on the required side, cite the
+  adjacent executable context line inside that same hunk as the unchanged-side fix-site anchor.
 - Target fault and harm evidence must be executable target statements, not comments, imports,
   declarations alone, or a historical note.
 - A target mechanism missing the donor's newer protection is not sufficient. Prove the target already

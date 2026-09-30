@@ -11,6 +11,20 @@ HUNK = {
     "patch": "@@ -1,2 +1,2 @@\n def normalize_count(value):\n-    return value\n+    return bounded(value)\n",
 }
 
+PURE_ADDITION_HUNK = {
+    "path": "counter.py",
+    "old_start": 1,
+    "new_start": 1,
+    "patch": "@@ -1,2 +1,3 @@\n def normalize_count(value):\n+    validate(value)\n    return bounded(value)\n",
+}
+
+PURE_DELETION_HUNK = {
+    "path": "counter.py",
+    "old_start": 1,
+    "new_start": 1,
+    "patch": "@@ -1,3 +1,2 @@\n def normalize_count(value):\n-    return unbounded(value)\n    return bounded(value)\n",
+}
+
 
 def evidence(revision, start=1, end=2, excerpt="def normalize_count(value):\n    return value"):
     return {"revision": revision, "path": "counter.py", "line_start": start,
@@ -46,6 +60,27 @@ class ImpactCausalityTest(unittest.TestCase):
 
     def test_valid_fix_defined_chain_is_accepted(self):
         self.agent()._validate_impact_causality(assessment())
+
+    def test_pure_addition_accepts_parent_context_at_fix_site(self):
+        raw = assessment()
+        raw["causal_chain"]["donor_fault_evidence"] = [2]
+        agent = object.__new__(AospBackportAgent)
+        agent._current_hunks = [PURE_ADDITION_HUNK]
+        agent._validate_impact_causality(raw)
+
+    def test_pure_deletion_accepts_fix_context_at_fix_site(self):
+        raw = assessment()
+        raw["causal_chain"]["donor_fix_evidence"] = [3]
+        agent = object.__new__(AospBackportAgent)
+        agent._current_hunks = [PURE_DELETION_HUNK]
+        agent._validate_impact_causality(raw)
+
+    def test_context_does_not_replace_changed_lines_in_mixed_hunk(self):
+        raw = assessment()
+        raw["evidence"][1] = evidence(
+            "source_parent", 1, 1, "def normalize_count(value):")
+        with self.assertRaisesRegex(AssessmentError, "donor_fault_evidence"):
+            self.agent()._validate_impact_causality(raw)
 
     def test_affected_requires_causal_chain(self):
         raw = assessment()

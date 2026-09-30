@@ -24,6 +24,14 @@ class ContractTest(unittest.TestCase):
         direct = Case(**{**raw, "files": tuple(raw["files"]), "validation": ()})
         self.assertNotIn("SECRET_REFERENCE", impact_prompt(direct) + backport_prompt(direct))
 
+    def test_impact_prompt_requires_all_production_flows(self):
+        prompt = impact_prompt(Case.from_dict(self.case_data()))
+        self.assertIn("Audit every distinct production behavior", prompt)
+        self.assertIn("A single absent donor flow does not clear the remaining flows", prompt)
+        self.assertIn("input-agnostic", prompt)
+        self.assertIn("newer input mode/wrapper", prompt)
+        self.assertIn("is not sufficient", prompt)
+
     def test_runtime_dataset_is_separate_from_references(self):
         root = Path(__file__).resolve().parents[1] / "dataset"
         cases = load_cases(root / "cases")

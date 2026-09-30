@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -76,6 +77,17 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(agent.run()["status"], "INCONCLUSIVE")
             self.assertEqual([call["read_only"] for call in runtime.calls], [True])
             self.assertEqual(git(agent.worktree, "status", "--porcelain"), "")
+
+    def test_interrupted_worktree_registration_is_pruned_before_reuse(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture)
+            agent.run_dir.mkdir(parents=True)
+            git(fixture.repo, "worktree", "add", "--detach", str(agent.worktree),
+                fixture.target)
+            shutil.rmtree(agent.run_dir)
+            agent.prepare()
+            self.assertTrue(agent.worktree.is_dir())
+            self.assertEqual(git(agent.worktree, "rev-parse", "HEAD"), fixture.target)
 
 
 

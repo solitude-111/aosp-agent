@@ -145,6 +145,7 @@ class AospBackportAgent:
         target = self._git("rev-parse", self.case.target_commit).stdout.strip()
         target_tree = self._git("rev-parse", f"{target}^{{tree}}").stdout.strip()
         self.worktree.parent.mkdir(parents=True, exist_ok=True)
+        self._git("worktree", "prune")
         self._git("worktree", "add", "--detach", str(self.worktree), target)
         self.record.update(status="PREPARED", source_commit=self.case.source_commit,
                            source_parent=self.case.source_parent, target_commit=target,
@@ -249,8 +250,15 @@ class AospBackportAgent:
 
     @staticmethod
     def _changed_hunk_lines(hunk: dict[str, Any], revision: str) -> set[int]:
-        """Return changed line numbers in a donor hunk for parent or fix."""
+        """Return causal line numbers in a donor hunk for parent or fix.
+
+        A pure addition has no parent-side changed lines and a pure deletion has
+        no fix-side changed lines.  In those cases the hunk's adjacent context
+        is the only available anchor for the unchanged side of the fix site.
+        Context is never accepted when changed lines exist on that side.
+        """
         changed: set[int] = set()
+        context: set[int] = set()
         line_number = int(hunk.get("old_start", 0) if revision == "source_parent"
                           else hunk.get("new_start", 0))
         for line in hunk.get("patch", "").splitlines():
@@ -258,6 +266,7 @@ class AospBackportAgent:
                 continue
             marker = line[:1]
             if marker == " ":
+                context.add(line_number)
                 line_number += 1
             elif marker == "-" and revision == "source_parent":
                 changed.add(line_number)
@@ -265,7 +274,7 @@ class AospBackportAgent:
             elif marker == "+" and revision == "source_fix":
                 changed.add(line_number)
                 line_number += 1
-        return changed
+        return changed or context
 
     @staticmethod
     def _is_executable_evidence(evidence: dict[str, Any]) -> bool:
