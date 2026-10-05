@@ -26,6 +26,9 @@ class FakeHandle:
             return
         texts = {
             "completed": '{"verdict":"ready"}',
+            "deepseek_nullable": ('{"answer":"ok","optional":null,'
+                                  '"nested":{"required":"yes","optional":null}}'),
+            "deepseek_simple_nullable": '{"answer":"ok","optional":null}',
             # GLM's observed tail slip: complete body, misordered closers.
             "broken_tail": '{"verdict":"ready"}]}',
             # The real signature from CVE-2025-48533 mb-003 (limitations tail).
@@ -82,7 +85,7 @@ class FakeCodex:
 
 
 class RuntimeTest(unittest.TestCase):
-    def run_fake(self, mode, *, schema=None, timeout=1):
+    def run_fake(self, mode, *, schema=None, timeout=1, model=None, model_provider=None):
         fake = None
 
         def factory(config):
@@ -94,6 +97,8 @@ class RuntimeTest(unittest.TestCase):
             root = Path(directory)
             with patch("openai_codex.AsyncCodex", factory):
                 runtime = CodexRuntime(root / "events.jsonl", turn_timeout=timeout,
+                                       model=model,
+                                       model_provider=model_provider,
                                        env={"TEST_API_KEY": "example-secret-value"})
                 try:
                     with runtime:
@@ -134,6 +139,62 @@ class RuntimeTest(unittest.TestCase):
             self.assertEqual(runtime._codex.starts[0]["model_provider"], "ZAI")
             self.assertEqual(runtime._codex.thread.calls[0]["model"], "glm-5.3")
             self.assertEqual(runtime._codex.thread.calls[0]["effort"], "high")
+
+    def test_deepseek_strict_schema_nullables_are_wire_only(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "answer": {"type": "string"},
+                "optional": {"type": "string"},
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "required": {"type": "string"},
+                        "optional": {"type": "string"},
+                    },
+                    "required": ["required"],
+                },
+            },
+            "required": ["answer", "nested"],
+        }
+        original = json.loads(json.dumps(schema))
+        result, fake, events = self.run_fake(
+            "deepseek_nullable", schema=schema, model_provider="deepseek")
+        self.assertEqual(result["output"], {"answer": "ok", "nested": {"required": "yes"}})
+        self.assertEqual(schema, original)
+        wire_schema = fake.thread.calls[0]["output_schema"]
+        self.assertEqual(wire_schema["required"], ["answer", "nested", "optional"])
+        self.assertEqual(wire_schema["properties"]["nested"]["required"],
+                         ["optional", "required"])
+        self.assertEqual(wire_schema["properties"]["optional"]["anyOf"][0], {"type": "null"})
+        self.assertTrue(any(event.get("event") == "deepseek_schema_compat" for event in events))
+
+    def test_nullable_cleanup_is_not_used_for_other_providers(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"answer": {"type": "string"}, "optional": {"type": "string"}},
+            "required": ["answer"],
+        }
+        result, fake, _ = self.run_fake("deepseek_nullable", schema=schema)
+        self.assertIsInstance(result, CodexRuntimeError)
+        self.assertEqual(result.kind, "INVALID_OUTPUT")
+        self.assertEqual(fake.thread.calls[0]["output_schema"], schema)
+
+    def test_deepseek_model_slug_alone_enables_schema_compat(self):
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"answer": {"type": "string"}, "optional": {"type": "string"}},
+            "required": ["answer"],
+        }
+        result, fake, _ = self.run_fake(
+            "deepseek_simple_nullable", schema=schema, model="deepseek-flash",
+            model_provider=None)
+        self.assertEqual(result["output"], {"answer": "ok"})
+        self.assertIn("optional", fake.thread.calls[0]["output_schema"]["required"])
 
     def test_failed_and_interrupted_turns_are_not_success(self):
         for mode, expected in (("failed", "AUTH_REQUIRED"), ("interrupted", "INTERRUPTED"), ("missing_completion", "INCOMPLETE_TURN")):

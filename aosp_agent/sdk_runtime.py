@@ -27,6 +27,57 @@ class CodexRuntimeError(RuntimeError):
         self.details = details or {}
 
 
+def _schema_allows_null(schema: Any) -> bool:
+    if not isinstance(schema, dict):
+        return False
+    schema_type = schema.get("type")
+    if schema_type == "null" or (isinstance(schema_type, list) and "null" in schema_type):
+        return True
+    if None in schema.get("enum", []):
+        return True
+    return any(_schema_allows_null(item) for item in schema.get("anyOf", []))
+
+
+def _deepseek_strict_schema(schema: Any) -> Any:
+    """Return a DeepSeek-compatible schema without changing business semantics."""
+    if isinstance(schema, list):
+        return [_deepseek_strict_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    converted = {key: _deepseek_strict_schema(value) for key, value in schema.items()}
+    properties = converted.get("properties")
+    if not isinstance(properties, dict):
+        return converted
+    required = set(converted.get("required", []))
+    for name, property_schema in properties.items():
+        if name in required:
+            continue
+        if not _schema_allows_null(property_schema):
+            properties[name] = {"anyOf": [{"type": "null"}, property_schema]}
+        required.add(name)
+    converted["required"] = sorted(required)
+    return converted
+
+
+def _remove_wire_only_nulls(value: Any, schema: Any) -> Any:
+    """Remove nullable values that exist only to satisfy DeepSeek's wire schema."""
+    if isinstance(value, list):
+        item_schema = schema.get("items", {}) if isinstance(schema, dict) else {}
+        return [_remove_wire_only_nulls(item, item_schema) for item in value]
+    if not isinstance(value, dict) or not isinstance(schema, dict):
+        return value
+    properties = schema.get("properties", {})
+    required = set(schema.get("required", []))
+    cleaned = {}
+    for name, item in value.items():
+        property_schema = properties.get(name, {}) if isinstance(properties, dict) else {}
+        if (name in properties and name not in required and item is None
+                and not _schema_allows_null(property_schema)):
+            continue
+        cleaned[name] = _remove_wire_only_nulls(item, property_schema)
+    return cleaned
+
+
 class CodexRuntime:
     """One Codex conversation with explicit sandbox changes and durable events.
 
@@ -66,6 +117,10 @@ class CodexRuntime:
         self._cwd = None
         self._closed = False
         self._event_count = 0
+        self._deepseek_schema_compat = (
+            (self.model_provider or "").lower() == "deepseek"
+            or (self.model or "").lower().startswith("deepseek-")
+        )
         combined = {**os.environ, **self.env}
         self._secrets = tuple(value for name, value in combined.items()
                               if len(value) >= 8 and re.search(r"KEY|TOKEN|PASSWORD|SECRET|AUTH", name, re.I))
@@ -138,11 +193,18 @@ class CodexRuntime:
             validator_class = validator_for(output_schema)
             validator_class.check_schema(output_schema)
             validator = validator_class(output_schema)
+        wire_schema = (_deepseek_strict_schema(output_schema)
+                       if self._deepseek_schema_compat and output_schema is not None
+                       else output_schema)
         started = time.monotonic()
         self._log("turn_requested", thread_id=self._thread.id, prompt=prompt,
                   sandbox="read_only" if read_only else "workspace_write",
-                  output_schema=output_schema)
-        result = self._call(self._consume(prompt, read_only, output_schema), timeout=self.turn_timeout)
+                  output_schema=wire_schema)
+        if self._deepseek_schema_compat and output_schema is not None:
+            self._log("deepseek_schema_compat", original_required=output_schema.get("required", []),
+                      wire_required=wire_schema.get("required", []))
+        result = self._call(self._consume(prompt, read_only, wire_schema),
+                            timeout=self.turn_timeout)
         output, failure = self._validated_output(result, output_schema, validator)
         if failure is not None:
             # One corrective re-ask: a malformed structured reply is a
@@ -155,7 +217,7 @@ class CodexRuntime:
                           + "\nReturn the complete corrected reply now. Match the requested "
                             "JSON schema exactly: one JSON object only, valid syntax, no Markdown "
                             "fences, no commentary, no trailing characters.")
-            result = self._call(self._consume(correction, read_only, output_schema),
+            result = self._call(self._consume(correction, read_only, wire_schema),
                                 timeout=self.turn_timeout)
             output, failure = self._validated_output(result, output_schema, validator)
             if failure is not None:
@@ -193,6 +255,8 @@ class CodexRuntime:
             self._log("output_json_repaired", thread_id=self._thread.id,
                       original_tail=text[-40:], repaired_tail=repaired[-16:])
             result["json_repaired"] = True
+        if self._deepseek_schema_compat and output_schema is not None:
+            output = _remove_wire_only_nulls(output, output_schema)
         if validator is not None:
             try:
                 validator.validate(output)
