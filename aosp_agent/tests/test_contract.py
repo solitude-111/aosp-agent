@@ -69,7 +69,24 @@ class ContractTest(unittest.TestCase):
             Case.from_dict(raw)
 
     def test_structured_impact_requires_target_evidence(self):
-        raw = {"status": "AFFECTED", "evidence": [], "reasoning": "The target lacks the guard.",
+        scope = {
+            "vulnerability_pattern": "generic_data_flow",
+            "representation_change": "same_representation",
+            "donor_security_invariant": "Values remain guarded.",
+            "donor_fault_scope": "The donor fault path is the audited path.",
+            "target_counterpart_scope": "The target counterpart path is the audited path.",
+            "adjacent_behavior_excluded": "Adjacent callers are outside this audit.",
+        }
+        proof_steps = [
+            {"id": "donor_fault", "question": "Does the donor have the fault?",
+             "resolution": "The donor lacks the guard.", "resolved": True, "evidence": []},
+            {"id": "target_fault", "question": "Does the target have the fault?",
+             "resolution": "Target reachability is unresolved.", "resolved": False, "evidence": []},
+            {"id": "downstream_harm", "question": "Can the faulty value escape?",
+             "resolution": "Harm depends on target reachability.", "resolved": False, "evidence": []},
+        ]
+        raw = {"status": "AFFECTED", "scope_contract": scope, "proof_steps": proof_steps,
+               "evidence": [], "reasoning": "The target lacks the guard.",
                "limitations": ["Runtime reachability is unverified."],
                "root_cause": {"category": "logic_error",
                                "description": "Missing guard allows unbounded values.",
@@ -81,6 +98,9 @@ class ContractTest(unittest.TestCase):
         raw["status"] = "AFFECTED"
         raw["evidence"] = [{"revision": "target", "path": "src/Example.java", "line_start": 1,
                             "line_end": 1, "excerpt": "class Example {}", "claim": "No guard here."}]
+        for step in raw["proof_steps"]:
+            step["resolved"] = True
+            step["evidence"] = [1]
         self.assertEqual(parse_impact_response(json.dumps(raw)), raw)
         raw["status"] = "ALREADY_FIXED"
         self.assertEqual(parse_impact_response(json.dumps(raw))["status"], "ALREADY_FIXED")
@@ -130,6 +150,22 @@ class ContractTest(unittest.TestCase):
     def test_root_cause_category_validated(self):
         """根因分析：分类必须来自预定义列表；缺 root_cause 整体拒绝。"""
         base = {"status": "AFFECTED", "reasoning": "x", "limitations": [],
+                "scope_contract": {
+                    "vulnerability_pattern": "generic_data_flow",
+                    "representation_change": "same_representation",
+                    "donor_security_invariant": "x",
+                    "donor_fault_scope": "x",
+                    "target_counterpart_scope": "x",
+                    "adjacent_behavior_excluded": "x",
+                },
+                "proof_steps": [
+                    {"id": "donor_fault", "question": "x", "resolution": "x",
+                     "resolved": True, "evidence": [1]},
+                    {"id": "target_fault", "question": "x", "resolution": "x",
+                     "resolved": True, "evidence": [1]},
+                    {"id": "downstream_harm", "question": "x", "resolution": "x",
+                     "resolved": True, "evidence": [1]},
+                ],
                 "evidence": [{"revision": "target", "path": "a.java", "line_start": 1,
                               "line_end": 1, "excerpt": "x", "claim": "x"}]}
         # 缺 root_cause → 拒绝

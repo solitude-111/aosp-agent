@@ -6,9 +6,10 @@ Four subcommands mirroring RetroPatch's tool surface (locate_symbol,
 viewcode, git_history, git_show), exposed to the model as wrapper scripts
 under <run_dir>/bin/. Hard constraints enforced inside every command:
 
-- Git runs with --git-dir (donor bare store) or inside the target
-  worktree, always with GIT_NO_LAZY_FETCH=1 / GIT_TERMINAL_PROMPT=0 /
-  protocol.allow=never; no network access ever happens.
+- Git runs with --git-dir (donor bare store), inside the target worktree, or
+  inside a declared read-only dependency repository, always with
+  GIT_NO_LAZY_FETCH=1 / GIT_TERMINAL_PROMPT=0 / protocol.allow=never; no
+  network access ever happens.
 - --ref/--sha whitelists: only the commits recorded in run.json
   (target_commit / source_parent / source_commit) plus SHAs recorded by
   hunk-history in history-commits.jsonl.
@@ -70,6 +71,7 @@ class RunContext:
         self.allowed_refs = {self.record[name] for name in
                              ("target_commit", "source_parent", "source_commit")
                              if self.record.get(name)}
+        self.dependency_repositories = self.record.get("dependency_repositories", {})
         self.hunks = {hunk["id"]: hunk for hunk in self.inspection.get("hunks", [])}
 
     def history_shas(self) -> set[str]:
@@ -103,9 +105,27 @@ class RunContext:
             if not self.donor_git:
                 raise ToolError("this run has no separate donor store")
             return ["--git-dir", self.donor_git], None
-        raise ToolError("--repo must be target or donor")
+        if repo.startswith("dependency:"):
+            key = repo.split(":", 1)[1]
+            dependency = self.dependency_repositories.get(key)
+            if dependency is None:
+                raise ToolError(f"unknown read-only dependency repository: {key}")
+            root = Path(dependency["root"])
+            if not root.is_dir():
+                raise ToolError(f"read-only dependency repository is missing: {key}")
+            return [], root
+        raise ToolError("--repo must be target, donor, or dependency:<repository-path>")
 
-    def check_ref(self, ref: str) -> str:
+    def check_ref(self, ref: str, repo: str = "target") -> str:
+        if repo.startswith("dependency:"):
+            key = repo.split(":", 1)[1]
+            dependency = self.dependency_repositories.get(key)
+            allowed = {dependency["head"]} if dependency else set()
+            if ref not in allowed:
+                raise ToolError(f"--ref is not the pinned HEAD for {key}: {ref}")
+            return ref
+        if repo not in ("target", "donor"):
+            raise ToolError("invalid repository selector")
         if ref not in self.allowed_refs and ref not in self.history_shas():
             raise ToolError(f"--ref is not whitelisted for this run: {ref}")
         return ref
@@ -184,7 +204,7 @@ def _finish(ctx: RunContext, cmd: str, args, output: str, code: int = 0,
 
 
 def cmd_locate_symbol(ctx: RunContext, args) -> int:
-    ref = ctx.check_ref(args.ref)
+    ref = ctx.check_ref(args.ref, args.repo)
     validate_symbol = re.fullmatch(r"[A-Za-z_$][\w$]*", args.symbol or "")
     if not validate_symbol:
         raise ToolError("--symbol must be a plain identifier")
@@ -212,7 +232,7 @@ def cmd_locate_symbol(ctx: RunContext, args) -> int:
 
 
 def cmd_view_code(ctx: RunContext, args) -> int:
-    ref = ctx.check_ref(args.ref)
+    ref = ctx.check_ref(args.ref, args.repo)
     try:
         path = validate_relative_path(args.path)
     except ValueError as exc:
@@ -407,11 +427,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--run-dir", type=Path, required=True)
     sub = parser.add_subparsers(dest="cmd", required=True)
     locate = sub.add_parser("locate-symbol")
-    locate.add_argument("--repo", required=True, choices=["target", "donor"])
+    locate.add_argument("--repo", required=True)
     locate.add_argument("--ref", required=True)
     locate.add_argument("--symbol", required=True)
     view = sub.add_parser("view-code")
-    view.add_argument("--repo", required=True, choices=["target", "donor"])
+    view.add_argument("--repo", required=True)
     view.add_argument("--ref", required=True)
     view.add_argument("--path", required=True)
     view.add_argument("--start", type=int, required=True)

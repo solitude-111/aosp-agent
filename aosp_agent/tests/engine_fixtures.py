@@ -76,7 +76,7 @@ class GitFixture:
         })
 
     def assessment(self, status: str = "AFFECTED", *, already_fixed: bool = False) -> dict[str, Any]:
-        evidence = [] if status == "UNKNOWN" else [
+        evidence = [
             {"revision": "target", "path": "counter.py", "line_start": 1, "line_end": 2,
              "excerpt": (FIXED if already_fixed else BASELINE).rstrip("\n"),
              "claim": "Target implementation at the selected baseline."},
@@ -85,7 +85,32 @@ class GitFixture:
             {"revision": "source_fix", "path": "counter.py", "line_start": 1, "line_end": 2,
              "excerpt": FIXED.rstrip("\n"), "claim": "Donor caps ordinary count values."},
         ]
+        proof_steps = [
+            {"id": "donor_fault", "question": "Does the donor parent accept the unbounded count?",
+             "resolution": "The donor parent returns the caller value without clamping.",
+             "resolved": True, "evidence": [2]},
+            {"id": "target_fault", "question": "Does the target accept the unbounded count?",
+             "resolution": "The target returns the caller value without clamping.",
+             "resolved": status != "UNKNOWN", "evidence": [1]},
+            {"id": "downstream_harm", "question": "Can the unbounded value reach the caller?",
+             "resolution": "The target function returns the unbounded value.",
+             "resolved": status != "UNKNOWN", "evidence": [1]},
+        ]
+        if status in ("NOT_AFFECTED", "ALREADY_FIXED"):
+            proof_steps.append(
+                {"id": "equivalent_protection", "question": "Does the target already clamp the value?",
+                 "resolution": "The selected fixture evidence represents equivalent target protection.",
+                 "resolved": True, "evidence": [1]})
         assessment = {"status": status,
+                "scope_contract": {
+                    "vulnerability_pattern": "generic_data_flow",
+                    "representation_change": "same_representation",
+                    "donor_security_invariant": "Ordinary caller count values remain within the fixed bounds.",
+                    "donor_fault_scope": "The donor parent returns an unbounded caller count.",
+                    "target_counterpart_scope": "The target normalize_count function is the selected counterpart.",
+                    "adjacent_behavior_excluded": "Unrelated counting callers and diagnostics are outside this fixture.",
+                },
+                "proof_steps": proof_steps,
                 "root_cause": {"category": "input_validation",
                                "description": "Unbounded count accepted without range clamping.",
                                "attack_vector": "Caller passes a crafted count that bypasses the intended bounds."},

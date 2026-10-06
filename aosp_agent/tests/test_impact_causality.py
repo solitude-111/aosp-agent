@@ -44,6 +44,25 @@ def assessment(**causal_updates):
     causal.update(causal_updates)
     return {
         "status": "AFFECTED",
+        "scope_contract": {
+            "vulnerability_pattern": "generic_data_flow",
+            "representation_change": "same_representation",
+            "donor_security_invariant": "Returned counts remain bounded.",
+            "donor_fault_scope": "The donor parent returns an unbounded count.",
+            "target_counterpart_scope": "The target normalize_count function returns the count.",
+            "adjacent_behavior_excluded": "Other normalization callers are outside this audit.",
+        },
+        "proof_steps": [
+            {"id": "donor_fault", "question": "Does the donor parent have the fault?",
+             "resolution": "The donor parent returns the unbounded value.",
+             "resolved": True, "evidence": [2]},
+            {"id": "target_fault", "question": "Does the target have the fault?",
+             "resolution": "The target returns the unbounded value.",
+             "resolved": True, "evidence": [1]},
+            {"id": "downstream_harm", "question": "Does the unbounded value escape?",
+             "resolution": "The function returns the unbounded value to its caller.",
+             "resolved": True, "evidence": [1]},
+        ],
         "root_cause": {"category": "logic_error", "description": "fault", "attack_vector": "caller"},
         "evidence": [evidence("target"), evidence("source_parent"), evidence("source_fix")],
         "causal_chain": causal,
@@ -60,6 +79,18 @@ class ImpactCausalityTest(unittest.TestCase):
 
     def test_valid_fix_defined_chain_is_accepted(self):
         self.agent()._validate_impact_causality(assessment())
+
+    def test_valid_equivalent_representation_is_accepted(self):
+        raw = assessment()
+        raw["scope_contract"]["representation_change"] = "equivalent_representation"
+        raw["proof_steps"].append({
+            "id": "representation_equivalence",
+            "question": "Do both representations carry the same value?",
+            "resolution": "Both executable paths return the same count value.",
+            "resolved": True,
+            "evidence": [1, 2],
+        })
+        self.agent()._validate_impact_causality(raw)
 
     def test_pure_addition_accepts_parent_context_at_fix_site(self):
         raw = assessment()
@@ -96,6 +127,28 @@ class ImpactCausalityTest(unittest.TestCase):
         with self.assertRaisesRegex(AssessmentError, "donor_fault_evidence"):
             self.agent()._validate_impact_causality(raw)
 
+    def test_context_comment_cannot_bridge_equivalent_representation(self):
+        comment = "// An old API once returned the same value.\n"
+        raw = assessment()
+        raw["scope_contract"]["representation_change"] = "equivalent_representation"
+        raw["evidence"].append(evidence("source_parent", 1, 1, comment))
+        raw["proof_steps"].append({
+            "id": "representation_equivalence",
+            "question": "Does the old target representation carry the same value?",
+            "resolution": "The historical donor comment says the old API did.",
+            "resolved": True,
+            "evidence": [1, 4],
+        })
+        with self.assertRaisesRegex(AssessmentError, "representation_equivalence"):
+            self.agent()._validate_impact_causality(raw)
+
+    def test_target_pattern_proof_cannot_mix_donor_evidence(self):
+        raw = assessment()
+        step = next(step for step in raw["proof_steps"] if step["id"] == "target_fault")
+        step["evidence"] = [1, 2]
+        with self.assertRaisesRegex(AssessmentError, "target_fault.*target-only"):
+            self.agent()._validate_impact_causality(raw)
+
     def test_external_behavior_assumption_cannot_prove_affected(self):
         raw = assessment(external_behavior_assumptions=[
             "DefaultDialerManager returns a phantom dialer in the work profile"])
@@ -106,7 +159,7 @@ class ImpactCausalityTest(unittest.TestCase):
         comment = "// This path could be vulnerable.\n// No executable state is shown."
         raw = assessment()
         raw["evidence"][0] = evidence("target", 1, 2, comment)
-        with self.assertRaisesRegex(AssessmentError, "target_fault_evidence"):
+        with self.assertRaisesRegex(AssessmentError, "target_fault"):
             self.agent()._validate_impact_causality(raw)
 
     def test_parser_accepts_optional_causal_chain_shape(self):

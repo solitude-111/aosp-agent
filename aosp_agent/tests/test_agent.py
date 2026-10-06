@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -57,6 +58,13 @@ class AgentTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 Case.from_dict(raw)
 
+    def test_cli_module_is_importable(self):
+        completed = subprocess.run(
+            [sys.executable, "-m", "aosp_agent", "run", "--help"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        self.assertIn("--impact-only", completed.stdout)
+
     def test_preparation_is_not_reported_as_patch_completion(self):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment())
@@ -75,6 +83,16 @@ class AgentTest(unittest.TestCase):
             runtime = ScriptedRuntime(fixture.assessment("UNKNOWN"))
             agent = self.agent(fixture, runtime)
             self.assertEqual(agent.run()["status"], "INCONCLUSIVE")
+            self.assertEqual([call["read_only"] for call in runtime.calls], [True])
+            self.assertEqual(git(agent.worktree, "status", "--porcelain"), "")
+
+    def test_impact_only_stops_before_patch_phase_for_affected_case(self):
+        with GitFixture() as fixture:
+            runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
+            agent = self.agent(fixture, runtime)
+            result = agent.run(impact_only=True)
+            self.assertEqual(result["status"], "AFFECTED")
+            self.assertEqual(result["impact_decision"], "affected")
             self.assertEqual([call["read_only"] for call in runtime.calls], [True])
             self.assertEqual(git(agent.worktree, "status", "--porcelain"), "")
 
@@ -193,6 +211,41 @@ class AgentTest(unittest.TestCase):
         with GitFixture() as fixture:
             assessment = fixture.assessment()
             assessment["evidence"] = assessment["evidence"][:1]
+            runtime = ScriptedRuntime(assessment)
+            self.assert_failed(fixture, self.agent(fixture, runtime), max_attempts=3)
+            self.assertEqual(len(runtime.calls), 3)
+
+    def test_affected_assessment_requires_pattern_proof_steps(self):
+        with GitFixture() as fixture:
+            assessment = fixture.assessment()
+            assessment["proof_steps"] = [step for step in assessment["proof_steps"]
+                                         if step["id"] != "target_fault"]
+            runtime = ScriptedRuntime(assessment)
+            self.assert_failed(fixture, self.agent(fixture, runtime), max_attempts=3)
+            self.assertEqual(len(runtime.calls), 3)
+
+    def test_equivalent_representation_requires_comparison_proof(self):
+        with GitFixture() as fixture:
+            assessment = fixture.assessment()
+            assessment["scope_contract"]["representation_change"] = "equivalent_representation"
+            runtime = ScriptedRuntime(assessment)
+            self.assert_failed(fixture, self.agent(fixture, runtime), max_attempts=3)
+            self.assertEqual(len(runtime.calls), 3)
+
+    def test_unknown_assessment_requires_unresolved_material_question(self):
+        with GitFixture() as fixture:
+            assessment = fixture.assessment("UNKNOWN")
+            for step in assessment["proof_steps"]:
+                step["resolved"] = True
+            runtime = ScriptedRuntime(assessment)
+            self.assert_failed(fixture, self.agent(fixture, runtime), max_attempts=3)
+            self.assertEqual(len(runtime.calls), 3)
+
+    def test_not_affected_assessment_requires_clearing_proof(self):
+        with GitFixture() as fixture:
+            assessment = fixture.assessment("NOT_AFFECTED")
+            assessment["proof_steps"] = [step for step in assessment["proof_steps"]
+                                         if step["id"] != "equivalent_protection"]
             runtime = ScriptedRuntime(assessment)
             self.assert_failed(fixture, self.agent(fixture, runtime), max_attempts=3)
             self.assertEqual(len(runtime.calls), 3)
@@ -332,6 +385,25 @@ class AgentTest(unittest.TestCase):
 
             def assessment(self):
                 return {"status": "AFFECTED",
+                    "scope_contract": {
+                        "vulnerability_pattern": "generic_data_flow",
+                        "representation_change": "same_representation",
+                        "donor_security_invariant": "The widget consumes a protected value.",
+                        "donor_fault_scope": "The donor parent consumes the unprotected context.",
+                        "target_counterpart_scope": "The target consumes the corresponding context.",
+                        "adjacent_behavior_excluded": "Other widget callers are outside this fixture.",
+                    },
+                    "proof_steps": [
+                        {"id": "donor_fault", "question": "Does the donor parent have the fault?",
+                         "resolution": "The donor parent consumes the old context.",
+                         "resolved": True, "evidence": [2]},
+                        {"id": "target_fault", "question": "Does the target have the fault?",
+                         "resolution": "The target consumes the same old context.",
+                         "resolved": True, "evidence": [1]},
+                        {"id": "downstream_harm", "question": "Can the faulty value escape?",
+                         "resolution": "The widget path consumes the unprotected value.",
+                         "resolved": True, "evidence": [1]},
+                    ],
                     "root_cause": {"category": "logic_error",
                                     "description": "Old context lacks the protective change.",
                                     "attack_vector": "Missing guard on the widget path."},

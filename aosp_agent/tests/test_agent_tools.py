@@ -3,6 +3,7 @@ import json
 import os
 import subprocess
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from aosp_agent.agent_tools import main as tools_main
@@ -77,10 +78,38 @@ class AgentToolsTest(unittest.TestCase):
             self.assertEqual(self.run_tool(prepared, "view-code", "--repo", "target",
                                            "--ref", target, "--path", "../outside",
                                            "--start", "1", "--end", "2"), 2)
-            # argparse rejects an unknown --repo before the tool runs.
-            with self.assertRaises(SystemExit):
-                tools_main(["--run-dir", str(prepared.run_dir), "locate-symbol",
-                            "--repo", "somewhere", "--ref", target, "--symbol", "x"])
+            self.assertEqual(self.run_tool(prepared, "locate-symbol", "--repo", "somewhere",
+                                           "--ref", target, "--symbol", "x"), 2)
+
+    def test_declared_dependency_repository_is_read_only_and_pinned(self):
+        with PreparedRun() as prepared:
+            dependency = prepared.fixture.source_root / "dependency"
+            dependency.mkdir()
+            git(dependency, "init", "-q")
+            (dependency / "helper.py").write_text("def helper():\n    return 1\n")
+            git(dependency, "add", ".")
+            git(dependency, "commit", "-q", "-m", "dependency baseline")
+            head = git(dependency, "rev-parse", "HEAD")
+            case = replace(prepared.fixture.case(), repositories=(
+                {"path": "dependency", "role": "read_only_dependency", "files": ["helper.py"]},
+            ))
+            agent = AospBackportAgent(prepared.fixture.source_root,
+                                      prepared.fixture.root / "dependency-runs",
+                                      case, donor_root=prepared.donor_root)
+            agent.run(use_codex=False)
+            run_dir = prepared.fixture.root / "dependency-runs" / "CVE-2099-2000"
+            def run_dependency_tool(*argv):
+                return tools_main(["--run-dir", str(run_dir), *argv])
+
+            self.assertEqual(run_dependency_tool(
+                "view-code", "--repo", "dependency:dependency", "--ref", head,
+                "--path", "helper.py", "--start", "1", "--end", "2"), 0)
+            self.assertEqual(run_dependency_tool(
+                "view-code", "--repo", "dependency:dependency", "--ref", "0" * 40,
+                "--path", "helper.py", "--start", "1", "--end", "2"), 2)
+            self.assertEqual(run_dependency_tool(
+                "view-code", "--repo", "dependency:missing", "--ref", head,
+                "--path", "helper.py", "--start", "1", "--end", "2"), 2)
     def test_locate_symbol_miss_suggests_nearest(self):
         with PreparedRun() as prepared:
             target = prepared.record["target_commit"]

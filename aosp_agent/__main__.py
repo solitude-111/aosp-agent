@@ -39,6 +39,8 @@ def main() -> int:
                      help="prepare and inspect without starting a model; reports PREPARED")
     run.add_argument("--no-mechanical", action="store_true",
                      help="skip the pre-model mechanical hunk application (debug)")
+    run.add_argument("--impact-only", action="store_true",
+                     help="stop after the grounded impact decision without migrating a patch")
     run.add_argument("--verify", action="store_true")
     run.add_argument("--max-attempts", type=int, default=6,
                      help="maximum turns per assessment/backport phase, including the initial turn")
@@ -101,7 +103,7 @@ def main() -> int:
         result = AospBackportAgent(args.source_root, args.run_root, case, args.model, args.donor_root,
                                    args.model_provider, turn_timeout=args.turn_timeout).run(
             use_codex=not args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
-            mechanical=not args.no_mechanical)
+            mechanical=not args.no_mechanical, impact_only=args.impact_only)
     except Exception as exc:
         print(json.dumps({"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}},
                          ensure_ascii=False, indent=2))
@@ -110,7 +112,7 @@ def main() -> int:
                                           "patch_sha256", "final_verification", "error") if key in result}
     summary["record"] = str(args.run_root.resolve() / case.cve / "run.json")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return {"PREPARED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
+    return {"PREPARED": 0, "AFFECTED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
             "PATCH_UNVERIFIED": 3, "INCONCLUSIVE": 4, "VALIDATION_FAILED": 5}.get(result["status"], 2)
 
 

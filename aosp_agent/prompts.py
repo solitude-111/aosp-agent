@@ -15,9 +15,9 @@ ONLY sanctioned way to search history or locate code. Do not run git
 blame/log/find or recursive grep yourself; the tools are bounded, local-only
 and logged.
 
-- locate-symbol --repo target|donor --ref SHA --symbol NAME
+- locate-symbol --repo target|donor|dependency:<repository-path> --ref SHA --symbol NAME
     Locate a symbol (function/class) at a revision; suggests nearest names on miss.
-- view-code --repo target|donor --ref SHA --path P --start N --end M
+- view-code --repo target|donor|dependency:<repository-path> --ref SHA --path P --start N --end M
     Read a bounded slice of a file at a revision.
 - hunk-history --hunk-id ID
     Line-range history of that donor hunk between the target baseline and the
@@ -55,6 +55,43 @@ IMPACT_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "status": {"type": "string", "enum": ["AFFECTED", "NOT_AFFECTED", "UNKNOWN", "ALREADY_FIXED"]},
+        "scope_contract": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "vulnerability_pattern": {
+                    "type": "string",
+                    "enum": ["authorization_boundary", "persistent_state_pollution",
+                             "resource_bound", "generic_data_flow"],
+                },
+                "representation_change": {
+                    "type": "string",
+                    "enum": ["same_representation", "equivalent_representation", "no_counterpart"],
+                },
+                "donor_security_invariant": {"type": "string", "minLength": 20},
+                "donor_fault_scope": {"type": "string", "minLength": 20},
+                "target_counterpart_scope": {"type": "string", "minLength": 20},
+                "adjacent_behavior_excluded": {"type": "string", "minLength": 20},
+            },
+            "required": ["vulnerability_pattern", "representation_change",
+                         "donor_security_invariant", "donor_fault_scope",
+                         "target_counterpart_scope", "adjacent_behavior_excluded"],
+        },
+        "proof_steps": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "id": {"type": "string", "minLength": 3},
+                    "question": {"type": "string", "minLength": 12},
+                    "resolution": {"type": "string", "minLength": 1},
+                    "resolved": {"type": "boolean"},
+                    "evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+                },
+                "required": ["id", "question", "resolution", "resolved", "evidence"],
+            },
+        },
         "root_cause": {
             "type": "object",
             "additionalProperties": False,
@@ -100,7 +137,8 @@ IMPACT_SCHEMA = {
         "reasoning": {"type": "string", "minLength": 1},
         "limitations": {"type": "array", "items": {"type": "string", "minLength": 1}},
     },
-    "required": ["status", "root_cause", "evidence", "reasoning", "limitations"],
+    "required": ["status", "scope_contract", "proof_steps", "root_cause",
+                 "evidence", "reasoning", "limitations"],
 }
 
 
@@ -136,6 +174,34 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
         raise ValueError("impact limitations must be a list of nonempty strings")
     if not isinstance(raw["evidence"], list):
         raise ValueError("impact evidence must be a list")
+    scope_fields = set(IMPACT_SCHEMA["properties"]["scope_contract"]["required"])
+    scope = raw.get("scope_contract")
+    if not isinstance(scope, dict) or set(scope) != scope_fields:
+        raise ValueError("impact scope_contract has missing or unexpected fields")
+    for key in scope_fields - {"vulnerability_pattern", "representation_change"}:
+        if not isinstance(scope[key], str) or not scope[key].strip():
+            raise ValueError(f"impact scope_contract {key} is required")
+    if scope["vulnerability_pattern"] not in IMPACT_SCHEMA["properties"]["scope_contract"]["properties"]["vulnerability_pattern"]["enum"]:
+        raise ValueError("invalid impact scope_contract vulnerability_pattern")
+    if scope["representation_change"] not in IMPACT_SCHEMA["properties"]["scope_contract"]["properties"]["representation_change"]["enum"]:
+        raise ValueError("invalid impact scope_contract representation_change")
+    proof_fields = set(IMPACT_SCHEMA["properties"]["proof_steps"]["items"]["required"])
+    if not isinstance(raw["proof_steps"], list):
+        raise ValueError("impact proof_steps must be a list")
+    for step in raw["proof_steps"]:
+        if not isinstance(step, dict) or set(step) != proof_fields:
+            raise ValueError("impact proof_steps entries have missing or unexpected fields")
+        if not isinstance(step["id"], str) or not step["id"].strip():
+            raise ValueError("impact proof_steps id is required")
+        if not isinstance(step["question"], str) or not step["question"].strip():
+            raise ValueError("impact proof_steps question is required")
+        if not isinstance(step["resolution"], str) or not step["resolution"].strip():
+            raise ValueError("impact proof_steps resolution is required")
+        if type(step["resolved"]) is not bool:
+            raise ValueError("impact proof_steps resolved must be boolean")
+        if (not isinstance(step["evidence"], list)
+                or any(type(index) is not int or index < 1 for index in step["evidence"])):
+            raise ValueError("impact proof_steps evidence must be 1-based indices")
     rc = raw.get("root_cause")
     if not isinstance(rc, dict) or set(rc) != {"category", "description", "attack_vector"}:
         raise ValueError("impact root_cause must have exactly category, description, attack_vector")
@@ -250,6 +316,15 @@ def impact_prompt(case: Case, source_diff: str = "", commit_message: str = "",
         preprocess_note = ("\nNOTE: The donor diff is a version copy; the controller has "
                            "extracted only the security-relevant hunks below.\n" if preprocessed else "\n")
         strategy_block = preprocess_note + SEARCH_STRATEGIES[vulnerability_class]
+    dependencies = [item.get("path", "") for item in case.repositories
+                    if item.get("role") == "read_only_dependency"]
+    dependency_block = ""
+    if dependencies:
+        dependency_block = ("Read-only dependency repositories (view or locate symbols at their pinned HEAD only; "
+                            "use --repo dependency:<repository-path>): "
+                            + ", ".join(dependencies) + "\n"
+                            "These repositories are evidence inputs, never writable migration targets. If a material "
+                            "API/type implementation resides there, cite it instead of guessing its behavior.\n")
     return f"""Perform an independent read-only impact assessment for {case.cve} in AOSP.
 Project: {case.project}; repository path: {case.repository}
 Source fixed commit: {case.source_commit} (parent {case.source_parent})
@@ -262,7 +337,7 @@ The orchestrator supplied this donor diff for the source commit:
 ```diff
 {source_diff}
 ```
-{prescan_block}{strategy_block}
+{prescan_block}{strategy_block}{dependency_block}
 Work through the assessment in this order:
 1. Existence first: for each file/symbol the donor diff touches, check whether it exists
    at the target baseline (the pre-scan table above when present; refine with the
@@ -326,6 +401,56 @@ Multi-flow donor diffs:
   donor's newer input mode/wrapper is not sufficient. If target caller-controlled data reaches the
   same unguarded sink, classify that flow as AFFECTED.
 
+Donor vulnerability contract and proof steps (mandatory):
+- First construct scope_contract from the source_parent -> source_fix delta, not from a general
+  security theme. State the exact donor security invariant, the faulty scope being fixed, the target
+  counterpart selected or rejected, and adjacent hardening that is explicitly outside this CVE.
+- Choose vulnerability_pattern:
+  * authorization_boundary: caller-controlled input reaches a sensitive operation without checking
+    the calling identity's authority.
+  * persistent_state_pollution: role/connection-specific state is written into a namespace later
+    reused or inherited by the wrong consumer.
+  * resource_bound: attacker-influenced representation can exceed the bound enforced by the donor
+    fix and reach an expensive/persistent sink.
+  * generic_data_flow: use only when none of the preceding specialized patterns fits.
+- Choose representation_change:
+  * same_representation when the target uses the same field/type/API shape.
+  * equivalent_representation when names/types/wrappers differ but the target carries the same
+    security-relevant state or input to the same invariant.
+  * no_counterpart when the corresponding target data flow or sink is absent.
+- Every proof_steps entry must identify one question required by the pattern, its resolution,
+  resolved=true/false, and evidence indices. Evidence indices are mandatory for resolved steps.
+  Do not mark an uncited API behavior resolved.
+- Required proof ids by pattern:
+  * authorization_boundary: caller_controlled_input, authority_boundary_missing,
+    sensitive_sink, downstream_harm.
+  * persistent_state_pollution: state_write, shared_namespace, reuse_or_inheritance,
+    consumer_role_confusion, downstream_harm.
+  * resource_bound: unbounded_input, fix_scoped_representation, resource_consuming_sink,
+    equivalent_bound_absent, downstream_harm.
+  * generic_data_flow: donor_fault, target_fault, downstream_harm.
+- If representation_change is equivalent_representation, also include representation_equivalence:
+  prove that the old target representation carries the same security-relevant value and that the
+  donor parent does not already protect that old representation through a separate mechanism.
+  A merely related field with its own pre-existing bound/limit is not equivalent.
+- For AFFECTED, all pattern-required proof steps and representation_equivalence (when applicable)
+  must be resolved with valid evidence. For NOT_AFFECTED/ALREADY_FIXED, include and resolve either
+  counterpart_absence or equivalent_protection; for NOT_AFFECTED with representation_change=
+  equivalent_representation, representation_out_of_scope may substitute for counterpart_absence.
+  For UNKNOWN, at least one material proof step must remain unresolved and explain the exact missing
+  evidence. Do not use UNKNOWN to avoid stating a difficult but source-provable step.
+- Keep adjacent hardening out of scope unless the donor delta itself changes that flow. In particular,
+  an older alternate representation is not equivalent merely because it is the same general data
+  category; compare its input limit, persistence semantics, and donor-parent protection.
+- When a donor fix strengthens an existing guard, define the donor fault as the exact unvalidated
+  value that the parent consumes and the fix validates. Do not broaden it to every possible
+  unreliable predicate with the same business meaning. An older predecessor representation is in
+  scope only when the donor parent itself still consumes that representation or the donor delta
+  replaces it.
+- A historical comment in donor context (for example, a note about a pre-refactor API bug) is only
+  a search lead. It cannot expand the CVE scope or prove that an older target representation is
+  equivalent to the faulty donor construct changed by this delta.
+
 Fix-defined causal chain (required for every AFFECTED conclusion):
 - Define the vulnerability from the actual source_parent → source_fix semantic delta. Code and
   comments outside that delta may guide investigation, but are context rather than the vulnerability
@@ -339,6 +464,10 @@ Fix-defined causal chain (required for every AFFECTED conclusion):
   adjacent executable context line inside that same hunk as the unchanged-side fix-site anchor.
 - Target fault and harm evidence must be executable target statements, not comments, imports,
   declarations alone, or a historical note.
+- Pattern proof steps that describe the target (other than donor_fault and
+  representation_equivalence) must cite target evidence only. Do not mix donor comments into those
+  steps. representation_equivalence must compare executable donor code overlapping the donor delta
+  with executable target code.
 - A target mechanism missing the donor's newer protection is not sufficient. Prove the target already
   reaches the same faulty value/decision before the donor fix would apply.
 - Put every assumption about behavior of an API/type whose implementation is not cited from the

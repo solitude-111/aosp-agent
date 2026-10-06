@@ -29,6 +29,23 @@ class AssessmentError(ValueError):
     kind = "ASSESSMENT_INVALID"
 
 
+PROOF_STEP_REQUIREMENTS = {
+    "authorization_boundary": (
+        "caller_controlled_input", "authority_boundary_missing",
+        "sensitive_sink", "downstream_harm",
+    ),
+    "persistent_state_pollution": (
+        "state_write", "shared_namespace", "reuse_or_inheritance",
+        "consumer_role_confusion", "downstream_harm",
+    ),
+    "resource_bound": (
+        "unbounded_input", "fix_scoped_representation", "resource_consuming_sink",
+        "equivalent_bound_absent", "downstream_harm",
+    ),
+    "generic_data_flow": ("donor_fault", "target_fault", "downstream_harm"),
+}
+
+
 class AospBackportAgent:
     """Run independent AOSP impact assessment and a guarded SDK backport."""
 
@@ -77,7 +94,11 @@ class AospBackportAgent:
             "source_extracted_jvm": "NOT_CONFIGURED", "android_module_build": "NOT_CONFIGURED",
             "android_runtime": "NOT_CONFIGURED", "poc_execution": "NOT_RUN"}
         self.record["capabilities"] = {
-            "multi_repository": "single_repository" if not case.repositories else "declared_not_orchestrated",
+            "multi_repository": ("single_repository" if not case.repositories else
+                                 "read_only_dependencies" if all(item.get("role") == "read_only_dependency"
+                                                                 for item in case.repositories)
+                                 else "declared_not_orchestrated"),
+            "read_only_dependencies": len(case.repositories),
             "donor_repository_mapping": "enabled" if case.donor_repository else "same_as_target",
             "repo_manifest": "declared" if case.manifest else "not_configured",
             "device_validation": "not_configured",
@@ -117,9 +138,21 @@ class AospBackportAgent:
     def prepare(self) -> Path:
         self.run_dir.mkdir(parents=True, exist_ok=False)
         self._owns_run = True
-        extra_repositories = [item.get("path") for item in self.case.repositories
-                              if item.get("path") != self.case.repository]
-        if extra_repositories:
+        dependencies: dict[str, dict[str, str]] = {}
+        unsupported: list[str] = []
+        for item in self.case.repositories:
+            repository_path = item.get("path", "")
+            if repository_path == self.case.repository:
+                continue
+            if item.get("role") != "read_only_dependency":
+                unsupported.append(repository_path)
+                continue
+            repository_root = (self.source_root / validate_relative_path(repository_path)).resolve()
+            if not repository_root.is_dir() or not repository_root.is_relative_to(self.source_root):
+                raise ValueError(f"read-only dependency repository must exist below source_root: {repository_path}")
+            head = self._git("rev-parse", "HEAD", cwd=repository_root).stdout.strip()
+            dependencies[repository_path] = {"root": str(repository_root), "head": head}
+        if unsupported:
             self.record["status"] = "FAILED"
             self.record["capabilities"]["multi_repository"] = "declared_not_orchestrated"
             self.record["error"] = {"kind": "UNSUPPORTED_MULTI_REPOSITORY", "type": "ValueError",
@@ -153,6 +186,9 @@ class AospBackportAgent:
                            worktree=str(self.worktree), original_checkout=self._source_before,
                            commit_message=self.commit_message,
                            donor_git=str(self.donor_repo) if self.donor_root else None)
+        if dependencies:
+            self.record["dependency_repositories"] = dependencies
+            self._event("read_only_dependencies_prepared", repositories=dependencies)
         self._event("prepared", target_commit=target, worktree=str(self.worktree))
         self.audit_diff(require_clean=True)
         if self.input_diff is None:
@@ -290,9 +326,94 @@ class AospBackportAgent:
         non_executable_prefixes = ("package ", "import ", "include ", "from ", "@")
         return any(not line.startswith(non_executable_prefixes) for line in lines)
 
+    def _evidence_overlaps_donor_delta(self, evidence: dict[str, Any]) -> bool:
+        if evidence["revision"] not in ("source_parent", "source_fix"):
+            return False
+        for hunk in self._current_hunks:
+            if hunk.get("path") != evidence["path"]:
+                continue
+            changed_lines = self._changed_hunk_lines(hunk, evidence["revision"])
+            if any(evidence["line_start"] <= line <= evidence["line_end"]
+                   for line in changed_lines):
+                return True
+        return False
+
     def _validate_impact_causality(self, assessment: dict[str, Any]) -> None:
-        """Reject affected claims not tied to the fix-defined causal chain."""
+        """Reject conclusions not tied to a fix-defined scope and proof contract."""
         status = assessment["status"]
+        scope = assessment["scope_contract"]
+        pattern = scope["vulnerability_pattern"]
+        if scope["representation_change"] == "no_counterpart" and status == "AFFECTED":
+            raise AssessmentError("AFFECTED cannot use scope_contract.representation_change=no_counterpart")
+        if assessment["root_cause"]["category"] == "denial_of_service" and pattern != "resource_bound":
+            raise AssessmentError("denial_of_service assessments must use the resource_bound proof pattern")
+        if assessment["root_cause"]["category"] == "permission_bypass" and pattern != "authorization_boundary":
+            raise AssessmentError("permission_bypass assessments must use the authorization_boundary proof pattern")
+
+        steps = assessment["proof_steps"]
+        step_ids = [step["id"] for step in steps]
+        if len(step_ids) != len(set(step_ids)):
+            raise AssessmentError("impact proof_steps ids must be unique")
+        by_id = {step["id"]: step for step in steps}
+        required = set(PROOF_STEP_REQUIREMENTS[pattern])
+        if scope["representation_change"] == "equivalent_representation":
+            required.add("representation_equivalence")
+        missing = sorted(required - set(by_id))
+        if missing:
+            raise AssessmentError(f"impact proof_steps is missing required ids: {', '.join(missing)}")
+
+        for step in steps:
+            if step["resolved"] and not step["evidence"]:
+                raise AssessmentError(f"resolved impact proof step {step['id']} requires evidence")
+            if any(type(index) is not int or not 1 <= index <= len(assessment["evidence"])
+                   for index in step["evidence"]):
+                raise AssessmentError(f"impact proof step {step['id']} contains an invalid evidence index")
+
+        if status == "UNKNOWN":
+            unresolved = [step for step in steps if not step["resolved"]]
+            if not unresolved:
+                raise AssessmentError("UNKNOWN impact requires at least one unresolved material proof step")
+        else:
+            unresolved = [step for step in steps if not step["resolved"]]
+            if unresolved:
+                raise AssessmentError("determinate impact cannot have unresolved proof steps: "
+                                      + ", ".join(step["id"] for step in unresolved))
+
+        if status in ("NOT_AFFECTED", "ALREADY_FIXED"):
+            clearing_ids = {"counterpart_absence", "equivalent_protection"}
+            if scope["representation_change"] == "equivalent_representation":
+                clearing_ids.add("representation_out_of_scope")
+            clearing = [step for step in steps if step["id"] in clearing_ids and step["resolved"]]
+            if not clearing:
+                raise AssessmentError(f"{status} impact requires resolved counterpart_absence, "
+                                      "equivalent_protection, or representation_out_of_scope evidence")
+            if not any(assessment["evidence"][index - 1]["revision"] == "target"
+                       for step in clearing for index in step["evidence"]):
+                raise AssessmentError(f"{status} impact clearing proof must cite target evidence")
+            if status == "ALREADY_FIXED" and not any(step["id"] == "equivalent_protection" for step in clearing):
+                raise AssessmentError("ALREADY_FIXED impact requires equivalent_protection proof")
+
+        if status == "AFFECTED":
+            target_proof_ids = tuple(step_id for step_id in PROOF_STEP_REQUIREMENTS[pattern]
+                                     if step_id != "donor_fault")
+            for step_id in target_proof_ids:
+                entries = [assessment["evidence"][index - 1] for index in by_id[step_id]["evidence"]]
+                if not entries or any(entry["revision"] != "target" for entry in entries):
+                    raise AssessmentError(f"AFFECTED proof step {step_id} requires target-only evidence")
+                if not all(self._is_executable_evidence(entry) for entry in entries):
+                    raise AssessmentError(f"AFFECTED proof step {step_id} must cite executable target statements")
+            if scope["representation_change"] == "equivalent_representation":
+                entries = [assessment["evidence"][index - 1] for index in by_id["representation_equivalence"]["evidence"]]
+                if not all(self._is_executable_evidence(entry) for entry in entries):
+                    raise AssessmentError(
+                        "representation_equivalence must cite executable donor and target statements")
+                if not any(self._evidence_overlaps_donor_delta(entry) for entry in entries):
+                    raise AssessmentError(
+                        "representation_equivalence donor evidence must overlap the donor fix delta")
+                revisions = {entry["revision"] for entry in entries}
+                if not revisions & {"source_parent", "source_fix"} or "target" not in revisions:
+                    raise AssessmentError("representation_equivalence must compare donor and target evidence")
+
         causal = assessment.get("causal_chain")
         if status != "AFFECTED":
             if causal is not None:
@@ -566,7 +687,7 @@ class AospBackportAgent:
                  + "\nReconcile the declarations with the actual diff in your next turn.")}
 
     def _codex_workflow(self, inspection: dict[str, Any], verify: bool, max_attempts: int,
-                        mechanical: bool = True) -> None:
+                        mechanical: bool = True, impact_only: bool = False) -> None:
         if self.runtime_factory is None:
             from .sdk_runtime import CodexRuntime
             factory = CodexRuntime
@@ -635,20 +756,26 @@ class AospBackportAgent:
                         raise
                     impact_request = ("Your previous JSON assessment failed deterministic Git evidence "
                                       "grounding with this error:\n" + str(exc) +
-                                      "\nRe-read the exact blobs and line ranges. For AFFECTED, also supply "
+                                      "\nRe-read the exact blobs and line ranges. Repair scope_contract and "
+                                      "proof_steps as well as causal_chain. For AFFECTED, supply "
                                       "a valid causal_chain: source_parent changed-line evidence for the donor "
                                       "fault, source_fix changed-line evidence for the fix delta, executable "
                                       "target evidence for the equivalent faulty state, executable target "
-                                      "evidence for downstream harm, and no external behavior assumptions. "
+                                      "evidence for downstream harm, every pattern-required proof step, "
+                                      "representation_equivalence when applicable, and no external behavior assumptions. "
                                       "If equivalent target impact depends on uncited API behavior, return "
                                       "UNKNOWN; return NOT_AFFECTED only when the donor-defined faulty data "
-                                      "flow is affirmatively absent. Do not edit files.\n" + context)
+                                      "flow is affirmatively absent and cleared by target evidence. "
+                                      "Do not edit files.\n" + context)
             assert assessment is not None
             self.record["assessment"] = assessment
             self.record["impact_decision"] = assessment["status"].lower()
             self.record["model_execution"] = "succeeded"
             self._json("impact.json", assessment)
             self._event("impact_grounded", status=assessment["status"], evidence=len(assessment["evidence"]))
+            if impact_only:
+                self.record["status"] = assessment["status"]
+                return
             if assessment["status"] == "UNKNOWN":
                 self.record["status"] = "INCONCLUSIVE"; return
             if assessment["status"] in ("NOT_AFFECTED", "ALREADY_FIXED"):
@@ -766,7 +893,7 @@ class AospBackportAgent:
             return
 
     def run(self, *, use_codex: bool = True, verify: bool = False, max_attempts: int = 6,
-            mechanical: bool = True) -> dict[str, Any]:
+            mechanical: bool = True, impact_only: bool = False) -> dict[str, Any]:
         if max_attempts < 1:
             raise ValueError("max_attempts must be positive")
         try:
@@ -775,7 +902,8 @@ class AospBackportAgent:
             if not use_codex:
                 self.record.update(status="PREPARED", model_skipped=True)
             else:
-                self._codex_workflow(inspection, verify, max_attempts, mechanical=mechanical)
+                self._codex_workflow(inspection, verify, max_attempts, mechanical=mechanical,
+                                     impact_only=impact_only)
             self.audit_diff(require_clean=not use_codex)
             self._write_record(); return self.record
         except Exception as exc:
