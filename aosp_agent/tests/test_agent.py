@@ -471,6 +471,16 @@ class AgentTest(unittest.TestCase):
             self.assertIn("contradict", runtime.calls[2]["prompt"])
             self.assertEqual(result["hunk_results"][0]["status"], "need_not_ported")
 
+    def test_hunk_result_declaration_accepts_optional_colon(self):
+        with GitFixture() as fixture:
+            agent = self.agent(fixture, case=fixture.case(validation=True))
+            agent._current_hunks = [{"id": "f001-h001", "path": "counter.py"}]
+            claims = agent._check_hunk_results(
+                "HUNK-RESULT f001-h001 implemented: the counter guard was adapted.",
+                changed_files=["counter.py"])
+            self.assertTrue(claims["ok"])
+            self.assertEqual(claims["claims"][0]["status"], "implemented")
+
     def test_cross_file_mapping_claim_is_not_path_audited(self):
         # CVE-2025-32348 lesson: a donor path absent at the target baseline can
         # only be semantically ported into another allowlisted file; an

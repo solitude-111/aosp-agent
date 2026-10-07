@@ -20,7 +20,7 @@ from .prompts import (IMPACT_SCHEMA, POST_FIX_SCHEMA, SYSTEM, backport_prompt,
 from . import symbols
 
 _HUNK_RESULT_RE = re.compile(
-    r"^\s*HUNK-RESULT\s+(\S+)\s+(implemented|need_not_ported)\s+(.+?)\s*$", re.MULTILINE)
+    r"^\s*HUNK-RESULT\s+(\S+)\s+(implemented|need_not_ported):?\s+(.+?)\s*$", re.MULTILINE)
 
 
 class AssessmentError(ValueError):
