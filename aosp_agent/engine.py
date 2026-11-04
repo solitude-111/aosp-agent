@@ -1220,6 +1220,12 @@ class AospBackportAgent:
                      if line}
 
         if category == "already_present":
+            # A pure-reformat hunk introduces no novel semantic tokens; there
+            # is nothing site-specific to falsify (mirrors the rewrap-only
+            # acceptance in implemented-hunk evidence).
+            if (_changed_diff_lines(patch, added=True)
+                    and not _novel_tokens(patch)):
+                return None
             for target in targets:
                 analysis = self._target_baseline_analysis(target)
                 if analysis is None:
@@ -1443,13 +1449,44 @@ class AospBackportAgent:
                     prompt += ("\nIMPORTANT: your previous two turns produced byte-identical patches, "
                                "so every failure above is still unfixed. Re-submitting the same files "
                                "cannot pass. You MUST actually change the workspace this turn.\n")
-                result = self._turn(runtime, prompt, read_only=False,
-                                    phase=f"backport_{level['strategy']}")
-                self.record.setdefault("backport_reports", []).append(result.get("final_response", ""))
+                self.record.setdefault("backport_reports", [])
                 self.record["attempts"].append(
-                    {"index": attempt, "strategy": level["strategy"], "turn_id": result.get("turn_id"),
+                    {"index": attempt, "strategy": level["strategy"], "turn_id": None,
                      "patch_sha256": None})
-                patch = self.export_patch(attempt)
+                try:
+                    result = self._turn(runtime, prompt, read_only=False,
+                                        phase=f"backport_{level['strategy']}")
+                    patch = self.export_patch(attempt)
+                except RuntimeError as exc:
+                    message = str(exc)
+                    # Ordinary wrong-file edits retry with feedback; security
+                    # violations (symlink escape, moved HEAD, dirtied source
+                    # checkout) stay fatal.
+                    retryable = ("diff audit failed" in message
+                                 and "unsafe_paths': []" in message
+                                 and "head_unchanged': True" in message
+                                 and "original_checkout_unchanged': True" in message)
+                    if not retryable:
+                        raise
+                    # A rejected workspace (wrong file edited) is model
+                    # feedback, not a fatal condition: the ladder retries
+                    # with the exact audit contradiction.
+                    self.record["backport_reports"].append("")
+                    self.record["status"] = "VALIDATION_FAILED"
+                    self._event("patch_export_rejected", attempt=attempt, error=str(exc))
+                    self.record["attempt_verifications"][str(attempt)] = {
+                        "status": "NOT_RUN", "blocked_by": "PATCH_EXPORT",
+                        "patch_sha256": None, "commands": []}
+                    self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
+                    claim_feedback = (
+                        "Your workspace changes were rejected by the export audit: "
+                        f"{exc} Revert every edit outside the allowlisted case files "
+                        f"{sorted(self.case.files)} and place the fix in the correct "
+                        "allowlisted file.")
+                    failing_stages = ["patch_export"]
+                    continue
+                self.record["backport_reports"].append(result.get("final_response", ""))
+                self.record["attempts"][-1]["turn_id"] = result.get("turn_id")
                 self.record["attempts"][-1]["patch_sha256"] = self.record["patch_sha256"]
                 previous_patch_shas.append(self.record["patch_sha256"])
                 if not patch.strip():
@@ -1558,6 +1595,9 @@ class AospBackportAgent:
         untracked = set(filter(None, self._git("ls-files", "--others", "--exclude-standard", "-z",
                                                cwd=self.worktree).stdout.rstrip("\0").split("\0")))
         untracked -= self._artifact_paths
+        # out-artifacts/ is the controller-owned destination the module-build
+        # script copies compiled artifacts into; it is never model output.
+        untracked = {path for path in untracked if not path.startswith("out-artifacts/")}
         changed = sorted(tracked | untracked); unsafe = []
         for relative in self.case.files:
             path = self.worktree / relative

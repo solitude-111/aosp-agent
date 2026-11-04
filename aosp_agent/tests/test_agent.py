@@ -280,12 +280,20 @@ class AgentTest(unittest.TestCase):
             self.assertEqual((fixture.repo / "counter.py").read_text(), BASELINE)
 
     def test_unapproved_file_changes_fail_audit(self):
+        # new16-par2 lesson: a wrong-file edit exhausts the retry ladder with
+        # per-attempt feedback instead of terminating the run on first sight.
         with GitFixture() as fixture:
             def rogue(worktree):
                 write_counter(FIXED)(worktree)
                 (worktree / "rogue.txt").write_text("unapproved change\n")
-            runtime = ScriptedRuntime(fixture.assessment(), [rogue])
-            self.assert_failed(fixture, self.agent(fixture, runtime))
+            runtime = ScriptedRuntime(fixture.assessment(), [rogue, rogue])
+            self.assert_failed(fixture, self.agent(fixture, runtime),
+                               verify=True, max_attempts=2)
+            record = fixture.record()
+            self.assertEqual(record["status"], "FAILED")
+            events = [e.get("event") for e in record["events"] if isinstance(e, dict)]
+            self.assertIn("patch_export_rejected", events)
+            self.assertEqual(len(record.get("attempts", [])), 2)
             self.assertFalse((fixture.repo / "rogue.txt").exists())
 
     def test_changing_worktree_head_fails_audit(self):
@@ -488,6 +496,24 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(result["status"], "VALIDATION_FAILED")
             self.assertIn("contradict", runtime.calls[2]["prompt"])
             self.assertEqual(result["hunk_results"][0]["status"], "need_not_ported")
+
+    def test_wrong_file_edit_becomes_ladder_feedback_not_fatal(self):
+        # new16-par2/CVE-0000-283006437 lesson: editing outside the allowlist
+        # must reject the candidate and retry with the audit contradiction,
+        # not terminate the run.
+        with GitFixture() as fixture:
+            def stray_edit(worktree):
+                (worktree / "widget.py").write_text("bad\n")
+            def corrected(worktree):
+                (worktree / "widget.py").unlink(missing_ok=True)
+                (worktree / "counter.py").write_text(FIXED)
+            runtime = ScriptedRuntime(fixture.assessment(), [stray_edit, corrected])
+            result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
+                verify=True, max_attempts=2)
+            self.assertEqual(result["status"], "VALIDATED")
+            events = [e.get("event") for e in result["events"] if isinstance(e, dict)]
+            self.assertIn("patch_export_rejected", events)
+            self.assertEqual(len(result["attempts"]), 2)
 
     def test_ledger_blocked_candidate_does_not_reuse_previous_verification(self):
         with GitFixture() as fixture:
@@ -741,6 +767,27 @@ class AgentTest(unittest.TestCase):
                 "HUNK-RESULT f001-h001 need_not_ported "
                 "evidence=already_present tools=f3e8e566198a "
                 "target overwriteCell already clears both flags",
+                changed_files=[])
+            self.assertTrue(claims["ok"], claims["contradictions"])
+
+    def test_already_present_accepts_pure_reformat_hunk(self):
+        # new16-par2/CVE-0000-340480881 lesson: a donor hunk that only
+        # rewraps lines (no novel tokens) has nothing site-specific to
+        # falsify; already_present must not be rejected for it.
+        with GitFixture() as fixture:
+            agent = self._guard_agent(fixture, self.GUARD_SIBLING)
+            agent._current_hunks = [{
+                "id": "f001-h006", "path": "guard.c",
+                "patch": ("@@ -100,3 +100,2 @@\n"
+                          "                 app,\n"
+                          "                 packageName\n"
+                          "-            )\n"
+                          "-                ?: return\n"
+                          "+            ) ?: return\n")}]
+            claims = agent._check_hunk_results(
+                "HUNK-RESULT f001-h006 need_not_ported "
+                "evidence=already_present tools=f3e8e566198a "
+                "target keeps the original line wrapping",
                 changed_files=[])
             self.assertTrue(claims["ok"], claims["contradictions"])
 

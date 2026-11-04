@@ -10,6 +10,10 @@
 #   - 不用 set -u：envsetup.sh 引用未定义变量（TOP/ZSH_VERSION）会杀死 shell，
 #     且 || 兜底分支不会执行；还原必须用 trap，不能用分支。
 #   - 还原验证四项: HEAD / status 字节相等 / 索引指纹 / diff HEAD 为空。
+# 全局串行锁：多个 run 并行时，真仓 apply→编译→还原 必须原子串行
+exec 9>/data/junjie/.module-build-r760.lock
+flock 9
+
 WORKTREE="$(pwd)"
 # 引擎布局 run_root/<CVE>/<仓库路径>，补丁在 CVE 目录。仓库路径段数不一
 # （frameworks/base 两段、kernel 一段），固定层级推导会 overshoot——改为
