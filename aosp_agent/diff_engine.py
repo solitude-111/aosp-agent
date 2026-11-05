@@ -15,7 +15,7 @@ from pathlib import Path
 from .case import Case, validate_relative_path
 from .discovery import Locator, diff_units, local_git, repositories
 from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt, migration_prompt
-from .engine import AospBackportAgent, AssessmentError
+from .engine import AospBackportAgent, AssessmentError, CandidateRejected
 from .prompts import SYSTEM
 
 
@@ -332,7 +332,16 @@ class DiffBackportAgent:
                     patches, verification = {}, {}
                     for key, child in self.children.items():
                         child.record['attempt'] = attempt
-                        patch = child.export_patch(attempt)
+                        try:
+                            patch = child.export_patch(attempt)
+                        except CandidateRejected as exc:
+                            coverage_error = coverage_error or str(exc)
+                            verification[key] = {'status': 'NOT_RUN',
+                                                 'blocked_by': 'NEW_FILE_INTEGRATION'}
+                            child.record.update(status='VALIDATION_FAILED',
+                                                final_verification=verification[key])
+                            child._write_record()
+                            continue
                         if patch.strip():
                             patches[key] = {'file': str(child.run_dir / 'backport.patch'),
                                             'sha256': child.record['patch_sha256'], 'target': child.case.target_commit,

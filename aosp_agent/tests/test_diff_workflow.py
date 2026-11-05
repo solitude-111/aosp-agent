@@ -246,6 +246,29 @@ class DiffWorkflowTest(unittest.TestCase):
             result = agent.run(max_attempts=1)
             self.assertIn('test_count.py', Path(result['patches']['repo']['file']).read_text())
 
+    def test_unintegrated_new_source_is_retryable_in_diff_mode(self):
+        with GitFixture() as fx:
+            agent = self.agent(fx)
+            assessment = self.assessment(agent)
+            assessment['new_files'] = [{
+                'path': 'repo/NewHelper.py', 'anchor_path': 'repo/counter.py',
+                'reason': 'Claimed compatibility helper.',
+            }]
+
+            def edit(cwd):
+                (cwd / 'repo/counter.py').write_text(FIXED)
+                (cwd / 'repo/NewHelper.py').write_text(
+                    'def unused_clamp(value):\n    return max(0, min(value, 10))\n')
+
+            agent.factory = QueueRuntime([
+                (assessment, None), (self.coverage(agent), edit),
+            ]).factory
+            result = agent.run(max_attempts=1)
+            self.assertEqual(result['status'], 'MIGRATION_INCOMPLETE')
+            self.assertIn('new-file integration audit failed', result['coverage_error'])
+            self.assertEqual(result['verification']['repo']['blocked_by'],
+                             'NEW_FILE_INTEGRATION')
+
     def test_discovery_does_not_follow_symlink_repository(self):
         with GitFixture() as fx:
             root = fx.root / 'only-links'

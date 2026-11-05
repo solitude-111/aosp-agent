@@ -39,6 +39,18 @@ _COMMON_DIFF_TOKENS = {
     "const", "else", "false", "for", "if", "int", "new", "null", "return",
     "static", "true", "void", "while",
 }
+_GUARDED_SOURCE_SUFFIXES = {
+    ".aidl", ".c", ".cc", ".cpp", ".cxx", ".go", ".h", ".hpp",
+    ".java", ".kt", ".kts", ".m", ".mm", ".proto", ".py", ".rs",
+}
+_TEST_PATH_COMPONENTS = {
+    "benchmark", "benchmarks", "fuzz", "fuzzer", "fuzzers", "sample",
+    "samples", "test", "testdata", "test_data", "testing", "tests",
+}
+_DECLARED_SOURCE_IDENTIFIER_RE = re.compile(
+    r"\b(?:class|def|enum|fun|interface|object|record|struct|trait)\s+"
+    r"([A-Za-z_][A-Za-z0-9_]*)"
+)
 
 
 def _is_version_only_delta(old: str, new: str) -> bool:
@@ -87,6 +99,45 @@ def _context_diff_lines(patch: str) -> list[str]:
 
 def _strip_comments(line: str) -> str:
     return _BLOCK_COMMENT_RE.sub(" ", _LINE_COMMENT_RE.sub("", line))
+
+
+def _added_code_lines(patch: str) -> list[str]:
+    """Added lines that are not plainly comments or language imports."""
+    result = []
+    for line in _changed_diff_lines(patch, added=True):
+        code = _strip_comments(line).strip()
+        if (not code or code.startswith(("/*", "*", "*/", "<!--", "-->"))
+                or (code.startswith("#") and not code.startswith("#include"))
+                or re.match(r"^(?:import|package)\b|^from\s+\S+\s+import\b", code)):
+            continue
+        result.append(code)
+    return result
+
+
+def _is_test_or_fixture_path(path: str) -> bool:
+    parts = {part.lower() for part in Path(path).parts}
+    name = Path(path).name.lower()
+    stem = Path(path).stem
+    return (bool(parts & _TEST_PATH_COMPONENTS)
+            or name.startswith("test_") or Path(path).stem.lower().endswith("_test")
+            or stem.endswith(("Test", "Tests")))
+
+
+def _is_build_only_path(path: str) -> bool:
+    name = Path(path).name
+    return (name in {"Android.bp", "Android.mk", "BUILD", "BUILD.bazel", "CMakeLists.txt"}
+            or name.endswith((".bp", ".mk", ".bzl")))
+
+
+def _new_source_identities(path: str, patch_chunks: list[dict[str, Any]]) -> set[str]:
+    """Stable names an existing live file can use to activate a new source file."""
+    identities = {Path(path).stem, Path(path).name}
+    for chunk in patch_chunks:
+        for line in _added_code_lines(chunk.get("patch", "")):
+            match = _DECLARED_SOURCE_IDENTIFIER_RE.search(line)
+            if match:
+                identities.add(match.group(1))
+    return {identity for identity in identities if identity}
 
 
 _EVIDENCE_TAG_RE = re.compile(r"\b(?:evidence|tools|controller)=\S+")
@@ -194,6 +245,16 @@ class AssessmentError(ValueError):
     """The model's assessment could not be grounded in immutable Git blobs."""
 
     kind = "ASSESSMENT_INVALID"
+
+
+class CandidateRejected(RuntimeError):
+    """A candidate is retryable but must not reach independent validation."""
+
+    kind = "CANDIDATE_REJECTED"
+
+    def __init__(self, message: str, *, feedback: str | None = None):
+        super().__init__(message)
+        self.feedback = feedback or message
 
 
 PROOF_STEP_REQUIREMENTS = {
@@ -1462,10 +1523,11 @@ class AospBackportAgent:
                     # Ordinary wrong-file edits retry with feedback; security
                     # violations (symlink escape, moved HEAD, dirtied source
                     # checkout) stay fatal.
-                    retryable = ("diff audit failed" in message
-                                 and "unsafe_paths': []" in message
-                                 and "head_unchanged': True" in message
-                                 and "original_checkout_unchanged': True" in message)
+                    retryable = (isinstance(exc, CandidateRejected)
+                                 or ("diff audit failed" in message
+                                     and "unsafe_paths': []" in message
+                                     and "head_unchanged': True" in message
+                                     and "original_checkout_unchanged': True" in message))
                     if not retryable:
                         raise
                     # A rejected workspace (wrong file edited) is model
@@ -1474,11 +1536,13 @@ class AospBackportAgent:
                     self.record["backport_reports"].append("")
                     self.record["status"] = "VALIDATION_FAILED"
                     self._event("patch_export_rejected", attempt=attempt, error=str(exc))
+                    blocked_by = ("NEW_FILE_INTEGRATION" if isinstance(exc, CandidateRejected)
+                                  else "PATCH_EXPORT")
                     self.record["attempt_verifications"][str(attempt)] = {
-                        "status": "NOT_RUN", "blocked_by": "PATCH_EXPORT",
+                        "status": "NOT_RUN", "blocked_by": blocked_by,
                         "patch_sha256": None, "commands": []}
                     self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
-                    claim_feedback = (
+                    claim_feedback = (exc.feedback if isinstance(exc, CandidateRejected) else
                         "Your workspace changes were rejected by the export audit: "
                         f"{exc} Revert every edit outside the allowlisted case files "
                         f"{sorted(self.case.files)} and place the fix in the correct "
@@ -1616,9 +1680,107 @@ class AospBackportAgent:
         self._last_audit = result
         return result
 
+    def _new_file_integration_audit(self, audit: dict[str, Any],
+                                    candidate_patch: str) -> dict[str, Any]:
+        """Reject invented production files that are not connected to live target code.
+
+        A donor-created source file is allowed because file creation is part of the
+        supplied change. Test/fixture additions are recorded but do not need a
+        production reachability claim. Every other new source file must be named by
+        an added, non-import line in a baseline-existing file. Build inclusion alone
+        is deliberately insufficient: it proved unable to distinguish dead classes
+        from real backports in the new16 batch.
+        """
+        new_paths = sorted(audit.get("untracked_files", []))
+        result: dict[str, Any] = {"status": "PASS", "new_files": [], "rejected": []}
+        if not new_paths:
+            return result
+
+        try:
+            candidate_hunks = split_hunks(candidate_patch)
+        except ValueError as exc:
+            return {"status": "FAIL", "new_files": [],
+                    "rejected": [{"path": None, "reason": f"invalid candidate patch: {exc}"}]}
+        source_hunks = self._current_hunks
+        if not source_hunks and self.input_diff:
+            source_hunks = split_hunks(self.input_diff)
+        donor_added_paths = {
+            hunk.get("new_path") for hunk in source_hunks
+            if hunk.get("old_path") is None and hunk.get("new_path")
+        }
+        by_path: dict[str, list[dict[str, Any]]] = {}
+        for hunk in candidate_hunks:
+            by_path.setdefault(hunk["path"], []).append(hunk)
+
+        for path in new_paths:
+            entry: dict[str, Any] = {"path": path, "status": "PASS"}
+            suffix = Path(path).suffix.lower()
+            if _is_test_or_fixture_path(path):
+                entry["basis"] = "test_or_fixture"
+            elif suffix not in _GUARDED_SOURCE_SUFFIXES:
+                entry["basis"] = "non_source_artifact"
+            elif path in donor_added_paths:
+                entry["basis"] = "donor_created_source"
+            else:
+                identities = _new_source_identities(path, by_path.get(path, []))
+                activation = None
+                for target_path, hunks in sorted(by_path.items()):
+                    if target_path == path or _is_build_only_path(target_path):
+                        continue
+                    if self._target_baseline_lines(target_path) is None:
+                        continue
+                    for hunk in hunks:
+                        for code in _added_code_lines(hunk.get("patch", "")):
+                            matched = next(
+                                (identity for identity in sorted(identities, key=len, reverse=True)
+                                 if (((identity in {path, Path(path).name}) and identity in code)
+                                     or re.search(rf"\b{re.escape(identity)}\b", code))),
+                                None,
+                            )
+                            if matched:
+                                activation = {"path": target_path, "identifier": matched,
+                                              "excerpt": code}
+                                break
+                        if activation:
+                            break
+                    if activation:
+                        break
+                if activation:
+                    entry.update(basis="existing_target_integration", activation=activation)
+                else:
+                    entry.update(
+                        status="FAIL",
+                        basis="unintegrated_new_source",
+                        reason=("target baseline lacks this source file, the donor modified an "
+                                "existing file rather than creating it, and no baseline-existing "
+                                "target file adds a non-build reference to the new source"),
+                        identities=sorted(identities),
+                    )
+                    result["rejected"].append(entry)
+            result["new_files"].append(entry)
+        if result["rejected"]:
+            result["status"] = "FAIL"
+        return result
+
     def export_patch(self, attempt: int) -> str:
         audit = self.audit_diff()
         patch = self._render_patch(audit)
+        new_file_audit = self._new_file_integration_audit(audit, patch)
+        self.record.setdefault("new_file_audits", {})[str(attempt)] = new_file_audit
+        self._json(f"new-file-audit-{attempt}.json", new_file_audit)
+        if new_file_audit["status"] != "PASS":
+            rejected = [entry["path"] for entry in new_file_audit["rejected"]]
+            self._event("new_file_integration_rejected", attempt=attempt,
+                        rejected_files=rejected)
+            raise CandidateRejected(
+                "new-file integration audit failed: " + ", ".join(rejected),
+                feedback=("The candidate created source files that do not exist at the target "
+                          f"baseline and are not integrated by live target code: {rejected}. "
+                          "Do not recreate a newer-version class merely because it is allowlisted. "
+                          "Locate and edit the older target implementation instead. If a new helper "
+                          "is genuinely required, also connect it from a baseline-existing source, "
+                          "manifest, or registration file."),
+            )
         (self.run_dir / f"candidate-{attempt}.patch").write_text(patch)
         (self.run_dir / "backport.patch").write_text(patch)
         check = self._check_application(patch)

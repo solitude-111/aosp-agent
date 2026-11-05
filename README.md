@@ -26,6 +26,9 @@ AOSP Backport Agent 是一个数据驱动的 Android 安全补丁回移系统。
 
 - 模型申报的文件、行号和摘录会与 Git blob 中的内容逐字核实。
 - 未知、证据不足、空补丁、路径越界和验证失败均 fail-closed，不会默认视为成功。
+- 候选补丁若新建目标基线不存在的生产源码，控制器会区分 donor 原生新增、测试/fixture
+  和跨版本映射产物；后者必须由目标基线已有源码、Manifest 或注册配置显式接入，单纯被
+  Soong 通配编译不能证明落点有效。
 - 迁移阶段使用 T1–T6 六级策略阶梯，根据 apply、diff audit、验证和编译失败反馈自动重试。
 - 诊断信息包含实际 argv、stdout/stderr、补丁重放结果和结构化失败原因。
 - `VALIDATED` 只表示通过当前案例配置的验证范围，不自动等价于完整设备安全证明。
@@ -159,6 +162,7 @@ impact.json              影响判断、根因分类和源码证据
 diff-audit.json          每轮修改审计
 candidate-N.patch        每轮候选补丁
 backport.patch           最终导出补丁
+new-file-audit-N.json    新增文件分类与既有目标代码接入证据
 verification.json        分层验证结果
 post-fix-impact.json     补丁后业务影响评估
 sdk-events.jsonl         SDK streaming 事件
@@ -193,7 +197,7 @@ out-artifacts/           编译产物哈希输入
 .venv-sdk/bin/python -m unittest discover -s aosp_agent/tests -v
 ```
 
-当前推送分支包含 147 项测试（1 项按条件跳过），覆盖 Git 准备、diff 分解、路径审计、证据核实、机械迁移、补丁重放、SDK 事件解析、策略阶梯、根因分类、继承分析和失败反馈。
+当前分支包含 213 项测试（1 项按条件跳过），覆盖 Git 准备、diff 分解、路径审计、新文件接入门禁、证据核实、机械迁移、补丁重放、SDK 事件解析、策略阶梯、根因分类、继承分析和失败反馈。
 
 ## 边界与安全原则
 

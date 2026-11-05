@@ -8,7 +8,7 @@ from pathlib import Path
 
 from aosp_agent.case import Case
 from aosp_agent.engine import (AospBackportAgent, AssessmentError, _assert_patch_paths,
-                               _codex_error_kind, _extract_unified_diff)
+                               _added_code_lines, _codex_error_kind, _extract_unified_diff)
 from aosp_agent.tests.engine_fixtures import (
     BASELINE, FIXED, PARTIAL, GitFixture, ScriptedRuntime, git, write_counter,
 )
@@ -30,6 +30,19 @@ class AgentTest(unittest.TestCase):
         self.assertEqual(_codex_error_kind("unexpected status 401 Unauthorized"), "AUTH_REQUIRED")
         self.assertEqual(_codex_error_kind("unexpected status 403 Forbidden"), "AUTH_REQUIRED")
         self.assertEqual(_codex_error_kind("thread failed"), "CODEX_ERROR")
+
+    def test_new_file_activation_ignores_comments_and_imports(self):
+        patch = (
+            "@@ -1 +1,7 @@\n"
+            "+/**\n"
+            "+ * class CommentOnlyReference\n"
+            "+ */\n"
+            "+import example.ImportOnlyReference;\n"
+            "+from module import PythonImportOnly\n"
+            "+# PythonCommentOnly\n"
+            "+return LiveReference.run();\n"
+        )
+        self.assertEqual(_added_code_lines(patch), ["return LiveReference.run();"])
 
     def test_direct_patch_is_limited_to_allowed_files(self):
         patch = "diff --git a/src.cc b/src.cc\n--- a/src.cc\n+++ b/src.cc\n@@ -1 +1 @@\n-a\n+b\n"
@@ -349,6 +362,71 @@ class AgentTest(unittest.TestCase):
             self.assertEqual((clean / "test_counter.py").read_text(), new_test)
             self.assertEqual((clean / "counter.py").read_text(), FIXED)
 
+    def test_true_donor_source_addition_is_not_rejected_as_dead(self):
+        with GitFixture() as fixture:
+            added = "def clamp(value):\n    return max(0, min(value, 10))\n"
+            source_diff = (
+                "diff --git a/NewHelper.py b/NewHelper.py\n"
+                "new file mode 100644\n"
+                "--- /dev/null\n"
+                "+++ b/NewHelper.py\n"
+                "@@ -0,0 +1,2 @@\n"
+                "+def clamp(value):\n"
+                "+    return max(0, min(value, 10))\n"
+            )
+            case = Case.from_dict({
+                "cve": "CVE-2099-2001", "project": "new source fixture",
+                "repository": "repo", "source_commit": fixture.donor,
+                "source_parent": fixture.target, "target_commit": fixture.target,
+                "files": ["NewHelper.py"], "validation": [],
+            })
+            agent = AospBackportAgent(fixture.source_root, fixture.run_root, case,
+                                      source_diff=source_diff)
+            agent.prepare()
+            inspection = agent.inspect()
+            agent._current_hunks = inspection["hunks"]
+            (agent.worktree / "NewHelper.py").write_text(added)
+            patch = agent.export_patch(1)
+            self.assertIn("new file mode 100644", patch)
+            audit = agent.record["new_file_audits"]["1"]
+            self.assertEqual(audit["status"], "PASS")
+            self.assertEqual(audit["new_files"][0]["basis"], "donor_created_source")
+
+    def test_new_helper_is_allowed_when_existing_target_code_activates_it(self):
+        with GitFixture() as fixture:
+            source_diff = (
+                "diff --git a/NewHelper.py b/NewHelper.py\n"
+                "--- a/NewHelper.py\n"
+                "+++ b/NewHelper.py\n"
+                "@@ -1,2 +1,2 @@\n"
+                " class NewHelper:\n"
+                "-    pass\n"
+                "+    clamp = staticmethod(lambda value: max(0, min(value, 10)))\n"
+            )
+            case = Case.from_dict({
+                "cve": "CVE-2099-2002", "project": "integrated source fixture",
+                "repository": "repo", "source_commit": fixture.donor,
+                "source_parent": fixture.target, "target_commit": fixture.target,
+                "files": ["counter.py", "NewHelper.py"], "validation": [],
+            })
+            agent = AospBackportAgent(fixture.source_root, fixture.run_root, case,
+                                      source_diff=source_diff)
+            agent.prepare()
+            inspection = agent.inspect()
+            agent._current_hunks = inspection["hunks"]
+            (agent.worktree / "NewHelper.py").write_text(
+                "class NewHelper:\n"
+                "    clamp = staticmethod(lambda value: max(0, min(value, 10)))\n")
+            (agent.worktree / "counter.py").write_text(
+                "def normalize_count(value):\n"
+                "    return NewHelper.clamp(value)\n")
+            agent.export_patch(1)
+            audit = agent.record["new_file_audits"]["1"]
+            self.assertEqual(audit["status"], "PASS")
+            self.assertEqual(audit["new_files"][0]["basis"],
+                             "existing_target_integration")
+            self.assertEqual(audit["new_files"][0]["activation"]["path"], "counter.py")
+
     def test_export_records_independent_clean_replay(self):
         with GitFixture() as fixture:
             def edit_with_test(worktree):
@@ -514,6 +592,49 @@ class AgentTest(unittest.TestCase):
             events = [e.get("event") for e in result["events"] if isinstance(e, dict)]
             self.assertIn("patch_export_rejected", events)
             self.assertEqual(len(result["attempts"]), 2)
+
+    def test_missing_modified_donor_file_cannot_validate_as_dead_new_source(self):
+        # Reproduce the false-VALIDATED shape from new16: the donor modifies a
+        # class that does not exist at the target, and a shallow grep validator
+        # would accept a newly created but unreferenced replacement.
+        with GitFixture() as fixture:
+            git(fixture.repo, "checkout", "-q", "-b", "missing-donor-file", fixture.target)
+            (fixture.repo / "MissingHelper.py").write_text(BASELINE)
+            git(fixture.repo, "add", "MissingHelper.py")
+            git(fixture.repo, "commit", "-q", "-m", "donor parent has split helper")
+            source_parent = git(fixture.repo, "rev-parse", "HEAD")
+            (fixture.repo / "MissingHelper.py").write_text(FIXED)
+            git(fixture.repo, "add", "MissingHelper.py")
+            git(fixture.repo, "commit", "-q", "-m", "fix split helper")
+            source_commit = git(fixture.repo, "rev-parse", "HEAD")
+            git(fixture.repo, "checkout", "--detach", "-q", fixture.target)
+
+            case = Case.from_dict({
+                "cve": "CVE-2099-2003", "project": "dead source regression",
+                "repository": "repo", "source_commit": source_commit,
+                "source_parent": source_parent, "target_commit": fixture.target,
+                "files": ["MissingHelper.py"],
+                "validation": [["grep", "-Fq", "max(0", "MissingHelper.py"]],
+            })
+            assessment = fixture.assessment()
+            assessment["evidence"][1].update(path="MissingHelper.py",
+                                               excerpt=BASELINE.rstrip("\n"))
+            assessment["evidence"][2].update(path="MissingHelper.py",
+                                               excerpt=FIXED.rstrip("\n"))
+
+            def create_dead_source(worktree):
+                (worktree / "MissingHelper.py").write_text(FIXED)
+
+            runtime = ScriptedRuntime(assessment, [create_dead_source, create_dead_source])
+            agent = self.agent(fixture, runtime, case)
+            result = agent.run(verify=True, max_attempts=2)
+            self.assertEqual(result["status"], "VALIDATION_FAILED")
+            self.assertEqual(result["new_file_audits"]["1"]["status"], "FAIL")
+            self.assertEqual(result["final_verification"]["blocked_by"],
+                             "NEW_FILE_INTEGRATION")
+            self.assertFalse(any(path.name.startswith("validation-")
+                                 for path in agent.run_dir.iterdir()))
+            self.assertIn("not integrated by live target code", runtime.calls[2]["prompt"])
 
     def test_ledger_blocked_candidate_does_not_reuse_previous_verification(self):
         with GitFixture() as fixture:
