@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .case import Case, validate_relative_path
+from .git_policy import OFFLINE_GIT_ENV, offline_git_env
 from .diagnosis import apply_diagnosis, verification_diagnosis
 from .ladder import ladder_plan, strategy_prompt
 from .patch_repair import repair_hunk
 from .patches import split_hunks
+from .path_mapping import version_normalized_paths as _version_normalized_paths
 from .prompts import (IMPACT_SCHEMA, POST_FIX_SCHEMA, SYSTEM, backport_prompt,
                       impact_prompt, parse_impact_response, post_fix_prompt)
 from . import symbols
@@ -30,8 +32,6 @@ _NUMBER_RE = re.compile(r"\d+(?:\.\d+)*")
 _DOTTED_NUMBER_RE = re.compile(r"\d+(?:\.\d+)+")
 _LONG_HEX_RE = re.compile(r"\b[0-9a-f]{12,}\b", re.I)
 _TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?\b")
-_VERSIONED_PATH_COMPONENT = re.compile(
-    r"^(?:.*?[-_])?v?\d+(?:[._]\d+)*$", re.I)
 _SEMANTIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)*")
 _LINE_COMMENT_RE = re.compile(r"//.*$")
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/")
@@ -48,7 +48,7 @@ _TEST_PATH_COMPONENTS = {
     "samples", "test", "testdata", "test_data", "testing", "tests",
 }
 _DECLARED_SOURCE_IDENTIFIER_RE = re.compile(
-    r"\b(?:class|def|enum|fun|interface|object|record|struct|trait)\s+"
+    r"\b(?:class|enum|interface|object|record|struct|trait)\s+"
     r"([A-Za-z_][A-Za-z0-9_]*)"
 )
 
@@ -60,16 +60,6 @@ def _is_version_only_delta(old: str, new: str) -> bool:
     normalize = lambda text: _DOTTED_NUMBER_RE.sub(
         "<version>", _LONG_HEX_RE.sub("<hash>", _TIMESTAMP_RE.sub("<time>", text)))
     return normalize(old) == normalize(new)
-
-
-def _version_normalized_paths(path: str) -> set[str]:
-    """Return paths obtainable by dropping explicit version directory names."""
-    parts = path.split("/")
-    return {
-        "/".join(part for index, part in enumerate(parts) if index != drop)
-        for drop in range(len(parts) - 1)
-        if _VERSIONED_PATH_COMPONENT.fullmatch(parts[drop])
-    } - {path}
 
 
 def _changed_diff_lines(patch: str, added: bool) -> list[str]:
@@ -336,7 +326,7 @@ class AospBackportAgent:
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True,
              env: dict[str, str] | None = None, input: str | None = None):
         repo = cwd or self.repo
-        git_env = dict(os.environ if env is None else env, GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0")
+        git_env = offline_git_env(env)
         return subprocess.run(["git", "-c", f"safe.directory={repo}", "-c", "protocol.allow=never",
                                "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args], cwd=repo,
                               text=True, capture_output=True, check=check, env=git_env, input=input, timeout=180)
@@ -345,7 +335,7 @@ class AospBackportAgent:
         if self.donor_root:
             return subprocess.run(["git", "-c", "protocol.allow=never", "--git-dir", str(self.donor_repo), *args],
                                   text=True, capture_output=True, check=check, timeout=180,
-                                  env=dict(os.environ, GIT_NO_LAZY_FETCH="1", GIT_TERMINAL_PROMPT="0"))
+                                  env=offline_git_env())
         return self._git(*args, check=check)
 
     def _event(self, name: str, **data: Any) -> None:
@@ -1393,7 +1383,7 @@ class AospBackportAgent:
                               ) if symbol_report else None
         with factory(events_path=self.run_dir / "sdk-events.jsonl", model=self.model,
                      model_provider=self.model_provider, turn_timeout=self.turn_timeout,
-                     env={"GIT_NO_LAZY_FETCH": "1"}) as runtime:
+                     env=OFFLINE_GIT_ENV) as runtime:
             self.record["thread_id"] = runtime.start(str(self.worktree), SYSTEM + context)
             # Diff 预处理：版本拷贝型 donor diff 提取安全修复 hunks +
             # 推断漏洞类别，为影响判断提供定向搜索策略
@@ -1684,23 +1674,22 @@ class AospBackportAgent:
                                     candidate_patch: str) -> dict[str, Any]:
         """Reject invented production files that are not connected to live target code.
 
-        A donor-created source file is allowed because file creation is part of the
-        supplied change. Test/fixture additions are recorded but do not need a
-        production reachability claim. Every other new source file must be named by
-        an added, non-import line in a baseline-existing file. Build inclusion alone
+        Test/fixture additions are recorded but do not need a production
+        reachability claim. Every new production source file needs an added call
+        in a baseline-existing function or a manifest component registration. Build inclusion alone
         is deliberately insufficient: it proved unable to distinguish dead classes
         from real backports in the new16 batch.
         """
-        new_paths = sorted(audit.get("untracked_files", []))
         result: dict[str, Any] = {"status": "PASS", "new_files": [], "rejected": []}
-        if not new_paths:
-            return result
-
         try:
             candidate_hunks = split_hunks(candidate_patch)
         except ValueError as exc:
             return {"status": "FAIL", "new_files": [],
                     "rejected": [{"path": None, "reason": f"invalid candidate patch: {exc}"}]}
+        # The exported diff includes staged additions too. ls-files --others alone
+        # misses a new source as soon as a model stages it.
+        new_paths = sorted({h['new_path'] for h in candidate_hunks
+                            if h.get('old_path') is None and h.get('new_path')})
         source_hunks = self._current_hunks
         if not source_hunks and self.input_diff:
             source_hunks = split_hunks(self.input_diff)
@@ -1719,30 +1708,23 @@ class AospBackportAgent:
                 entry["basis"] = "test_or_fixture"
             elif suffix not in _GUARDED_SOURCE_SUFFIXES:
                 entry["basis"] = "non_source_artifact"
-            elif path in donor_added_paths:
-                entry["basis"] = "donor_created_source"
             else:
+                entry['donor_created'] = path in donor_added_paths
                 identities = _new_source_identities(path, by_path.get(path, []))
                 activation = None
                 for target_path, hunks in sorted(by_path.items()):
-                    if target_path == path or _is_build_only_path(target_path):
+                    if (target_path == path or _is_build_only_path(target_path)
+                            or _is_test_or_fixture_path(target_path)):
                         continue
-                    if self._target_baseline_lines(target_path) is None:
+                    baseline = self._target_baseline_lines(target_path)
+                    if baseline is None:
                         continue
-                    for hunk in hunks:
-                        for code in _added_code_lines(hunk.get("patch", "")):
-                            matched = next(
-                                (identity for identity in sorted(identities, key=len, reverse=True)
-                                 if (((identity in {path, Path(path).name}) and identity in code)
-                                     or re.search(rf"\b{re.escape(identity)}\b", code))),
-                                None,
-                            )
-                            if matched:
-                                activation = {"path": target_path, "identifier": matched,
-                                              "excerpt": code}
-                                break
-                        if activation:
-                            break
+                    from .integration import activation as find_activation
+                    candidate = self.worktree / target_path
+                    if not candidate.is_file():
+                        continue
+                    activation = find_activation(target_path, '\n'.join(baseline),
+                                                 candidate.read_text(), hunks, identities)
                     if activation:
                         break
                 if activation:
@@ -1751,8 +1733,7 @@ class AospBackportAgent:
                     entry.update(
                         status="FAIL",
                         basis="unintegrated_new_source",
-                        reason=("target baseline lacks this source file, the donor modified an "
-                                "existing file rather than creating it, and no baseline-existing "
+                        reason=("target baseline lacks this source file and no baseline-existing "
                                 "target file adds a non-build reference to the new source"),
                         identities=sorted(identities),
                     )
@@ -1769,11 +1750,18 @@ class AospBackportAgent:
         self.record.setdefault("new_file_audits", {})[str(attempt)] = new_file_audit
         self._json(f"new-file-audit-{attempt}.json", new_file_audit)
         if new_file_audit["status"] != "PASS":
+            # Preserve rejected bytes separately and invalidate stale evidence from
+            # a previously exported candidate. The final patch path is not a receipt.
+            rejected_path = self.run_dir / f'rejected-candidate-{attempt}.patch'
+            rejected_path.write_text(patch)
+            self.record.update(patch_file=None, patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
+                               patch_replay='not_run', rejected_patch_file=str(rejected_path),
+                               verification_memory={})
             rejected = [entry["path"] for entry in new_file_audit["rejected"]]
             self._event("new_file_integration_rejected", attempt=attempt,
                         rejected_files=rejected)
             raise CandidateRejected(
-                "new-file integration audit failed: " + ", ".join(rejected),
+                "new-file integration audit failed: " + ", ".join(str(p) for p in rejected),
                 feedback=("The candidate created source files that do not exist at the target "
                           f"baseline and are not integrated by live target code: {rejected}. "
                           "Do not recreate a newer-version class merely because it is allowlisted. "
@@ -1811,12 +1799,12 @@ class AospBackportAgent:
             return result
         try:
             self._git("worktree", "add", "--detach", str(replay_dir), self.case.target_commit)
-            applied = subprocess.run(["git", "apply", "--check", "--binary", "-"], cwd=replay_dir,
-                                     input=patch, text=True, capture_output=True)
+            applied = self._git("apply", "--check", "--binary", "-", cwd=replay_dir,
+                                input=patch, check=False)
             result.update(returncode=applied.returncode, stderr=applied.stderr[-5000:])
             if applied.returncode == 0:
-                applied = subprocess.run(["git", "apply", "--binary", "-"], cwd=replay_dir,
-                                         input=patch, text=True, capture_output=True)
+                applied = self._git("apply", "--binary", "-", cwd=replay_dir,
+                                    input=patch, check=False)
                 result.update(apply_returncode=applied.returncode, apply_stderr=applied.stderr[-5000:])
             result["status"] = "pass" if applied.returncode == 0 else "fail"
             if result["status"] == "pass":

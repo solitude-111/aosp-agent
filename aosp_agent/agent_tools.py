@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 
 from .case import validate_relative_path
+from .git_policy import OFFLINE_GIT_ENV
 from .patch_repair import extract_context, find_most_similar_block
 from . import symbols
 
@@ -44,7 +45,7 @@ DEEPEN_HINT = ("NOT_AVAILABLE: donor history does not cover the target..source_p
 
 def _git(repo_args: list[str], *args: str, cwd: Path | None = None,
          check: bool = True) -> subprocess.CompletedProcess:
-    env = {"GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0", "PATH": "/usr/bin:/bin",
+    env = {**OFFLINE_GIT_ENV, "PATH": "/usr/bin:/bin",
            "HOME": str(Path.home())}
     return subprocess.run(["git", "-c", "protocol.allow=never", "-c", "core.hooksPath=/dev/null",
                            *repo_args, *args], cwd=cwd, text=True, capture_output=True,

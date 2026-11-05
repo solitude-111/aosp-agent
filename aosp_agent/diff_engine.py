@@ -13,7 +13,9 @@ import re
 from pathlib import Path
 
 from .case import Case, validate_relative_path
+from .git_policy import OFFLINE_GIT_ENV
 from .discovery import Locator, diff_units, local_git, repositories
+from .donor import verify_donor
 from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt, migration_prompt
 from .engine import AospBackportAgent, AssessmentError, CandidateRejected
 from .prompts import SYSTEM
@@ -44,10 +46,12 @@ def _excerpt(lines, evidence):
 
 class DiffBackportAgent:
     def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model=None,
-                 model_provider=None, turn_timeout=900, runtime_factory=None, validation=None):
+                 model_provider=None, turn_timeout=900, runtime_factory=None, validation=None,
+                 donor_repo=None, source_commit=None, source_parent=None):
         self.patch_bytes = patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
+        self.donor = verify_donor(donor_repo, source_commit, source_parent, self.diff)
         self.digest = hashlib.sha256(self.patch_bytes).hexdigest()
         self.task_id = 'patch-' + self.digest[:16]
         self.repos = repositories(target_root)
@@ -72,6 +76,16 @@ class DiffBackportAgent:
 
     def _save(self):
         _write(self.run_dir / 'run.json', self.record)
+
+    def _donor_tools_context(self):
+        if self.donor['status'] != 'VERIFIED':
+            return '\nDonor history: NOT_AVAILABLE; evidence is limited to supplied diff lines.\n'
+        tools = self.run_dir / 'bin'
+        return ('\nVerified donor history (read only):\n' + json.dumps(self.donor) +
+                '\nControlled tools: ' + str(tools) +
+                '/view-code --repo donor --ref SHA --path P --start N --end M; ' +
+                str(tools) + '/hunk-history --hunk-id ID; ' + str(tools) +
+                '/show-commit --sha SHA [--hunk-id ID]. Use only recorded revisions.\n')
 
     def _owner(self, workspace_path):
         validate_relative_path(workspace_path)
@@ -194,7 +208,7 @@ class DiffBackportAgent:
             factory = self.factory
         return factory(events_path=self.run_dir / f'sdk-{name}.jsonl', model=self.model,
                        model_provider=self.provider, turn_timeout=self.timeout,
-                       env={'GIT_NO_LAZY_FETCH': '1'})
+                       env=OFFLINE_GIT_ENV)
 
     def _turn(self, runtime, prompt, schema, *, read_only):
         result = runtime.run(prompt, read_only=read_only, output_schema=schema)
@@ -286,10 +300,21 @@ class DiffBackportAgent:
                           'tracked_files': len(r.files)} for r in self.repos]
             _write(self.run_dir / 'inventory.json', inventory)
             self.record['repositories'] = inventory
+            self.record['source_provenance'] = self.donor
+            if self.donor['status'] == 'VERIFIED':
+                from .agent_tools import _write_wrappers
+                self.record.update({key: self.donor[key] for key in
+                                    ('source_commit', 'source_parent', 'donor_git')})
+                self.record.update(worktree=str(self.repos[0].root),
+                                   target_commit=self.repos[0].head)
+                _write(self.run_dir / 'inspection.json', {'hunks': self.units,
+                                                         'source_diff': self.diff})
+                self._save()
+                _write_wrappers(self.run_dir)
             locator = Locator(self.repos, self.units)
             location = locator.locate(lambda state: _write(self.run_dir / 'discovery-progress.json', state))
             location['target_history'] = locator.history(location)
-            location['source_history'] = 'NOT_PROVIDED; source before/after evidence is limited to diff lines'
+            location['source_history'] = self.donor
             _write(self.run_dir / 'location.json', location)
             self._originals_unchanged()
             self.record['status'] = 'DISCOVERED'
@@ -298,7 +323,7 @@ class DiffBackportAgent:
                 return self.record
             with self._runtime('assessment') as runtime:
                 runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
-                prompt = assessment_prompt(self.diff, inventory, location)
+                prompt = assessment_prompt(self.diff, inventory, location) + self._donor_tools_context()
                 for attempt in range(1, max_attempts + 1):
                     raw = self._turn(runtime, prompt, ASSESSMENT_SCHEMA, read_only=True)
                     _write(self.run_dir / f'assessment-{attempt}.json', raw)
@@ -319,7 +344,8 @@ class DiffBackportAgent:
             self._prepare_children(assessment)
             with self._runtime('migration') as runtime:
                 runtime.start(self.workspace, SYSTEM)
-                prompt = migration_prompt(self.diff, assessment, assessment['writable_paths'], self.workspace)
+                prompt = (migration_prompt(self.diff, assessment, assessment['writable_paths'], self.workspace)
+                          + self._donor_tools_context())
                 for attempt in range(1, max_attempts + 1):
                     self.record['attempt'] = attempt
                     raw = self._turn(runtime, prompt, MIGRATION_SCHEMA, read_only=False)

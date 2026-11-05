@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .case import validate_relative_path
+from .git_policy import offline_git_env
 from .patches import split_hunks
+from .path_mapping import version_normalized_paths
 
 STOP = set('if else return void int long bool boolean public private protected static final class new null true false const char unsigned signed struct sizeof for while switch case break try catch throw throws def self this import package include override String Object value get set'.split())
 TOKEN = re.compile(r'[A-Za-z_$][\w$]*')
@@ -25,7 +27,7 @@ SOURCE_SUFFIXES = {'.java', '.kt', '.c', '.cc', '.cpp', '.h', '.hpp', '.rs', '.p
 
 
 def local_git(repo: Path, *args: str, check: bool = True, timeout: int = 45):
-    env = dict(os.environ, GIT_NO_LAZY_FETCH='1', GIT_TERMINAL_PROMPT='0', GIT_OPTIONAL_LOCKS='0')
+    env = offline_git_env(dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
     return subprocess.run(['git', '-c', 'protocol.allow=never', '-c', 'core.fsmonitor=false',
                            '-c', 'core.hooksPath=/dev/null', '-c', 'core.quotePath=false', *args],
                           cwd=repo, env=env, capture_output=True, text=True, errors='replace',
@@ -205,6 +207,7 @@ class Locator:
         output = []
         for unit in self.units:
             paths = {p for p in (unit['old_path'], unit['new_path']) if p}
+            normalized_paths = {p for original in paths for p in version_normalized_paths(original)}
             names = {Path(p).name for p in paths}
             text = '\n'.join(unit['before'].values()) + '\n' + '\n'.join(unit['after'].values())
             terms = tokens(text + '\n' + unit['header'])
@@ -222,6 +225,8 @@ class Locator:
                 for path in repo.files:
                     if path in paths or f'{repo.key}/{path}' in paths:
                         add(path, 8, 'exact_path')
+                    elif path in normalized_paths or f'{repo.key}/{path}' in normalized_paths:
+                        add(path, 7, 'version_normalized_path')
                     elif Path(path).name in names:
                         add(path, 5, 'basename')
                     elif any(p.endswith('/' + path) or path.endswith('/' + p) for p in paths):
@@ -262,7 +267,7 @@ class Locator:
                         defs = self.definitions[cache_key]
                         similarity, windows = _windows(content, unit, defs)
                         matching_defs = [d for d in defs if d['symbol'] in terms]
-                        if not windows and not matching_defs and not any(r in ('exact_path', 'basename', 'path_suffix') for r in reasons[path]):
+                        if not windows and not matching_defs and not any(r in ('exact_path', 'version_normalized_path', 'basename', 'path_suffix') for r in reasons[path]):
                             continue
                         candidates.append({'repository': repo.key, 'path': path, 'workspace_path': f'{repo.key}/{path}',
                                            'score': round(scores[path] + similarity + 4 * bool(matching_defs), 3),

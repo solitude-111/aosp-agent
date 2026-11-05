@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from aosp_agent.case import Case
-from aosp_agent.engine import (AospBackportAgent, AssessmentError, _assert_patch_paths,
+from aosp_agent.engine import (AospBackportAgent, AssessmentError, CandidateRejected, _assert_patch_paths,
                                _added_code_lines, _codex_error_kind, _extract_unified_diff)
 from aosp_agent.tests.engine_fixtures import (
     BASELINE, FIXED, PARTIAL, GitFixture, ScriptedRuntime, git, write_counter,
@@ -362,7 +362,7 @@ class AgentTest(unittest.TestCase):
             self.assertEqual((clean / "test_counter.py").read_text(), new_test)
             self.assertEqual((clean / "counter.py").read_text(), FIXED)
 
-    def test_true_donor_source_addition_is_not_rejected_as_dead(self):
+    def test_donor_source_addition_still_requires_target_integration(self):
         with GitFixture() as fixture:
             added = "def clamp(value):\n    return max(0, min(value, 10))\n"
             source_diff = (
@@ -386,11 +386,19 @@ class AgentTest(unittest.TestCase):
             inspection = agent.inspect()
             agent._current_hunks = inspection["hunks"]
             (agent.worktree / "NewHelper.py").write_text(added)
-            patch = agent.export_patch(1)
-            self.assertIn("new file mode 100644", patch)
+            with self.assertRaises(CandidateRejected):
+                agent.export_patch(1)
             audit = agent.record["new_file_audits"]["1"]
-            self.assertEqual(audit["status"], "PASS")
-            self.assertEqual(audit["new_files"][0]["basis"], "donor_created_source")
+            self.assertEqual(audit["status"], "FAIL")
+            self.assertTrue(audit["new_files"][0]["donor_created"])
+            # Staging the addition must not disable the same guard.
+            git(agent.worktree, 'add', 'NewHelper.py')
+            with self.assertRaises(CandidateRejected):
+                agent.export_patch(2)
+            self.assertEqual(agent.record['new_file_audits']['2']['status'], 'FAIL')
+            self.assertIsNone(agent.record['patch_file'])
+            self.assertEqual(agent.record['patch_replay'], 'not_run')
+            self.assertTrue(Path(agent.record['rejected_patch_file']).is_file())
 
     def test_new_helper_is_allowed_when_existing_target_code_activates_it(self):
         with GitFixture() as fixture:

@@ -26,9 +26,10 @@ AOSP Backport Agent 是一个数据驱动的 Android 安全补丁回移系统。
 
 - 模型申报的文件、行号和摘录会与 Git blob 中的内容逐字核实。
 - 未知、证据不足、空补丁、路径越界和验证失败均 fail-closed，不会默认视为成功。
-- 候选补丁若新建目标基线不存在的生产源码，控制器会区分 donor 原生新增、测试/fixture
-  和跨版本映射产物；后者必须由目标基线已有源码、Manifest 或注册配置显式接入，单纯被
-  Soong 通配编译不能证明落点有效。
+- 新生产源码（含 donor 原生新增、已暂存的新增文件）必须提供目标端接入证据：当前支持
+  基线已有函数中的新增调用和 AndroidManifest 组件注册。注释、字符串、import、测试调用、
+  新建孤立调用函数和 Soong 通配编译均不能满足此门禁。此检查是保守的结构证据，不能证明
+  全程序或产品运行时可达性；尚不支持的反射、JNI 或动态注册需额外证据适配。
 - 迁移阶段使用 T1–T6 六级策略阶梯，根据 apply、diff audit、验证和编译失败反馈自动重试。
 - 诊断信息包含实际 argv、stdout/stderr、补丁重放结果和结构化失败原因。
 - `VALIDATED` 只表示通过当前案例配置的验证范围，不自动等价于完整设备安全证明。
@@ -139,6 +140,20 @@ agent 会在 `--run-root` 下创建隔离 worktree。编译脚本会在受控流
   --verify
 ```
 
+可选地为 diff 接入本地 donor 历史（修复提交、直接父提交和输入 diff 必须一致）：
+
+```sh
+.venv-sdk/bin/python -m aosp_agent diff \
+  --patch /path/to/fix.diff --target-root /path/to/target \
+  --run-root /path/to/runs --donor-repo /path/to/donor.git \
+  --source-commit FIX_SHA --source-parent PARENT_SHA
+```
+
+三个 donor 参数须一起提供。不提供时记录 `NOT_PROVIDED / diff_lines_only`；提供但缺对象、
+父提交错误或 diff 不一致时停止，不静默退回文本模式。核实成功后可使用受控 `hunk-history`、
+`show-commit`、`view-code` 工具。所有 Git 子进程通过空的 `GIT_ALLOW_PROTOCOL` 禁止传输，
+即使旧 Git 忽略 `GIT_NO_LAZY_FETCH` 或仓库设置单独的协议许可，也不能隐式下载对象。
+
 分析补丁是否可继承到旧标签：
 
 ```sh
@@ -197,7 +212,7 @@ out-artifacts/           编译产物哈希输入
 .venv-sdk/bin/python -m unittest discover -s aosp_agent/tests -v
 ```
 
-当前分支包含 213 项测试（1 项按条件跳过），覆盖 Git 准备、diff 分解、路径审计、新文件接入门禁、证据核实、机械迁移、补丁重放、SDK 事件解析、策略阶梯、根因分类、继承分析和失败反馈。
+测试覆盖 Git 准备、离线部分克隆、donor 来源核实、diff 分解、路径审计、新文件接入门禁、证据核实、机械迁移、补丁重放、SDK 事件解析、策略阶梯、根因分类、继承分析和失败反馈。数量和跳过项以测试命令输出为准。
 
 ## 边界与安全原则
 

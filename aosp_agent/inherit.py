@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .prompts import SYSTEM
+from .git_policy import OFFLINE_GIT_ENV
 
 
 INHERIT_SCHEMA = {
@@ -34,7 +35,7 @@ INHERIT_SCHEMA = {
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    env = {"GIT_NO_LAZY_FETCH": "1", "GIT_TERMINAL_PROMPT": "0",
+    env = {**OFFLINE_GIT_ENV,
            "PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
     return subprocess.run(["git", "-c", "protocol.allow=never", "-c",
                            "core.hooksPath=/dev/null", "-C", str(repo), *args],
@@ -205,7 +206,7 @@ def analyze_inheritance(cve: str, fix_patch_path: Path, source_root: Path,
     events_path = fix_patch_path.parent / "inherit-events.jsonl"
     with CodexRuntime(events_path=events_path, model=model,
                       model_provider=model_provider, turn_timeout=turn_timeout,
-                      env={"GIT_NO_LAZY_FETCH": "1"}) as runtime:
+                      env=OFFLINE_GIT_ENV) as runtime:
         runtime.start(str(repo), SYSTEM + "\nCross-tag inheritance analysis is read-only.")
         prompt = inherit_prompt(cve, fix_diff, tag_diff, tag1, tag2, files)
         result = runtime.run(prompt, read_only=True, output_schema=INHERIT_SCHEMA)

@@ -65,8 +65,9 @@ def assessment_prompt(diff, inventory, location):
              'windows': [{k: w[k] for k in ('line_start', 'line_end', 'function')} for w in c['windows'][:2]]}
             for c in unit['candidates'][:6]]
     return '''Locate the target implementation and independently assess this higher-version patch.
-Only the original diff and repositories are supplied. No CVE identity, donor SHA, target paths,
-reference conclusion or migration recipe is provided. Repository HEADs below are pinned baselines.
+The original diff and repositories are supplied, optionally with verified donor commit/parent
+and read-only history tools. No reference conclusion or migration recipe is provided.
+Repository HEADs below are pinned baselines. Target mappings must be derived from source evidence.
 Work READ ONLY. Use git -C <original_root> show <head>:<path> and bounded git grep/log to investigate.
 Never checkout/reset/clean/commit/stage/fetch or modify an original repository. Set GIT_NO_LAZY_FETCH=1.
 Do not read sibling project files, prior runs, oracles, credentials or reference patches.

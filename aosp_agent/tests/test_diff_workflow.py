@@ -107,6 +107,14 @@ class DiffWorkflowTest(unittest.TestCase):
             self.assertEqual(report['units'][0]['status'], 'AMBIGUOUS_CANDIDATES')
             self.assertEqual({c['path'] for c in report['units'][0]['candidates']}, {'counter.py', 'copy.py'})
 
+    def test_version_directory_is_an_explicit_discovery_hint(self):
+        with GitFixture() as fx:
+            agent = self.agent(fx, patch=diff('vendor-3.4.5/counter.py', BASELINE, FIXED))
+            report = Locator(agent.repos, agent.units).locate()
+            candidate = next(c for c in report['units'][0]['candidates'] if c['path'] == 'counter.py')
+            self.assertIn('version_normalized_path', candidate['signals'])
+            self.assertEqual(report['impact'], 'UNASSESSED')
+
     def test_missing_is_unresolved_and_never_not_affected(self):
         with GitFixture() as fx:
             before = 'class QuantumThing {\n void fluxCapacitor() { entangledQuotas(); }\n}\n'
