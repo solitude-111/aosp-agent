@@ -2,7 +2,7 @@
 
 基于官方 Codex Python SDK 的 AOSP 影响判断与补丁迁移原型。借鉴 RetroPatch 的提交比较、hunk 分析、代码定位和验证反馈流程，当前首个真实案例为 CVE-2025-48550（Android 16 → 固定 Android 12）。
 
-另外三个轻量 `frameworks/base` 案例已完成真实 SDK 回移并标记为 `VALIDATED`：CVE-2021-0799、CVE-2021-0927 和 CVE-2021-0970。它们均只修改一个生产文件，验证覆盖源码级检查（0799 另有普通 JVM key 语义测试）；Android 全量模块、设备运行和 PoC 仍按案例记录的范围区分。
+历史记录中的三个轻量 `frameworks/base` 案例为 CVE-2021-0799、CVE-2021-0927 和 CVE-2021-0970；此前的状态不能作为新映射/门禁实现的验证成绩。本轮按用户要求未重跑真实案例。
 
 ## 运行方式
 
@@ -18,7 +18,7 @@ python3 -m venv .venv-sdk
   --model glm-5.3 --model-provider ZAI --verify --max-attempts 2
 ```
 
-每次使用新的运行目录。`--inspect-only`（兼容名 `--no-codex`）只做 Git 准备与 hunk 检查，不调用模型。`--turn-timeout` 默认 900 秒。认证由运行账户的 Codex SDK 环境提供，不把凭据放入项目。33 机器现有 Codex 程序和配置仍受用户“不操作”的约束，私有 SDK 依赖与实际认证需先确认。
+每次使用新的运行目录。`--inspect-only`（兼容名 `--no-codex`）只做固定提交的输入发现，不调用模型或创建迁移 worktree，返回 `DISCOVERED`。`--turn-timeout` 默认 900 秒。认证由运行账户的 Codex SDK 环境提供，不把凭据放入项目。
 
 模型后端为 GLM（智谱）：`~/.codex/config.toml` 配置 ZAI provider（`glm-5.3`、`model_reasoning_effort`）与 `~/.codex/models.json` 模型目录，API key 写在 config.toml 的 `experimental_bearer_token`。agent 不指定 `--model`/`--model-provider`/effort 时全部回落到该配置；显式传参仅用于单次覆盖。
 
@@ -26,7 +26,7 @@ SDK 执行层为 `sdk_runtime.py`，使用 `AsyncCodex`、官方 streaming turn�
 
 ## 当前流程
 
-1. 固定 donor 修复及其真实父提交，创建干净的 Android 12 detached worktree。
+1. 固定 donor 修复及其真实父提交；run/diff 共用只读发现和映射前端，生成不可变 MappingPlan 与运行时 Case，创建干净的目标 detached worktree。
 2. 分解 donor hunk，用独立临时 Git index 检查文本可应用性，保留冲突信息。
 3. SDK 以只读权限分析目标源码与相关 API，返回 AFFECTED、NOT_AFFECTED、ALREADY_FIXED 或 UNKNOWN 及源码证据。
 4. 控制器检查引用的 Git blob、文件、行范围和连续摘录；`AFFECTED` 还必须索引覆盖 donor 故障、donor 修复、目标等价故障和目标危害的因果链证据。不一致时在同一线程请求只读纠正。
@@ -41,21 +41,21 @@ donor diff 统一生成，不依赖按 CVE 手工配置的必需 hunk 白名单�
 必须在最终候选 diff 的对应目标文件中提供语义证据（归一化行或标识符重合），
 不能只因为该文件发生了其他修改而通过。
 
-`dataset/cases/` 是运行事实；`dataset/oracles/` 和历史人工补丁只供离线评价。模型输入不包含参考影响结论、迁移方案或验证实现。源码引用检查能证明引用真实，不能自动证明模型推理正确或所有产品可达性。
+`dataset/cases/` 提供提交身份和目标基线，CLI 忽略其中历史 `files`/`validation`。文件范围来自核实映射，冒烟检查来自 donor 新增行，构建目标来自固定目标树配置；独立人工验收需用 `--validation` 显式覆盖。`dataset/oracles/` 和历史人工补丁只供离线评价。源码引用检查不能自动证明模型推理正确或所有产品可达性。
 
 ## 状态与证据
 
 | 状态 | 含义 | CLI 退出码 |
 | --- | --- | --- |
-| PREPARED | 仅完成准备，模型未运行 | 0 |
+| DISCOVERED | 仅完成固定基线的候选发现，模型未运行 | 0 |
 | NOT_AFFECTED | 模型给出不受影响判断且引用通过核实，未迁移 | 0 |
 | INCONCLUSIVE | 证据不足，停止迁移 | 4 |
-| PATCH_UNVERIFIED | 已生成候选，但未请求或未配置验证 | 3 |
+| PATCH_UNVERIFIED | 未配置完整检查、仅冒烟通过，或缺少多仓联合验证 | 3 |
 | VALIDATED | 当前候选通过所配置的检查，仅限其覆盖范围 | 0 |
 | VALIDATION_FAILED | 验证重试耗尽，保留候选和失败证据 | 5 |
 | FAILED | SDK、证据、路径或执行错误 | 2 |
 
-主要产物：`run.json`、`sdk-events.jsonl`、`inspection.json`、`impact.json`、`diff-audit.json`、逐次 `candidate-N.patch`、最终 `backport.patch`、`verification.json` 和验证原始输出。
+顶层产物包括 `run.json`、`mapping-plan.json`、`validation-plans/`、`patch-bundle.json`。各仓库的运行时 Case、因果判断、逐 hunk 账本、候选补丁和验证输出位于 `repositories/<key>/`；有 donor 的模式另输出全任务 `hunk-ledger.json`。
 
 验证配置既可使用旧的 argv 列表，也可使用带 `stage` 和 `artifacts` 的 `checks` 对象。每个检查记录命令、退出码、日志、阶段和产物哈希；未配置的 JVM、模块构建、设备运行和 PoC 层明确保持 `NOT_CONFIGURED`/`NOT_RUN`。这些有限检查不能代替完整 Android 验证，`VALIDATED` 只表示当前配置覆盖范围内通过。
 

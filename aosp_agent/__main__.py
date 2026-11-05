@@ -22,6 +22,7 @@ def main() -> int:
     diff.add_argument("--model", default=None,
                       help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
     diff.add_argument("--model-provider")
+    diff.add_argument("--mapping-model", help="independent read-only mapping session model; defaults to --model")
     diff.add_argument("--turn-timeout", type=float, default=900)
     diff.add_argument("--max-attempts", type=int, default=3)
     diff.add_argument("--verify", action="store_true")
@@ -42,8 +43,12 @@ def main() -> int:
     run.add_argument("--model", default=None,
                      help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
     run.add_argument("--model-provider", help="Codex model provider id, or AOSP_AGENT_MODEL_PROVIDER")
+    run.add_argument("--mapping-model", help="independent read-only mapping session model; defaults to --model")
+    run.add_argument("--build-runner", type=Path)
+    run.add_argument("--validation", type=Path, help="explicit staged overrides keyed by discovered repository; dataset validation is ignored")
+    run.add_argument("--no-auto-validation", action="store_true")
     run.add_argument("--no-codex", "--inspect-only", dest="no_codex", action="store_true",
-                     help="prepare and inspect without starting a model; reports PREPARED")
+                     help="discover pinned source candidates without starting a model; reports DISCOVERED")
     run.add_argument("--no-mechanical", action="store_true",
                      help="skip the pre-model mechanical hunk application (debug)")
     run.add_argument("--impact-only", action="store_true",
@@ -74,7 +79,7 @@ def main() -> int:
                 validation=json.loads(args.validation.read_text()) if args.validation else None,
                 donor_repo=args.donor_repo, source_commit=args.source_commit,
                 source_parent=args.source_parent, auto_validation=not args.no_auto_validation,
-                build_runner=args.build_runner)
+                build_runner=args.build_runner, mapping_model=args.mapping_model)
             result = agent.run(inspect_only=args.inspect_only, max_attempts=args.max_attempts, verify=args.verify)
         except Exception as exc:
             result = {"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}}
@@ -110,19 +115,24 @@ def main() -> int:
         return {"INHERIT": 0, "CONDITIONAL": 1, "RE_TEST": 2}.get(result.get("verdict"), 3)
     case = cases[args.cve]
     try:
-        result = AospBackportAgent(args.source_root, args.run_root, case, args.model, args.donor_root,
-                                   args.model_provider, turn_timeout=args.turn_timeout).run(
-            use_codex=not args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
+        from .mapped_run import from_case
+        agent = from_case(case, args.source_root, args.run_root, donor_root=args.donor_root,
+            model=args.model, mapping_model=args.mapping_model, model_provider=args.model_provider,
+            turn_timeout=args.turn_timeout, auto_validation=not args.no_auto_validation,
+            build_runner=args.build_runner,
+            validation=json.loads(args.validation.read_text()) if args.validation else None)
+        result = agent.run(inspect_only=args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
             mechanical=not args.no_mechanical, impact_only=args.impact_only)
     except Exception as exc:
         print(json.dumps({"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}},
                          ensure_ascii=False, indent=2))
         return 2
     summary = {key: result[key] for key in ("cve", "status", "backend", "model", "patch_file",
-                                          "patch_sha256", "final_verification", "error") if key in result}
+                                          "patch_sha256", "patches", "repository_statuses",
+                                          "final_verification", "error") if key in result}
     summary["record"] = str(args.run_root.resolve() / case.cve / "run.json")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return {"PREPARED": 0, "AFFECTED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
+    return {"DISCOVERED": 0, "PREPARED": 0, "AFFECTED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
             "PATCH_UNVERIFIED": 3, "INCONCLUSIVE": 4, "VALIDATION_FAILED": 5}.get(result["status"], 2)
 
 

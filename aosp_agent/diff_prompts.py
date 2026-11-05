@@ -107,7 +107,7 @@ Do not mechanically copy donor hunk contexts or skip a missing function. If the 
 return unresolved coverage and explain the missing mapping; do not edit outside the allowlist.
 
 The controller will generate patches and independently replay them on fresh target worktrees. Runtime
-validation is NOT_CONFIGURED unless explicit controller checks are present; do not claim test PASS.
+validation is determined only by the controller's fixed checks; do not claim test PASS.
 Return structured coverage for EVERY original unit id. For affected units mark implemented only with
 exact current candidate excerpts covering its invariant; all others use not_required with explanation.
 Coverage is your source review, not independent proof of security. Never claim Android build/device

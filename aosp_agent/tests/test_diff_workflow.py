@@ -229,6 +229,17 @@ class DiffWorkflowTest(unittest.TestCase):
             self.assertEqual(result['status'], 'VALIDATED')
             self.assertTrue(any('contract verified' in c['stdout'] for c in result['verification']['repo']['commands']))
 
+    def test_text_diff_uses_backend_hunk_ledger_before_verification(self):
+        with GitFixture() as fx:
+            agent = self.agent(fx)
+            unrelated = BASELINE.replace('return value', 'return -value')
+            agent.factory = QueueRuntime([(self.assessment(agent), None),
+                (self.coverage(agent, unrelated), lambda cwd: (cwd / 'repo/counter.py').write_text(unrelated))]).factory
+            result = agent.run(max_attempts=1, verify=True)
+            self.assertEqual(result['status'], 'MIGRATION_INCOMPLETE')
+            self.assertEqual(result['verification']['repo']['blocked_by'], 'HUNK_LEDGER')
+            self.assertIn('semantic evidence', result['coverage_error'])
+
     def test_unmodified_excerpts_do_not_establish_migration_coverage(self):
         with GitFixture() as fx:
             agent = self.agent(fx)

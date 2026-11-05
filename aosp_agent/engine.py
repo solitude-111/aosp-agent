@@ -25,15 +25,10 @@ from . import symbols
 
 _HUNK_RESULT_RE = re.compile(
     r"^\s*HUNK-RESULT\s+(\S+)\s+(implemented|need_not_ported):?\s+(.+?)\s*$", re.MULTILINE)
-_METADATA_PATH_RE = re.compile(
-    r"(?:^|/)(?:METADATA|README\.version|OWNERS|Android\.patch|[^/]+\.(?:bp|mk))$")
-_METADATA_LINE_RE = re.compile(
-    r"SQLITE_VERSION\s|SQLITE_VERSION_NUMBER\s|SQLITE_SOURCE_ID\s|VERSION\s*=|"
-    r"PATCHLEVEL\s*=|Copyright|License|Changelog|Changes\s*$", re.I)
-_NUMBER_RE = re.compile(r"\d+(?:\.\d+)*")
-_DOTTED_NUMBER_RE = re.compile(r"\d+(?:\.\d+)+")
-_LONG_HEX_RE = re.compile(r"\b[0-9a-f]{12,}\b", re.I)
-_TIMESTAMP_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?\b")
+_VERSION_LINE_RE = re.compile(
+    r'^(?:(?:#\s*define\s+(?:SQLITE_VERSION|SQLITE_VERSION_NUMBER|SQLITE_SOURCE_ID)\s+|'
+    r'(?:VERSION|PATCHLEVEL)\s*=\s*)(?:[0-9.]+|"[A-Za-z0-9_. :+-]+")|'
+    r'(?:static\s+)?(?:const\s+)?char\s+version\s*\[\s*\]\s*=\s*"[A-Za-z0-9_. :+-]+"\s*;)$', re.I)
 _SEMANTIC_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*|\d+(?:\.\d+)*")
 _LINE_COMMENT_RE = re.compile(r"//.*$")
 _BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/")
@@ -53,15 +48,6 @@ _DECLARED_SOURCE_IDENTIFIER_RE = re.compile(
     r"\b(?:class|enum|interface|object|record|struct|trait)\s+"
     r"([A-Za-z_][A-Za-z0-9_]*)"
 )
-
-
-def _is_version_only_delta(old: str, new: str) -> bool:
-    # Only dotted version numbers, long hashes and timestamps count as
-    # version noise; a bare integer delta (e.g. a security bound) is a
-    # semantic change and must not wash out as metadata.
-    normalize = lambda text: _DOTTED_NUMBER_RE.sub(
-        "<version>", _LONG_HEX_RE.sub("<hash>", _TIMESTAMP_RE.sub("<time>", text)))
-    return normalize(old) == normalize(new)
 
 
 def _changed_diff_lines(patch: str, added: bool) -> list[str]:
@@ -233,6 +219,17 @@ def _novel_tokens(patch: str) -> set[str]:
             - _semantic_tokens([_strip_comments(line) for line in existing]))
 
 
+def _rewrap_only(patch: str) -> bool:
+    # Preserve operators and quoted strings: identical identifier sets do not
+    # imply formatting-only changes (e.g. '<' versus '<=' changes a bound).
+    pattern = re.compile(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|\w+|\S')
+    def lex(lines):
+        return [m[0] for m in pattern.finditer('\n'.join(lines)) if not m[0].startswith(('//', '/*'))]
+    removed = _changed_diff_lines(patch, added=False)
+    added = _changed_diff_lines(patch, added=True)
+    return bool(removed and added) and lex(removed) == lex(added)
+
+
 class AssessmentError(ValueError):
     """The model's assessment could not be grounded in immutable Git blobs."""
 
@@ -304,6 +301,8 @@ class AospBackportAgent:
         self.run_dir, self.worktree = self.run_root / case.cve, self.run_root / case.cve / case.repository
         self._owns_run, self._source_before = False, None
         self._current_hunks: list[dict[str, Any]] = []
+        self.mapping_plan, self.mapping_repository = None, None
+        self.selected_hunk_ids = None
         self._last_audit: dict[str, Any] | None = None
         self._events_swept = 0
         self.record: dict[str, Any] = {"cve": case.cve, "status": "INITIALIZED", "backend": "codex_sdk",
@@ -430,6 +429,9 @@ class AospBackportAgent:
         source_diff = (self.input_diff if self.input_diff is not None else
                        self._source_git("diff", "--no-ext-diff", self.case.source_parent, self.case.source_commit).stdout)
         hunks = split_hunks(source_diff)
+        if self.selected_hunk_ids is not None:
+            hunks = [h for h in hunks if h['id'] in self.selected_hunk_ids]
+            source_diff = ''.join(h['patch'] for h in hunks)
         self._source_changed_paths = {h["path"] for h in hunks if h.get("path")}
         for hunk in hunks:
             hunk["application_check"] = (self._check_application(hunk["patch"])
@@ -981,8 +983,18 @@ class AospBackportAgent:
                  + "\nProvide exactly one evidence-backed declaration for every donor hunk.")}
 
     def _implemented_hunk_evidence(self, hunk: dict[str, Any],
-                                   candidate_patch: str | None) -> dict[str, Any]:
-        targets = sorted(self._donor_targets(hunk.get("path", "")))
+                                   candidate_patch: str | None, *, scope=None) -> dict[str, Any]:
+        if self.mapping_plan is not None and scope is None:
+            regions = [t for t in self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id'])
+                       if t['action'] == 'edit' and t['status'] == 'AFFECTED']
+            evidence = [self._implemented_hunk_evidence(hunk, candidate_patch, scope=region)
+                        for region in regions]
+            ok = bool(evidence) and all(e['ok'] for e in evidence)
+            return {'required': True, 'ok': ok, 'regions': evidence,
+                    'targets': sorted({t['path'] for t in regions}),
+                    'match': 'evidence in every grounded mapping region' if ok else None,
+                    'error': None if ok else 'no mapped target semantic evidence in every required region'}
+        targets = [scope['path']] if scope else sorted(self._donor_targets(hunk.get("path", "")))
         result = {"required": bool(targets), "targets": targets,
                   "ok": not targets, "match": None}
         if not targets:
@@ -1009,9 +1021,16 @@ class AospBackportAgent:
                 continue
             target_lines: list[str] = []
             for target_hunk in target_hunks:
-                target_lines.extend(_changed_diff_lines(
-                    target_hunk.get("patch", ""), added=bool(donor_additions)))
+                if scope:
+                    from .hunk_scope import changed_lines_in_region
+                    target_lines.extend(changed_lines_in_region(target_hunk.get('patch', ''),
+                        scope['line_start'], scope['line_end'], added=bool(donor_additions)))
+                else:
+                    target_lines.extend(_changed_diff_lines(
+                        target_hunk.get("patch", ""), added=bool(donor_additions)))
             target_lines = [line for line in target_lines if line]
+            if scope and expected_lines and not target_lines:
+                continue
             if not expected_lines:
                 result.update(ok=True, match=f"changed target hunk: {target}")
                 return result
@@ -1052,7 +1071,7 @@ class AospBackportAgent:
                             match=(f"novel tokens in {target}: "
                                    + ", ".join(sorted(novel)[:8])))
                         return result
-                else:
+                elif _rewrap_only(hunk.get('patch', '')):
                     result.update(
                         ok=True,
                         match=(f"no novel tokens in rewrap-only donor hunk; "
@@ -1180,8 +1199,6 @@ class AospBackportAgent:
 
     def _is_metadata_hunk(self, hunk: dict[str, Any]) -> bool:
         path = hunk.get("path") or ""
-        if _METADATA_PATH_RE.search(path):
-            return True
         patch_lines = hunk.get("patch", "").splitlines()
         removed = [line[1:] for line in patch_lines
                    if line.startswith("-") and not line.startswith("---")]
@@ -1190,14 +1207,27 @@ class AospBackportAgent:
         changed_lines = removed + added
         if not changed_lines:
             return False
-        if all(_METADATA_LINE_RE.search(line) for line in changed_lines):
+        # File names alone cannot exempt executable build/configuration edits.
+        meaningful = [line.strip() for line in changed_lines if line.strip()]
+        comments_removed = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/', '', '\n'.join(meaningful))
+        if meaningful and not comments_removed.strip():
             return True
-        return (len(removed) == len(added) and bool(removed)
-                and all(_is_version_only_delta(old, new)
-                        for old, new in zip(removed, added)))
+        if meaningful and all(_VERSION_LINE_RE.fullmatch(_strip_comments(line).strip()) for line in meaningful):
+            return True
+        if Path(path).name == 'OWNERS':
+            return bool(meaningful) and all(re.fullmatch(r'[\w.+-]+@[\w.-]+|#.*', line) for line in meaningful)
+        if Path(path).name in {'METADATA', 'README.version'}:
+            return bool(meaningful) and all(re.fullmatch(
+                r'(?:version|date|last_upgrade_date|year|month|day)\s*[:=]\s*[\w.\s"{}:-]+|[{}]', line,
+                re.I) for line in meaningful)
+        return False
 
     def _donor_targets(self, donor_path: str) -> set[str]:
         allowed = set(self.case.files)
+        if self.mapping_plan is not None:
+            return {target['path'] for target in self.mapping_plan.targets(
+                self.mapping_repository, donor_path=donor_path)
+                if target['action'] == 'edit'} & allowed
         targets = {donor_path} & allowed
         normalized = _version_normalized_paths(donor_path) & allowed
         if len(normalized) == 1:
@@ -1265,19 +1295,32 @@ class AospBackportAgent:
                                      for item in
                                      _changed_diff_lines(patch, added=False))
                    if line}
-        if not anchors:
-            return None
         additions = {line for line in (_normalized_code_line(_strip_comments(item))
                                        for item in
                                        _changed_diff_lines(patch, added=True))
                      if line}
+        if not anchors:
+            # Pure insertions still need site evidence. Use donor context when
+            # present; without any context, an exclusion cannot rest on a UID
+            # alone or on the mere existence of the target file.
+            anchors = {_normalized_code_line(_strip_comments(line))
+                       for line in _context_diff_lines(patch)
+                       if _semantic_tokens([_strip_comments(line)])}
+            anchors.discard('')
+            if not anchors:
+                if category == 'already_present':
+                    for target in targets:
+                        analysis = self._target_baseline_analysis(target)
+                        if analysis and additions and additions <= set(analysis['normalized']):
+                            return None
+                    return 'already_present is unsupported: unanchored additions are absent from mapped targets'
+                return 'semantic_equivalence is unsupported: pure additions have no grounded target anchor'
 
         if category == "already_present":
             # A pure-reformat hunk introduces no novel semantic tokens; there
             # is nothing site-specific to falsify (mirrors the rewrap-only
             # acceptance in implemented-hunk evidence).
-            if (_changed_diff_lines(patch, added=True)
-                    and not _novel_tokens(patch)):
+            if _rewrap_only(patch):
                 return None
             for target in targets:
                 analysis = self._target_baseline_analysis(target)
@@ -1294,6 +1337,9 @@ class AospBackportAgent:
                 for index in anchor_hits:
                     anchor_path = paths[index]
                     if not anchor_path:
+                        if re.match(r'^#\s*define\b', normalized[index]):
+                            return (f'already_present is false: pre-change macro remains at '
+                                    f'{target}:{index + 1}; top-level definitions require site-specific evidence')
                         continue
                     if not any(paths[hit] and paths[hit][0] == anchor_path[0]
                                for hit in addition_hits):

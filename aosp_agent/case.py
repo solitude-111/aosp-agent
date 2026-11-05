@@ -15,7 +15,7 @@ class Case:
     source_commit: str
     source_parent: str
     target_commit: str
-    files: tuple[str, ...]
+    files: tuple[str, ...] = ()
     # Legacy attributes remain for callers, but loaded reference answers are discarded.
     impact: str = ""
     migration: str = ""
@@ -36,7 +36,7 @@ class Case:
         if not isinstance(raw, dict):
             raise ValueError("case must be a JSON object")
         required = ("cve", "project", "repository", "source_commit", "source_parent",
-                    "target_commit", "files", "validation")
+                    "target_commit")
         missing = [key for key in required if key not in raw]
         if missing:
             raise ValueError(f"case is missing fields: {', '.join(missing)}")
@@ -45,16 +45,16 @@ class Case:
             raise ValueError(f"invalid CVE identifier: {cve}")
         repository = validate_relative_path(raw["repository"])
         donor_repository = validate_relative_path(raw.get("donor_repository", repository))
-        if not isinstance(raw["files"], list) or not raw["files"]:
-            raise ValueError(f"case {cve} files must be a nonempty list")
-        files = tuple(validate_relative_path(path) for path in raw["files"])
+        if not isinstance(raw.get("files", []), list):
+            raise ValueError(f"case {cve} files must be a list")
+        files = tuple(validate_relative_path(path) for path in raw.get("files", []))
         if len(files) != len(set(files)):
             raise ValueError(f"case {cve} contains duplicate file paths")
         for field in ("source_commit", "source_parent", "target_commit"):
             value = raw[field]
             if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{1,64}", value):
                 raise ValueError(f"case {cve} {field} must be a Git object ID")
-        validation_raw = raw["validation"]
+        validation_raw = raw.get("validation", [])
         if not isinstance(validation_raw, (list, dict)):
             raise ValueError(f"case {cve} validation must be a list or staged object")
         commands: list[tuple[str, ...]] = []

@@ -20,6 +20,7 @@ from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt
 from .engine import AospBackportAgent, AssessmentError, CandidateRejected
 from .prompts import SYSTEM
 from .validation_plan import make_plan, normalize_checks
+from .mapping_plan import MappingPlanner, MappingPlan, _shape, _excerpt
 
 
 def _write(path, value):
@@ -27,42 +28,29 @@ def _write(path, value):
     temporary = path.with_suffix(path.suffix + '.tmp')
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + '\n')
     temporary.replace(path)
-
-
-def _shape(raw, schema):
-    from jsonschema import validate, ValidationError
-    try:
-        validate(raw, schema)
-    except ValidationError as exc:
-        raise AssessmentError('invalid response structure: ' + exc.message) from exc
-
-
-def _excerpt(lines, evidence):
-    start, end = evidence['line_start'], evidence['line_end']
-    if start < 1 or end < start or end > len(lines):
-        raise AssessmentError(f'invalid range: {evidence["path"]}:{start}-{end}')
-    if '\n'.join(lines[start - 1:end]).strip() != evidence['excerpt'].strip():
-        raise AssessmentError(f'excerpt mismatches exact range: {evidence["path"]}:{start}-{end}')
-
-
 class DiffBackportAgent:
     def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model=None,
                  model_provider=None, turn_timeout=900, runtime_factory=None, validation=None,
                  donor_repo=None, source_commit=None, source_parent=None,
-                 auto_validation=True, build_runner=None):
-        self.patch_bytes = patch.read_bytes()
+                 auto_validation=True, build_runner=None, mapping_model=None,
+                 task_id=None, pinned_heads=None):
+        self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
         self.donor = verify_donor(donor_repo, source_commit, source_parent, self.diff)
         self.digest = hashlib.sha256(self.patch_bytes).hexdigest()
-        self.task_id = 'patch-' + self.digest[:16]
-        self.repos = repositories(target_root)
+        self.task_id = validate_relative_path(task_id) if task_id else 'patch-' + self.digest[:16]
+        self.target_root = target_root.resolve()
+        self.repos = repositories(target_root, pinned_heads=pinned_heads)
         self.by_key = {r.key: r for r in self.repos}
+        self.mapper = MappingPlanner(self.repos, self.units)
+        self.mapping_plan = None
         self.run_dir = run_root.resolve() / self.task_id
         if any(self.run_dir.is_relative_to(r.root) for r in self.repos):
             raise ValueError('run directory must be outside original repositories')
         self.workspace = self.run_dir / 'workspace'
         self.model, self.provider, self.timeout = model, model_provider or os.environ.get('AOSP_AGENT_MODEL_PROVIDER'), turn_timeout
+        self.mapping_model = mapping_model or model
         self.factory, self.validation = runtime_factory, {} if validation is None else validation
         if not isinstance(self.validation, dict):
             raise ValueError('validation must be an object keyed by repository')
@@ -78,6 +66,9 @@ class DiffBackportAgent:
             normalize_checks(spec)
         self.before = {r.key: r.state() for r in self.repos}
         self.children = {}
+        self.protected = {}
+        if self.build_runner:
+            self._protect(self.build_runner)
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZED',
                        'backend': 'codex_sdk', 'model': model or 'codex_config_default', 'model_execution': 'not_run',
                        'impact_decision': 'UNKNOWN', 'patch_replay': 'not_run',
@@ -87,6 +78,9 @@ class DiffBackportAgent:
 
     def _save(self):
         _write(self.run_dir / 'run.json', self.record)
+
+    def _protect(self, path):
+        self.protected[path] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def _donor_tools_context(self):
         if self.donor['status'] != 'VERIFIED':
@@ -98,15 +92,8 @@ class DiffBackportAgent:
                 str(tools) + '/hunk-history --hunk-id ID; ' + str(tools) +
                 '/show-commit --sha SHA [--hunk-id ID]. Use only recorded revisions.\n')
 
-    def _owner(self, workspace_path):
-        validate_relative_path(workspace_path)
-        matches = [r for r in self.repos if workspace_path.startswith(r.key + '/')]
-        if not matches:
-            raise AssessmentError(f'path does not belong to a supplied repository: {workspace_path}')
-        repo = max(matches, key=lambda r: len(r.key))
-        relative = workspace_path[len(repo.key) + 1:]
-        validate_relative_path(relative)
-        return repo, relative
+    def _owner(self, path):
+        return self.mapper._owner(path)
 
     def _originals_unchanged(self):
         for repo in self.repos:
@@ -114,6 +101,9 @@ class DiffBackportAgent:
                 raise RuntimeError(f'original repository changed: {repo.key}')
 
     def _audit(self):
+        for path, digest in self.protected.items():
+            if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
+                raise RuntimeError('controller-owned plan was modified: ' + str(path))
         self._originals_unchanged()
         for child in self.children.values():
             child.audit_diff()
@@ -133,83 +123,7 @@ class DiffBackportAgent:
                     raise RuntimeError('unexpected files outside repository worktrees')
 
     def ground(self, raw):
-        _shape(raw, ASSESSMENT_SCHEMA)
-        expected = {u['id']: u for u in self.units}
-        if len(raw['units']) != len(expected) or {u['id'] for u in raw['units']} != set(expected):
-            raise AssessmentError('assessment must cover every diff unit exactly once')
-        for item in raw['units']:
-            unit = expected[item['id']]
-            if not unit['supported'] and item['status'] != 'UNKNOWN':
-                raise AssessmentError('unsupported change units require UNKNOWN')
-            for target in item['targets']:
-                repo, path = self._owner(target['path'])
-                lines = repo.read(path).splitlines()
-                start, end = target['line_start'], target['line_end']
-                if start < 1 or end < start or end > len(lines):
-                    raise AssessmentError(f'invalid target mapping range: {target["path"]}')
-                if target['relationship'] not in ('dependency', 'test', 'data_or_configuration'):
-                    symbol = re.split(r'[.#]|::', target['symbol'])[-1]
-                    if (not re.fullmatch(r'[A-Za-z_$][\w$]*', symbol)
-                            or not re.search(r'\b' + re.escape(symbol) + r'\s*\(', '\n'.join(lines[start - 1:end]))):
-                        raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
-                if not any(e['origin'] == 'target' and e['path'] == target['path']
-                           and start <= e['line_start'] <= e['line_end'] <= end for e in item['evidence']):
-                    raise AssessmentError(f'target mapping lacks an excerpt within its range: {target["path"]}')
-            for evidence in item['evidence']:
-                if evidence['origin'] == 'target':
-                    repo, path = self._owner(evidence['path'])
-                    _excerpt(repo.read(path).splitlines(), evidence)
-                    if evidence['path'] not in {t['path'] for t in item['targets']}:
-                        raise AssessmentError('target evidence must be included in the mapping')
-                else:
-                    side = 'before' if evidence['origin'] == 'patch_before' else 'after'
-                    source_path = unit['old_path'] if side == 'before' else unit['new_path']
-                    if source_path != evidence['path']:
-                        raise AssessmentError('source excerpt path is not this unit diff side')
-                    start, end = evidence['line_start'], evidence['line_end']
-                    if start < 1 or end < start or end - start > len(unit[side]):
-                        raise AssessmentError('invalid diff evidence range')
-                    try:
-                        excerpt = '\n'.join(unit[side][n] for n in range(start, end + 1))
-                    except KeyError as exc:
-                        raise AssessmentError('source evidence refers to lines outside the supplied diff') from exc
-                    if excerpt.strip() != evidence['excerpt'].strip():
-                        raise AssessmentError('source evidence mismatches supplied diff')
-            if item['status'] != 'UNKNOWN':
-                origins = {e['origin'] for e in item['evidence']}
-                if 'target' not in origins or not origins & {'patch_before', 'patch_after'}:
-                    raise AssessmentError('determinate unit requires target AND diff evidence')
-            if item['status'] == 'NOT_AFFECTED':
-                if item['absence_basis'] != 'feature_absent':
-                    raise AssessmentError('equivalent protection belongs to ALREADY_FIXED; absence requires feature_absent')
-                target_evidence = {(e['path'], e['line_start'], e['line_end']) for e in item['evidence'] if e['origin'] == 'target'}
-                if len(target_evidence) < 2:
-                    raise AssessmentError('feature absence requires two distinct target excerpts, including its entry point')
-            elif item['status'] == 'ALREADY_FIXED':
-                if item['absence_basis'] != 'equivalent_protection':
-                    raise AssessmentError('ALREADY_FIXED requires equivalent_protection rationale')
-            elif item['absence_basis'] != 'none':
-                raise AssessmentError('AFFECTED/UNKNOWN cannot claim an absence basis')
-        affected = {t['path'] for u in raw['units'] if u['status'] == 'AFFECTED'
-                    for t in u['targets'] if t['action'] == 'edit'}
-        for item in raw['units']:
-            if item['status'] == 'AFFECTED' and not any(t['action'] == 'edit' for t in item['targets']):
-                raise AssessmentError('affected unit requires at least one explicit edit mapping')
-        new_paths = set()
-        for addition in raw['new_files']:
-            repo, relative = self._owner(addition['path'])
-            anchor_repo, _ = self._owner(addition['anchor_path'])
-            if repo.key != anchor_repo.key or addition['anchor_path'] not in affected:
-                raise AssessmentError('new file must be anchored to an affected mapping in the same repository')
-            if relative in repo.files or addition['path'] in new_paths:
-                raise AssessmentError('new file exists or is duplicated')
-            new_paths.add(addition['path'])
-        statuses = {u['status'] for u in raw['units']}
-        status = ('UNKNOWN' if 'UNKNOWN' in statuses else 'AFFECTED' if 'AFFECTED' in statuses else
-                  'ALREADY_FIXED' if 'ALREADY_FIXED' in statuses else 'NOT_AFFECTED')
-        return {**raw, 'status': status, 'writable_paths': sorted(affected | new_paths),
-                'evidence_scope': 'source_at_pinned_heads_and_supplied_diff_only',
-                'semantic_equivalence': 'model_assessed_not_formally_proven'}
+        return self.mapper.ground(raw)
 
     def _runtime(self, name):
         if self.factory is None:
@@ -217,7 +131,8 @@ class DiffBackportAgent:
             factory = CodexRuntime
         else:
             factory = self.factory
-        return factory(events_path=self.run_dir / f'sdk-{name}.jsonl', model=self.model,
+        return factory(events_path=self.run_dir / f'sdk-{name}.jsonl',
+                       model=self.mapping_model if name == 'assessment' else self.model,
                        model_provider=self.provider, turn_timeout=self.timeout,
                        env=OFFLINE_GIT_ENV)
 
@@ -235,11 +150,17 @@ class DiffBackportAgent:
         return output
 
     def _prepare_children(self, assessment):
+        self.mapping_plan = MappingPlan.create(assessment, self.repos, self.units, self.donor)
+        _write(self.run_dir / 'mapping-plan.json', self.mapping_plan.data())
+        self._protect(self.run_dir / 'mapping-plan.json')
+        self.record['mapping_plan_sha256'] = self.mapping_plan.sha256
         # Read dependencies in the same workspace; only AFFECTED mappings/new files become writable.
         selected = {self._owner(t['path'])[0].key for u in assessment['units'] for t in u['targets']}
+        source_root = (self.target_root.parent if any(r.root == self.target_root for r in self.repos)
+                       else self.target_root)
         for key in sorted(selected):
             repo = self.by_key[key]
-            files = tuple(self._owner(p)[1] for p in assessment['writable_paths'] if self._owner(p)[0].key == key)
+            files = self.mapping_plan.files(key)
             mappings = {}
             for unit in assessment['units']:
                 if unit['status'] != 'AFFECTED':
@@ -251,18 +172,39 @@ class DiffBackportAgent:
                              explicit=self.validation.get(key), auto=self.auto_validation,
                              build_runner=self.build_runner)
             _write(self.run_dir / 'validation-plans' / key / 'plan.json', plan)
+            self._protect(self.run_dir / 'validation-plans' / key / 'plan.json')
             validation_case = Case.from_dict({'cve': 'CVE-2099-0000', 'project': 'validation contract',
                 'repository': 'repo', 'source_commit': '0', 'source_parent': '0', 'target_commit': repo.head,
                 'files': ['placeholder'], 'validation': plan['checks']})
-            case = Case(cve=self.task_id, project='AOSP diff-only backport', repository=repo.root.name,
-                        source_commit='', source_parent='', target_commit=repo.head, files=files,
-                        validation=validation_case.validation, validation_checks=validation_case.validation_checks)
-            child = AospBackportAgent(repo.root.parent, self.run_dir / 'exports', case,
+            dependencies = tuple({'path': self.by_key[k].root.relative_to(source_root).as_posix(),
+                                  'role': 'read_only_dependency', 'files': []}
+                                 for k in sorted(selected - {key}))
+            case = Case(cve=self.task_id, project='AOSP mapped backport',
+                        repository=repo.root.relative_to(source_root).as_posix(),
+                        source_commit=self.donor.get('source_commit', ''),
+                        source_parent=self.donor.get('source_parent', ''), target_commit=repo.head, files=files,
+                        validation=validation_case.validation, validation_checks=validation_case.validation_checks,
+                        repositories=dependencies)
+            child = AospBackportAgent(source_root, self.run_dir / 'exports', case,
                                       model=self.model, source_diff=self.diff)
             child.run_dir = self.run_dir / 'repositories' / key
             child.worktree = self.workspace / key
+            child.mapping_plan, child.mapping_repository = self.mapping_plan, key
             self.children[key] = child
             child.prepare()
+            from dataclasses import asdict
+            _write(child.run_dir / 'runtime-case.json', asdict(case))
+            self._protect(child.run_dir / 'runtime-case.json')
+            for check in case.validation_checks:
+                argv = check['argv']
+                scripts = [argv[0]]
+                if re.fullmatch(r'(?:python[\d.]*|pypy[\d.]*|node|ruby|perl)', Path(argv[0]).name):
+                    if '-m' not in argv:
+                        scripts.extend(next(([a] for a in argv[1:] if not a.startswith('-')), []))
+                for script in scripts:
+                    path = Path(script) if Path(script).is_absolute() else child.worktree / script
+                    if path.is_file():
+                        self._protect(path.resolve())
             child.record['validation_plan'] = str(self.run_dir / 'validation-plans' / key / 'plan.json')
             child._write_record()
         self._audit()
@@ -313,12 +255,14 @@ class DiffBackportAgent:
                 raise AssessmentError('each edit mapping requires changed candidate evidence; missing: ' + ', '.join(missing))
         return raw
 
-    def run(self, *, inspect_only=False, max_attempts=3, verify=False):
+    def run(self, *, inspect_only=False, max_attempts=3, verify=False,
+            impact_only=False, mechanical=True):
         if max_attempts < 1:
             raise ValueError('max_attempts must be positive')
         self.run_dir.mkdir(parents=True, exist_ok=False)
         try:
             (self.run_dir / 'input.patch').write_bytes(self.patch_bytes)
+            self._protect(self.run_dir / 'input.patch')
             inventory = [{'key': r.key, 'original_root': str(r.root), 'head': r.head,
                           'tracked_files': len(r.files)} for r in self.repos]
             _write(self.run_dir / 'inventory.json', inventory)
@@ -359,12 +303,21 @@ class DiffBackportAgent:
                             raise
                         prompt = f'Correct the complete read-only assessment. Evidence rejection: {exc}. Return all units in the same schema. Do not edit files.'
             _write(self.run_dir / 'assessment.json', assessment)
+            self._protect(self.run_dir / 'assessment.json')
             self.record.update(model_execution='succeeded', impact_decision=assessment['status'])
             if assessment['status'] != 'AFFECTED':
                 self.record['status'] = 'INCONCLUSIVE' if assessment['status'] == 'UNKNOWN' else assessment['status']
                 self._save()
                 return self.record
             self._prepare_children(assessment)
+            if self.donor['status'] == 'VERIFIED':
+                from .mapped_backend import run_backends
+                return run_backends(self, assessment, verify=verify, max_attempts=max_attempts,
+                                    impact_only=impact_only, mechanical=mechanical)
+            if impact_only:
+                self.record['status'] = 'AFFECTED'
+                self._save()
+                return self.record
             with self._runtime('migration') as runtime:
                 runtime.start(self.workspace, SYSTEM)
                 prompt = (migration_prompt(self.diff, assessment, assessment['writable_paths'], self.workspace)
@@ -381,6 +334,9 @@ class DiffBackportAgent:
                     patches, verification = {}, {}
                     for key, child in self.children.items():
                         child.record['attempt'] = attempt
+                        required_ids = {t['unit_id'] for t in self.mapping_plan.targets(key)
+                                        if t['action'] == 'edit' and t['status'] == 'AFFECTED'}
+                        child._current_hunks = [u for u in self.units if u['id'] in required_ids]
                         try:
                             patch = child.export_patch(attempt)
                         except CandidateRejected as exc:
@@ -395,7 +351,17 @@ class DiffBackportAgent:
                             patches[key] = {'file': str(child.run_dir / 'backport.patch'),
                                             'sha256': child.record['patch_sha256'], 'target': child.case.target_commit,
                                             'replay': child.record['patch_replay']}
-                            verification[key] = child.verify() if verify else {'status': 'NOT_REQUESTED'}
+                            if not coverage_error:
+                                declarations = '\n'.join(
+                                    f"HUNK-RESULT {c['id']} implemented {c['explanation']}"
+                                    for c in raw['coverage'] if c['id'] in required_ids and c['status'] == 'implemented')
+                                ledger = child._check_hunk_results(declarations, child._last_audit['changed_files'], patch)
+                                child.record['hunk_results'] = ledger['claims']
+                                if not ledger['ok']:
+                                    coverage_error = ledger['feedback']
+                            verification[key] = ({'status': 'NOT_RUN', 'blocked_by': 'HUNK_LEDGER'}
+                                if coverage_error else child.verify() if verify else {'status': 'NOT_REQUESTED'})
+                            child.record['final_verification'] = verification[key]
                         child._write_record()
                     self._audit()
                     self.record['patches'], self.record['verification'] = patches, verification

@@ -10,13 +10,13 @@ AOSP Backport Agent 是一个数据驱动的 Android 安全补丁回移系统。
 
 `aosp_agent run` 执行以下流程：
 
-1. 读取案例 JSON，固定 donor 修复提交、父提交、目标提交、允许修改文件和验证命令。
-2. 从 donor 裸仓提取修复 diff，做 hunk 分解、donor diff 预处理和安全变更分类。
-3. 为目标提交创建隔离 detached worktree，避免直接修改原始 checkout。
-4. 先尝试机械 hunk 迁移，再让模型在允许文件范围内完成跨版本适配。
+1. 读取案例 JSON 中的 donor 身份、真实父提交和目标基线，忽略历史 `files`、`validation` 与参考答案字段。
+2. 从 donor 裸仓提取修复 diff，使用与 diff 入口相同的发现和映射核验，固定 `MappingPlan` 与自动验收计划。
+3. 从核实的映射推导每个仓库的运行时 Case 和允许修改文件，创建隔离 detached worktree。
+4. 各仓库接入原 run 后端的因果证据判断、机械迁移、策略阶梯与逐 hunk 账本；映射和答题使用独立 SDK 会话。
 5. 审计每轮修改：HEAD、tracked/untracked 文件、路径 allowlist、符号链接、原始 checkout。
 6. 导出候选补丁，并在新的干净 worktree 中独立重放。
-7. 按案例执行源码契约检查；配置 `--verify` 时执行编译验证。
+7. `--verify` 执行控制器固定的验收计划；编译需要显式 `--build-runner` 且构建归属解析完整。冒烟单独通过不升级 `VALIDATED`。
 8. 对 `VALIDATED` 补丁做补丁后影响分析，记录兼容性、性能和测试建议。
 9. 生成 `run.json`、impact/post-fix 报告、候选补丁、最终补丁、验证输出和 SDK 事件留痕。
 
@@ -44,8 +44,13 @@ AOSP Backport Agent 是一个数据驱动的 Android 安全补丁回移系统。
 
 ```text
 aosp_agent/
-  engine.py             CVE 主工作流和状态机
-  diff_engine.py        仅从 diff 输入的发现/评估/迁移工作流
+  engine.py            因果证据、迁移策略、逐 hunk 账本和验证后端
+  diff_engine.py       共用发现/映射编排及无 donor 的受限流程
+  mapping_plan.py      映射核验与不可变运行时范围
+  mapped_run.py        案例身份输入适配，不采用预填目标文件
+  mapped_backend.py    按仓接入原 run 后端与结果汇总
+  validation_plan.py   可溯源的自动验收和显式 stage 覆盖
+  build_transaction.py 受控构建契约、锁和精确恢复
   diff_analysis.py      donor diff 预处理与漏洞类别推断
   sdk_runtime.py        官方 Codex SDK streaming 运行时
   prompts.py            影响判断、迁移、补丁后影响和继承分析提示词
@@ -91,7 +96,7 @@ python3 -m venv .venv-sdk
 
 ## 准备源码与 donor
 
-每个案例 JSON 记录了 `repository`、`source_commit`、`source_parent`、`target_commit` 和允许修改的文件。运行前需要准备：
+案例 JSON 记录 `repository`、`source_commit`、`source_parent`、`target_commit` 等输入身份；`files` 和 `validation` 可省略，CLI 不再以它们作为出题依据。运行前需要准备：
 
 1. **目标源码根**：`--source-root` 指向包含案例仓库的 AOSP 或多仓源码根，目标仓库中必须已有目标提交对象，原始 checkout 应保持干净。
 2. **donor 裸仓根**：`--donor-root` 指向包含 donor 裸仓的目录。命名规则是把仓库路径中的 `/` 替换为 `-` 并加 `.git`，例如 `frameworks/base` 对应 `frameworks-base.git`。
@@ -117,8 +122,14 @@ agent 会在 `--run-root` 下创建隔离 worktree。编译脚本会在受控流
   --source-root /path/to/aosp \
   --donor-root /path/to/donor-git \
   --run-root /path/to/runs \
+  --build-runner /absolute/path/to/module-build-r760.sh \
   --verify --max-attempts 6 --turn-timeout 3600
 ```
+
+需要保留独立人工验收时，使用 `--validation /path/to/overrides.json` 显式提供按仓库 key 分组的检查；旧 dataset 验收不会自动沿用。
+`--mapping-model` 可单独指定只读出题会话的模型，默认继承 `--model`；答题会话无权改写映射和验收计划。
+有核实 donor 的 run/diff 都接回原 run 后端；只有 diff 文本时保留受限源码证据流程，但同样执行映射区域账本检查。
+多仓分别完成迁移和重试，失败不抹掉其他仓库的产物；尚无联合验证时，分别通过也只报告 `PATCH_UNVERIFIED`。
 
 只准备和检查输入，不调用模型：
 

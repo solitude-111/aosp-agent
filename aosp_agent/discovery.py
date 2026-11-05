@@ -56,7 +56,7 @@ class Repository:
                 'diff': hashlib.sha256(local_git(self.root, 'diff', '--binary', '--no-ext-diff', 'HEAD').stdout.encode()).hexdigest()}
 
 
-def repositories(root: Path, max_directories: int = 20000) -> list[Repository]:
+def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None) -> list[Repository]:
     """Discover standalone Git or repo-tool checkouts without following directory links."""
     root = root.resolve()
     roots = []
@@ -78,7 +78,8 @@ def repositories(root: Path, max_directories: int = 20000) -> list[Repository]:
     for path in sorted(roots):
         key = path.relative_to(root).as_posix() if path != root else 'repo'
         validate_relative_path(key)
-        head = local_git(path, 'rev-parse', '--verify', 'HEAD^{commit}').stdout.strip()
+        ref = (pinned_heads or {}).get(key, 'HEAD')
+        head = local_git(path, 'rev-parse', '--verify', ref + '^{commit}').stdout.strip()
         entries = local_git(path, 'ls-tree', '-r', '-z', head).stdout.split('\0')
         files = {}
         for entry in filter(None, entries):
@@ -89,6 +90,8 @@ def repositories(root: Path, max_directories: int = 20000) -> list[Repository]:
                 continue
             files[name] = meta.split()[0]
         result.append(Repository(key, path, head, files))
+    if set(pinned_heads or {}) - {r.key for r in result}:
+        raise ValueError('pinned target repository was not discovered')
     return result
 
 
