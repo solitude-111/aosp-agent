@@ -11,11 +11,12 @@ import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from .case import Case, validate_relative_path
 from .git_policy import OFFLINE_GIT_ENV
-from .discovery import Locator, diff_units, local_git, repositories, repository_roots, repository_issue
+from .discovery import Locator, diff_units, local_git, repositories, repository_roots, repository_issue, READ_BUDGETS
 from .donor import verify_donor
 from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt
 from .engine import AospBackportAgent, AssessmentError
@@ -96,19 +97,33 @@ class DiffBackportAgent:
             raise
 
     def _inventory(self, pinned_heads):
+        self.record.update(git_read_budgets_seconds={k: list(v) for k, v in READ_BUDGETS.items()},
+                           git_read_attempts='git-read-attempts.jsonl', git_read_retry_on='TimeoutExpired_only')
+        self._save()
         self.repo_roots = repository_roots(self.target_root)
         self.repo_keys = {p.relative_to(self.target_root).as_posix() if p != self.target_root else 'repo': p
                           for p in self.repo_roots}
         def progress(state):
             _write(self.run_dir / 'inventory-progress.json', {**state, 'issues': self.inventory_issues})
+        last_read_snapshot = float('-inf')
+        def read_event(event):
+            nonlocal last_read_snapshot
+            with (self.run_dir / 'git-read-attempts.jsonl').open('a') as log:
+                log.write(json.dumps(event, ensure_ascii=False) + '\n')
+            now = time.monotonic()
+            # Keep every attempt in the append-only log, without atomically
+            # replacing a snapshot twice for every fast grep/blob read.
+            if now - last_read_snapshot >= 1 or event['status'] in ('TIMED_OUT', 'ERROR') or event['attempt'] > 1:
+                _write(self.run_dir / 'git-read-progress.json', event)
+                last_read_snapshot = now
         repos = repositories(self.target_root, pinned_heads=pinned_heads, roots=self.repo_roots,
-                             issues=self.inventory_issues, progress=progress)
+                             issues=self.inventory_issues, progress=progress, read_events=read_event)
         self.before, self.repos = {}, []
         for number, repo in enumerate(repos, 1):
             progress({'repository': repo.key, 'stage': 'source_guard',
                       'completed_repositories': number - 1, 'total_repositories': len(repos)})
             try:
-                self.before[repo.key] = repo.state(timeout=10)
+                self.before[repo.key] = repo.state(timeout=None)
             except (OSError, subprocess.SubprocessError) as exc:
                 self.inventory_issues.append(repository_issue(repo.key, 'source_guard', exc, repo.root))
                 if repo.key in (pinned_heads or {}):

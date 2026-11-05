@@ -12,8 +12,9 @@ import math
 import os
 import re
 import subprocess
+import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from .case import validate_relative_path
@@ -34,26 +35,83 @@ def local_git(repo: Path, *args: str, check: bool = True, timeout: int = 45):
                           check=check, timeout=timeout)
 
 
+# First attempt / one timeout-only retry. These are operation budgets, not
+# promises about repository health or a substitute for object-store maintenance.
+READ_BUDGETS = {
+    'resolve_commit': (15, 45),
+    'read_tree': (45, 120),
+    'guard_head': (10, 30),
+    'guard_status': (45, 120),
+    'guard_diff': (45, 120),
+    'blob_size': (15, 45),
+    'blob_read': (30, 90),
+    'identifier_search': (30, 60),
+}
+
+
+def read_git(repo, *args, stage, check=True, timeout=None, progress=None):
+    """Retry only a timed-out read, never parse partial output or alter Git state.
+
+    An explicit timeout retains the caller's single-attempt contract. Later
+    source integrity audits use this mode; inventory uses the staged policy.
+    local_git reaps its process before returning/raising, so retries are serial.
+    """
+    budgets = READ_BUDGETS[stage] if timeout is None else (timeout,)
+    if any(not isinstance(t, (int, float)) or isinstance(t, bool) or not math.isfinite(t) or t <= 0 for t in budgets):
+        raise ValueError('Git read timeouts must be positive numbers')
+    attempts = []
+    operation = hashlib.sha256('\0'.join(args).encode()).hexdigest()[:16]
+    for number, budget in enumerate(budgets, 1):
+        event = {'stage': stage, 'operation': operation, 'command': args[0],
+                 'attempt': number, 'max_attempts': len(budgets), 'timeout_seconds': budget}
+        if progress:
+            progress({**event, 'status': 'STARTED'})
+        started = time.monotonic()
+        try:
+            result = local_git(repo, *args, check=check, timeout=budget)
+        except (OSError, subprocess.SubprocessError) as exc:
+            timed_out = isinstance(exc, subprocess.TimeoutExpired)
+            event.update(status='TIMED_OUT' if timed_out else 'ERROR',
+                         elapsed_seconds=round(time.monotonic() - started, 3), type=type(exc).__name__)
+            attempts.append(event)
+            if progress:
+                progress(dict(event))
+            exc.read_attempts = list(attempts)
+            if not timed_out or number == len(budgets):
+                raise
+        else:
+            event.update(status='SUCCEEDED' if result.returncode == 0 else 'RETURNED_NONZERO',
+                         returncode=result.returncode, elapsed_seconds=round(time.monotonic() - started, 3))
+            if progress:
+                progress(event)
+            return result
+
+
 @dataclass
 class Repository:
     key: str
     root: Path
     head: str
     files: dict[str, str]  # path -> mode; blobs read only on demand
+    read_events: object = field(default=None, repr=False, compare=False)
 
     def read(self, path: str) -> str:
         validate_relative_path(path)
         if self.files.get(path) not in ('100644', '100755'):
             raise ValueError(f'not a regular tracked file: {self.key}/{path}')
-        size = int(local_git(self.root, 'cat-file', '-s', f'{self.head}:{path}').stdout)
+        size = int(read_git(self.root, 'cat-file', '-s', f'{self.head}:{path}',
+                            stage='blob_size', progress=self.read_events).stdout)
         if size > 32 * 1024 * 1024:
             raise ValueError(f'blob exceeds 32 MiB retrieval limit: {path}')
-        return local_git(self.root, 'show', '--no-ext-diff', '--no-textconv', f'{self.head}:{path}').stdout
+        return read_git(self.root, 'show', '--no-ext-diff', '--no-textconv', f'{self.head}:{path}',
+                        stage='blob_read', progress=self.read_events).stdout
 
     def state(self, *, timeout=45) -> dict:
-        return {'head': local_git(self.root, 'rev-parse', 'HEAD', timeout=timeout).stdout.strip(),
-                'status': local_git(self.root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', timeout=timeout).stdout,
-                'diff': hashlib.sha256(local_git(self.root, 'diff', '--binary', '--no-ext-diff', 'HEAD', timeout=timeout).stdout.encode()).hexdigest()}
+        def read(stage, *args):
+            return read_git(self.root, *args, stage=stage, timeout=timeout, progress=self.read_events).stdout
+        return {'head': read('guard_head', 'rev-parse', 'HEAD').strip(),
+                'status': read('guard_status', 'status', '--porcelain=v1', '-z', '--untracked-files=all'),
+                'diff': hashlib.sha256(read('guard_diff', 'diff', '--binary', '--no-ext-diff', 'HEAD').encode()).hexdigest()}
 
 
 def repository_roots(root: Path, max_directories: int = 20000) -> list[Path]:
@@ -119,11 +177,13 @@ def repository_issue(key, stage, exc, root=None):
             'error': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))[-1200:]}
     if root is not None:
         issue['object_store'] = object_store_diagnostic(root)
+    if getattr(exc, 'read_attempts', None):
+        issue['attempts'] = exc.read_attempts
     return issue
 
 
 def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None,
-                 issues=None, progress=None, roots=None, timeout=10) -> list[Repository]:
+                 issues=None, progress=None, roots=None, timeout=None, read_events=None) -> list[Repository]:
     """Read bounded inventories. Opt-in tolerant callers must retain every issue.
 
     An explicit pinned repository remains mandatory, even in tolerant mode.
@@ -136,14 +196,20 @@ def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None,
         key = path.relative_to(root).as_posix() if path != root else 'repo'
         validate_relative_path(key)
         ref = (pinned_heads or {}).get(key, 'HEAD')
+        def emit(event, repository=key):
+            if read_events:
+                read_events({'repository': repository, **event})
+        event_sink = emit if read_events else None
         stage = 'resolve_commit'
         if progress:
             progress({'repository': key, 'completed_repositories': number - 1,
                       'total_repositories': len(roots), 'stage': stage})
         try:
-            head = local_git(path, 'rev-parse', '--verify', ref + '^{commit}', timeout=timeout).stdout.strip()
+            head = read_git(path, 'rev-parse', '--verify', ref + '^{commit}', timeout=timeout,
+                            stage=stage, progress=event_sink).stdout.strip()
             stage = 'read_tree'
-            entries = local_git(path, 'ls-tree', '-r', '-z', head, timeout=timeout).stdout.split('\0')
+            entries = read_git(path, 'ls-tree', '-r', '-z', head, timeout=timeout,
+                               stage=stage, progress=event_sink).stdout.split('\0')
             files = {}
             for entry in filter(None, entries):
                 meta, name = entry.split('\t', 1)
@@ -152,7 +218,7 @@ def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None,
                 except ValueError:
                     continue
                 files[name] = meta.split()[0]
-            result.append(Repository(key, path, head, files))
+            result.append(Repository(key, path, head, files, event_sink))
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             if issues is None:
                 raise
@@ -327,8 +393,9 @@ class Locator:
                         for term in query:
                             search_key = (repo.key, term)
                             if search_key not in self.search_cache:
-                                res = local_git(repo.root, 'grep', '--no-textconv', '-I', '-l', '-z', '-F', '-w',
-                                                '-e', term, repo.head, '--', check=False, timeout=10)
+                                res = read_git(repo.root, 'grep', '--no-textconv', '-I', '-l', '-z', '-F', '-w',
+                                               '-e', term, repo.head, '--', check=False,
+                                               stage='identifier_search', progress=repo.read_events)
                                 if res.returncode not in (0, 1):
                                     raise ValueError(res.stderr[-1000:])
                                 self.search_cache[search_key] = [p.removeprefix(repo.head + ':') for p in res.stdout.split('\0') if p]

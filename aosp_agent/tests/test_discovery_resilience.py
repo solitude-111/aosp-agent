@@ -41,7 +41,7 @@ class DiscoveryResilienceTest(unittest.TestCase):
             with self.unavailable(peer, calls):
                 agent = self.agent(fx)
                 result = agent.run(inspect_only=True)
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
             self.assertEqual(result['status'], 'INCONCLUSIVE')
             self.assertEqual(result['inventory_status'], 'INCOMPLETE')
             self.assertEqual(result['source_guard']['unavailable'], ['unavailable'])
@@ -157,7 +157,7 @@ class DiscoveryResilienceTest(unittest.TestCase):
                 return original(root, *args, **kwargs)
             with patch.object(discovery, 'local_git', side_effect=read):
                 report = discovery.Locator(repos, units).locate()
-            self.assertEqual(len(calls), 1)
+            self.assertEqual(len(calls), 2)
             self.assertEqual(len(report['issues']), 2)
             self.assertTrue(all(i['stage'] == 'identifier_search' for i in report['issues']))
 
