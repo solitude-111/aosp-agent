@@ -45,6 +45,10 @@ KNOWLEDGE = '''AOSP investigation guide (hypotheses, never reference answers):
 - A new helper in the diff may express protection that belongs inside an old function. A missing name
   may be renamed, moved across repositories, split, merged or inlined. Compare callers, fields,
   constants, control flow and local history; file/name similarity alone proves nothing.
+- Separate the faulty security operation from the mechanism introduced to fix it. Missing new
+  hooks, blobs, flags, types, APIs or prerequisite commits does not prove the operation absent.
+  Trace the old entrypoint, dispatch, object/identity flow and checks across repository boundaries.
+  An old representation can retain the same fault even when the donor fix cannot be copied directly.
 - Enumerate every change unit, including new/deleted files, tests and configuration. Explain dependencies
   between units. Equivalent existing protection is ALREADY_FIXED. NOT_AFFECTED requires affirmative
   target evidence about the feature/call path; failed search or missing Git objects is not absence.
@@ -90,6 +94,9 @@ Return the JSON schema. For EACH change-unit id exactly once:
    numbers shown in the location report. Never cite lines outside the diff as patch evidence.
 4. Missing/new helpers: locate the old callers and decide inline/adapt/create/irrelevant with evidence.
    NOT_AFFECTED with feature_absent needs at least two target excerpts including the relevant entry point.
+   Feature-absence proposals receive a separate read-only challenge before acceptance. Prove why the
+   faulty operation is absent/unreachable in the OLD implementation; naming missing modern APIs is
+   insufficient. Equivalent existing protection is ALREADY_FIXED; uncertain equivalence is UNKNOWN.
    UNKNOWN blocks the entire migration. It is valid to report uncertainty rather than invent a mapping.
 5. Include required existing tests/build/API dependencies among targets. If a new file is necessary,
    declare new_files with a related existing anchor_path and rationale. Only the resulting reviewed

@@ -212,7 +212,7 @@ class DiffBackportAgent:
         else:
             factory = self.factory
         return factory(events_path=self.run_dir / f'sdk-{name}.jsonl',
-                       model=self.mapping_model if name == 'assessment' else self.model,
+                       model=self.mapping_model if name == 'assessment' or name.startswith('exclusion-review-') else self.model,
                        model_provider=self.provider, turn_timeout=self.timeout,
                        env=OFFLINE_GIT_ENV)
 
@@ -395,6 +395,7 @@ class DiffBackportAgent:
                     self._save()
                 return self.record
             with self._runtime('assessment') as runtime:
+                from .exclusion_review import ExclusionReviewError, review_exclusions, unresolved_exclusions
                 runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
                 prompt = assessment_prompt(self.diff, inventory, location) + self._donor_tools_context() + review_prompt(review)
                 for attempt in range(1, max_attempts + 1):
@@ -402,10 +403,14 @@ class DiffBackportAgent:
                     _write(self.run_dir / f'assessment-{attempt}.json', raw)
                     try:
                         assessment = self.ground(raw)
+                        review_exclusions(self, assessment, inventory, attempt)
                         break
                     except AssessmentError as exc:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))
                         if attempt == max_attempts:
+                            if isinstance(exc, ExclusionReviewError):
+                                assessment = unresolved_exclusions(self, assessment, str(exc))
+                                break
                             raise
                         prompt = f'Correct the complete read-only assessment. Evidence rejection: {exc}. Return all units in the same schema. Do not edit files.'
             _write(self.run_dir / 'assessment.json', assessment)
