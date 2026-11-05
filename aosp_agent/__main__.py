@@ -86,7 +86,10 @@ def main() -> int:
             result = agent.run(inspect_only=args.inspect_only, max_attempts=args.max_attempts, verify=args.verify)
         except Exception as exc:
             result = {"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}}
-        summary = {k: result[k] for k in ("task_id", "status", "impact_decision", "model", "patches", "error") if k in result}
+            if getattr(exc, 'record_path', None):
+                result['record'] = exc.record_path
+        summary = {k: result[k] for k in ("task_id", "status", "impact_decision", "model", "patches", "error", "record",
+                                        "inventory_status", "completion_blocked_by") if k in result}
         if agent:
             summary["record"] = str(agent.run_dir / "run.json")
         print(json.dumps(summary, ensure_ascii=False, indent=2))

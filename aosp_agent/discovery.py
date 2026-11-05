@@ -50,14 +50,14 @@ class Repository:
             raise ValueError(f'blob exceeds 32 MiB retrieval limit: {path}')
         return local_git(self.root, 'show', '--no-ext-diff', '--no-textconv', f'{self.head}:{path}').stdout
 
-    def state(self) -> dict:
-        return {'head': local_git(self.root, 'rev-parse', 'HEAD').stdout.strip(),
-                'status': local_git(self.root, 'status', '--porcelain=v1', '-z', '--untracked-files=all').stdout,
-                'diff': hashlib.sha256(local_git(self.root, 'diff', '--binary', '--no-ext-diff', 'HEAD').stdout.encode()).hexdigest()}
+    def state(self, *, timeout=45) -> dict:
+        return {'head': local_git(self.root, 'rev-parse', 'HEAD', timeout=timeout).stdout.strip(),
+                'status': local_git(self.root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', timeout=timeout).stdout,
+                'diff': hashlib.sha256(local_git(self.root, 'diff', '--binary', '--no-ext-diff', 'HEAD', timeout=timeout).stdout.encode()).hexdigest()}
 
 
-def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None) -> list[Repository]:
-    """Discover standalone Git or repo-tool checkouts without following directory links."""
+def repository_roots(root: Path, max_directories: int = 20000) -> list[Path]:
+    """Enumerate checkouts without opening Git objects or following directory links."""
     root = root.resolve()
     roots = []
     visited = 0
@@ -66,7 +66,7 @@ def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None)
         if visited > max_directories:
             raise ValueError('repository discovery directory limit reached; provide a narrower checkout root')
         path = Path(folder)
-        if (path / '.git').exists():
+        if os.path.lexists(path / '.git'):
             roots.append(path)
             dirs[:] = []
         else:
@@ -74,22 +74,97 @@ def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None)
                              and d not in ('out', 'runs', 'node_modules'))
     if not roots:
         raise ValueError('target must be a Git worktree or a root containing Git worktrees')
+    return sorted(roots)
+
+
+def object_store_diagnostic(root: Path, limit=100000):
+    """Cheap metadata only; a timeout is not proof of a missing object.
+
+    Do not run fsck, fetch, gc, or repack as part of discovery. Pack fragmentation
+    is an advisory maintenance clue, not a diagnosis of repository corruption.
+    """
+    try:
+        gitdir = root / '.git'
+        if gitdir.is_file():
+            with gitdir.open() as stream:
+                pointer = stream.read(4096).strip()
+            if not pointer.startswith('gitdir: '):
+                return {'status': 'UNKNOWN_GIT_DIRECTORY'}
+            gitdir = (root / pointer[8:]).resolve()
+        common = gitdir / 'commondir'
+        if common.is_file():
+            with common.open() as stream:
+                gitdir = (gitdir / stream.read(4096).strip()).resolve()
+        counts = {'.pack': 0, '.idx': 0, '.promisor': 0}
+        truncated = False
+        with os.scandir(gitdir / 'objects' / 'pack') as entries:
+            for number, entry in enumerate(entries):
+                if number >= limit:
+                    truncated = True
+                    break
+                suffix = Path(entry.name).suffix
+                if suffix in counts:
+                    counts[suffix] += 1
+        return {'status': 'METADATA_ONLY', 'pack_files': counts['.pack'], 'index_files': counts['.idx'],
+                'promisor_files': counts['.promisor'], 'truncated': truncated,
+                'object_completeness': 'NOT_CHECKED',
+                'maintenance_hint': 'MANY_PACK_FILES' if counts['.pack'] > 1024 else 'NONE'}
+    except OSError as exc:
+        return {'status': 'UNAVAILABLE', 'type': type(exc).__name__, 'object_completeness': 'NOT_CHECKED'}
+
+
+def repository_issue(key, stage, exc, root=None):
+    issue = {'repository': key, 'stage': stage, 'status': 'UNAVAILABLE',
+            'type': type(exc).__name__,
+            'error': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))[-1200:]}
+    if root is not None:
+        issue['object_store'] = object_store_diagnostic(root)
+    return issue
+
+
+def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None,
+                 issues=None, progress=None, roots=None, timeout=10) -> list[Repository]:
+    """Read bounded inventories. Opt-in tolerant callers must retain every issue.
+
+    An explicit pinned repository remains mandatory, even in tolerant mode.
+    This never fetches or repairs source repositories.
+    """
+    root = root.resolve()
+    roots = repository_roots(root, max_directories) if roots is None else roots
     result = []
-    for path in sorted(roots):
+    for number, path in enumerate(sorted(roots), 1):
         key = path.relative_to(root).as_posix() if path != root else 'repo'
         validate_relative_path(key)
         ref = (pinned_heads or {}).get(key, 'HEAD')
-        head = local_git(path, 'rev-parse', '--verify', ref + '^{commit}').stdout.strip()
-        entries = local_git(path, 'ls-tree', '-r', '-z', head).stdout.split('\0')
-        files = {}
-        for entry in filter(None, entries):
-            meta, name = entry.split('\t', 1)
-            try:
-                validate_relative_path(name)
-            except ValueError:
-                continue
-            files[name] = meta.split()[0]
-        result.append(Repository(key, path, head, files))
+        stage = 'resolve_commit'
+        if progress:
+            progress({'repository': key, 'completed_repositories': number - 1,
+                      'total_repositories': len(roots), 'stage': stage})
+        try:
+            head = local_git(path, 'rev-parse', '--verify', ref + '^{commit}', timeout=timeout).stdout.strip()
+            stage = 'read_tree'
+            entries = local_git(path, 'ls-tree', '-r', '-z', head, timeout=timeout).stdout.split('\0')
+            files = {}
+            for entry in filter(None, entries):
+                meta, name = entry.split('\t', 1)
+                try:
+                    validate_relative_path(name)
+                except ValueError:
+                    continue
+                files[name] = meta.split()[0]
+            result.append(Repository(key, path, head, files))
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            if issues is None:
+                raise
+            issues.append(repository_issue(key, stage, exc, path))
+            if progress:
+                progress({'repository': key, 'completed_repositories': number,
+                          'total_repositories': len(roots), 'stage': stage, 'status': 'UNAVAILABLE'})
+            if key in (pinned_heads or {}):
+                raise ValueError(f'pinned target repository is unavailable: {key}') from exc
+        if progress:
+            progress({'repository': key, 'completed_repositories': number,
+                      'total_repositories': len(roots), 'stage': 'inventory'})
     if set(pinned_heads or {}) - {r.key for r in result}:
         raise ValueError('pinned target repository was not discovered')
     return result
@@ -198,12 +273,20 @@ class Locator:
         self.cache = {}
         self.definitions = {}
         self.search_cache = {}
+        self.search_failures = {}
+        self.read_failures = {}
         self.issues = []
 
     def read(self, repo: Repository, path: str) -> str:
         key = (repo.key, path)
+        if key in self.read_failures:
+            raise ValueError(self.read_failures[key])
         if key not in self.cache:
-            self.cache[key] = repo.read(path)
+            try:
+                self.cache[key] = repo.read(path)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.read_failures[key] = str(exc)[-1000:]
+                raise
         return self.cache[key]
 
     def locate(self, progress=None) -> dict:
@@ -236,6 +319,8 @@ class Locator:
                         add(path, 4, 'path_suffix')
                 if query and unit['supported']:
                     try:
+                        if repo.key in self.search_failures:
+                            raise ValueError(self.search_failures[repo.key])
                         # Preserve evidence from rare stable APIs/fields even if the file and
                         # enclosing function both changed names. A single OR grep followed by
                         # alphabetical truncation loses those hits in large AOSP repositories.
@@ -243,7 +328,7 @@ class Locator:
                             search_key = (repo.key, term)
                             if search_key not in self.search_cache:
                                 res = local_git(repo.root, 'grep', '--no-textconv', '-I', '-l', '-z', '-F', '-w',
-                                                '-e', term, repo.head, '--', check=False)
+                                                '-e', term, repo.head, '--', check=False, timeout=10)
                                 if res.returncode not in (0, 1):
                                     raise ValueError(res.stderr[-1000:])
                                 self.search_cache[search_key] = [p.removeprefix(repo.head + ':') for p in res.stdout.split('\0') if p]
@@ -253,7 +338,8 @@ class Locator:
                             weight = 6 / (1 + math.log1p(len(hits)))
                             for path in hits:
                                 add(path, weight, 'identifier:' + term)
-                    except (ValueError, subprocess.SubprocessError) as exc:
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                        self.search_failures[repo.key] = str(exc)[-1200:]
                         self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'identifier_search',
                                             'error': str(exc)[-1200:]})
                 # Prefer path hints, then rare identifier-bearing filenames. Never call a truncated scan exhaustive.
@@ -275,7 +361,7 @@ class Locator:
                         candidates.append({'repository': repo.key, 'path': path, 'workspace_path': f'{repo.key}/{path}',
                                            'score': round(scores[path] + similarity + 4 * bool(matching_defs), 3),
                                            'signals': reasons[path], 'symbols': matching_defs[:12], 'windows': windows})
-                    except (ValueError, subprocess.SubprocessError) as exc:
+                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
                         self.issues.append({'unit': unit['id'], 'path': f'{repo.key}/{path}', 'stage': 'read', 'error': str(exc)[-1000:]})
             candidates.sort(key=lambda c: (-c['score'], c['workspace_path']))
             kept = candidates[:self.candidate_limit]

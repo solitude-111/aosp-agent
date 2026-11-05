@@ -68,6 +68,10 @@ def assessment_prompt(diff, inventory, location):
 The original diff and repositories are supplied, optionally with verified donor commit/parent
 and read-only history tools. No reference conclusion or migration recipe is provided.
 Repository HEADs below are pinned baselines. Target mappings must be derived from source evidence.
+UNAVAILABLE entries are diagnostic scope gaps, not searchable or mappable repositories. Do not
+retry object reads against them. Their absence from candidates proves nothing about impact.
+Account for cross-repository callers and dependencies; unresolved required dependencies mean UNKNOWN.
+Partial discovery cannot establish a global NOT_AFFECTED, ALREADY_FIXED or fully validated result.
 Work READ ONLY. Use git -C <original_root> show <head>:<path> and bounded git grep/log to investigate.
 Never checkout/reset/clean/commit/stage/fetch or modify an original repository. Set GIT_NO_LAZY_FETCH=1.
 Do not read sibling project files, prior runs, oracles, credentials or reference patches.
