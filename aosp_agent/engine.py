@@ -1639,24 +1639,8 @@ class AospBackportAgent:
                         self.record['status'] = 'PATCH_UNVERIFIED'
                         return
                     self.record["status"] = "VALIDATED"
-                    # 功能二：修复后业务影响评估（doc E 类）。补丁验证通过后，
-                    # 用一个只读回合分析补丁对系统的业务影响。评估失败不回退
-                    # VALIDATED 终态（评估是附加分析，不是门禁）。
-                    # 注意：不能用 self._turn(read_only=True) 因为那会做
-                    # "worktree 未变"审计——而此时 worktree 已包含最终补丁。
-                    try:
-                        pf_prompt = post_fix_prompt(self.case, patch) + context
-                        pf_result = runtime.run(pf_prompt, read_only=True,
-                                                output_schema=POST_FIX_SCHEMA)
-                        pf_output = pf_result.get("output") or json.loads(
-                            pf_result.get("final_response", "{}"))
-                        self.record["post_fix_impact"] = pf_output
-                        self._json("post-fix-impact.json", pf_output)
-                        self._event("post_fix_impact_assessed",
-                                    overall_risk=pf_output.get("overall_risk"))
-                    except Exception as exc:
-                        self.record["post_fix_impact"] = {"error": str(exc)[:200]}
-                        self._event("post_fix_impact_failed", error=str(exc)[:200])
+                    if not getattr(self, 'defer_post_fix', False):
+                        self.assess_post_fix(runtime, patch, context)
                     return
                 if verification["status"] == "NOT_CONFIGURED":
                     self.record["status"] = "PATCH_UNVERIFIED"; return
@@ -1668,6 +1652,28 @@ class AospBackportAgent:
             # completed *attempt* but not a successful security validation.
             self.record["status"] = "VALIDATION_FAILED"
             return
+
+    def assess_post_fix(self, runtime, patch, context=''):
+        """Optional analysis may fail, but even a read-only turn must not edit."""
+        before = hashlib.sha256(self._render_patch().encode()).hexdigest()
+        try:
+            result = runtime.run(post_fix_prompt(self.case, patch) + context,
+                                 read_only=True, output_schema=POST_FIX_SCHEMA)
+            if result.get('status') != 'completed':
+                raise RuntimeError('post-fix assessment did not complete')
+            output = result.get('output') or json.loads(result.get('final_response', '{}'))
+            self.record['post_fix_impact'] = output
+            self._json('post-fix-impact.json', output)
+            self._event('post_fix_impact_assessed', overall_risk=output.get('overall_risk'))
+        except Exception as exc:
+            message = re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))[:200]
+            self.record['post_fix_impact'] = {'error': message}
+            self._event('post_fix_impact_failed', error=message)
+        finally:
+            self.audit_diff()
+            if hashlib.sha256(self._render_patch().encode()).hexdigest() != before:
+                raise RuntimeError('post-fix assessment modified the candidate')
+        self.record['post_fix_patch_sha256'] = before
 
     def run(self, *, use_codex: bool = True, verify: bool = False, max_attempts: int = 6,
             mechanical: bool = True, impact_only: bool = False) -> dict[str, Any]:
@@ -1897,6 +1903,7 @@ class AospBackportAgent:
         memory = self.record.get("verification_memory") or {}
         passed_stages = (set(memory.get("passed_stages", []))
                          if memory.get("patch_sha256") and memory["patch_sha256"] == before
+                         and memory.get('context') == self.record.get('verification_context')
                          else set())
         for number, check_spec in enumerate(checks, 1):
             argv = tuple(check_spec["argv"])
@@ -1911,6 +1918,8 @@ class AospBackportAgent:
             start = time.monotonic()
             try:
                 verification_env = _safe_env()
+                for key in ('AOSP_AGENT_PATCH_BUNDLE', 'AOSP_AGENT_BUNDLE_SHA256', 'AOSP_AGENT_ARTIFACT_DIR'):
+                    verification_env.pop(key, None)
                 # Explicit controller contract: neither a model nor cwd ancestry
                 # chooses which original checkout a build is allowed to mutate.
                 verification_env.update({
@@ -1951,6 +1960,7 @@ class AospBackportAgent:
         stages = {stage: ("PASS" if all(item["returncode"] == 0 for item in results if item["stage"] == stage)
                           else "FAIL") for stage in {item["stage"] for item in results}}
         self.record["verification_memory"] = {"patch_sha256": before,
+                                              "context": self.record.get('verification_context'),
                                               "passed_stages": sorted(
                                                   stage for stage, outcome in stages.items()
                                                   if outcome == "PASS")}

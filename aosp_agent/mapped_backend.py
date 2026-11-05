@@ -29,23 +29,26 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
         # Audit the immutable plan and other repositories after every backend
         # model turn, not just after the complete per-repository run.
         original_turn = child._turn
-        def audited_turn(*args, _original=original_turn, **kwargs):
-            result = _original(*args, **kwargs)
-            controller._audit()
-            return result
+        def audited_turn(*args, _original=original_turn, _key=key, **kwargs):
+            before = controller._candidate_hashes(except_key=_key)
+            try:
+                return _original(*args, **kwargs)
+            finally:
+                controller._audit_peers(_key, before)
         child._turn = audited_turn
+        peers = controller._candidate_hashes(except_key=key)
         try:
             result = child.run(verify=verify, max_attempts=max_attempts,
                                mechanical=mechanical, impact_only=impact_only)
         except Exception as exc:
             # Ordinary exhausted backend failures are local to this repository.
             # Unsafe source/plan/workspace mutations still stop the whole task.
-            controller._audit()
+            controller._audit_peers(key, peers)
             statuses[key] = 'FAILED'
             controller.record.setdefault('repository_errors', {})[key] = {
                 'type': type(exc).__name__, 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))}
             continue
-        controller._audit()
+        controller._audit_peers(key, peers)
         statuses[key] = result['status']
         if result.get('patch_file'):
             patches[key] = {'file': result['patch_file'], 'sha256': result['patch_sha256'],
@@ -94,5 +97,8 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
     from .diff_engine import _write
     _write(controller.run_dir / 'patch-bundle.json', patches)
     _write(controller.run_dir / 'hunk-ledger.json', ledger)
+    if not impact_only:
+        from .joint_validation import finish_joint
+        finish_joint(controller, verify=verify, assessment=assessment, max_attempts=max_attempts)
     controller._save()
     return controller.record

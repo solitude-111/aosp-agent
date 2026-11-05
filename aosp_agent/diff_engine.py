@@ -16,8 +16,8 @@ from .case import Case, validate_relative_path
 from .git_policy import OFFLINE_GIT_ENV
 from .discovery import Locator, diff_units, local_git, repositories
 from .donor import verify_donor
-from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt, migration_prompt
-from .engine import AospBackportAgent, AssessmentError, CandidateRejected
+from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt
+from .engine import AospBackportAgent, AssessmentError
 from .prompts import SYSTEM
 from .validation_plan import make_plan, normalize_checks
 from .mapping_plan import MappingPlanner, MappingPlan, _shape, _excerpt
@@ -33,7 +33,7 @@ class DiffBackportAgent:
                  model_provider=None, turn_timeout=900, runtime_factory=None, validation=None,
                  donor_repo=None, source_commit=None, source_parent=None,
                  auto_validation=True, build_runner=None, mapping_model=None,
-                 task_id=None, pinned_heads=None):
+                 task_id=None, pinned_heads=None, joint_validation=None):
         self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -64,6 +64,9 @@ class DiffBackportAgent:
             raise ValueError(f'validation names unknown repositories: {sorted(unknown)}')
         for spec in self.validation.values():
             normalize_checks(spec)
+        self.joint_validation, self.joint_plan = joint_validation, None
+        if joint_validation is not None:
+            normalize_checks(joint_validation)
         self.before = {r.key: r.state() for r in self.repos}
         self.children = {}
         self.protected = {}
@@ -82,6 +85,17 @@ class DiffBackportAgent:
     def _protect(self, path):
         self.protected[path] = hashlib.sha256(path.read_bytes()).hexdigest()
 
+    def _freeze_check(self, check, cwd):
+        argv = check['argv']
+        scripts = [argv[0]]
+        if re.fullmatch(r'(?:python[\d.]*|pypy[\d.]*|node|ruby|perl)', Path(argv[0]).name):
+            if '-m' not in argv:
+                scripts.extend(next(([a] for a in argv[1:] if not a.startswith('-')), []))
+        for script in scripts:
+            path = Path(script) if Path(script).is_absolute() else cwd / script
+            if path.is_file():
+                self._protect(path.resolve())
+
     def _donor_tools_context(self):
         if self.donor['status'] != 'VERIFIED':
             return '\nDonor history: NOT_AVAILABLE; evidence is limited to supplied diff lines.\n'
@@ -99,6 +113,15 @@ class DiffBackportAgent:
         for repo in self.repos:
             if repo.state() != self.before[repo.key]:
                 raise RuntimeError(f'original repository changed: {repo.key}')
+
+    def _candidate_hashes(self, except_key=None):
+        return {key: hashlib.sha256(child._render_patch().encode()).hexdigest()
+                for key, child in self.children.items() if key != except_key}
+
+    def _audit_peers(self, key, before):
+        self._audit()
+        if self._candidate_hashes(except_key=key) != before:
+            raise RuntimeError('repository turn modified another candidate: ' + key)
 
     def _audit(self):
         for path, digest in self.protected.items():
@@ -156,6 +179,8 @@ class DiffBackportAgent:
         self.record['mapping_plan_sha256'] = self.mapping_plan.sha256
         # Read dependencies in the same workspace; only AFFECTED mappings/new files become writable.
         selected = {self._owner(t['path'])[0].key for u in assessment['units'] for t in u['targets']}
+        multi = sum(bool(self.mapping_plan.files(key)) for key in selected) > 1
+        deferred = []
         source_root = (self.target_root.parent if any(r.root == self.target_root for r in self.repos)
                        else self.target_root)
         for key in sorted(selected):
@@ -171,11 +196,18 @@ class DiffBackportAgent:
             plan = make_plan(repo, self.units, mappings, files, self.diff,
                              explicit=self.validation.get(key), auto=self.auto_validation,
                              build_runner=self.build_runner)
+            local_checks = []
+            for check in plan['checks']:
+                if multi and files and check['stage'] == 'android_module_build':
+                    deferred.append((key, check))
+                else:
+                    local_checks.append(check)
+            plan['deferred_to_joint'] = ['android_module_build'] if len(local_checks) != len(plan['checks']) else []
             _write(self.run_dir / 'validation-plans' / key / 'plan.json', plan)
             self._protect(self.run_dir / 'validation-plans' / key / 'plan.json')
             validation_case = Case.from_dict({'cve': 'CVE-2099-0000', 'project': 'validation contract',
                 'repository': 'repo', 'source_commit': '0', 'source_parent': '0', 'target_commit': repo.head,
-                'files': ['placeholder'], 'validation': plan['checks']})
+                'files': ['placeholder'], 'validation': local_checks})
             dependencies = tuple({'path': self.by_key[k].root.relative_to(source_root).as_posix(),
                                   'role': 'read_only_dependency', 'files': []}
                                  for k in sorted(selected - {key}))
@@ -190,23 +222,18 @@ class DiffBackportAgent:
             child.run_dir = self.run_dir / 'repositories' / key
             child.worktree = self.workspace / key
             child.mapping_plan, child.mapping_repository = self.mapping_plan, key
+            child.defer_post_fix = multi
             self.children[key] = child
             child.prepare()
             from dataclasses import asdict
             _write(child.run_dir / 'runtime-case.json', asdict(case))
             self._protect(child.run_dir / 'runtime-case.json')
             for check in case.validation_checks:
-                argv = check['argv']
-                scripts = [argv[0]]
-                if re.fullmatch(r'(?:python[\d.]*|pypy[\d.]*|node|ruby|perl)', Path(argv[0]).name):
-                    if '-m' not in argv:
-                        scripts.extend(next(([a] for a in argv[1:] if not a.startswith('-')), []))
-                for script in scripts:
-                    path = Path(script) if Path(script).is_absolute() else child.worktree / script
-                    if path.is_file():
-                        self._protect(path.resolve())
+                self._freeze_check(check, child.worktree)
             child.record['validation_plan'] = str(self.run_dir / 'validation-plans' / key / 'plan.json')
             child._write_record()
+        from .joint_validation import prepare_joint
+        prepare_joint(self, deferred)
         self._audit()
 
     def _coverage(self, raw, assessment):
@@ -318,78 +345,8 @@ class DiffBackportAgent:
                 self.record['status'] = 'AFFECTED'
                 self._save()
                 return self.record
-            with self._runtime('migration') as runtime:
-                runtime.start(self.workspace, SYSTEM)
-                prompt = (migration_prompt(self.diff, assessment, assessment['writable_paths'], self.workspace)
-                          + self._donor_tools_context())
-                for attempt in range(1, max_attempts + 1):
-                    self.record['attempt'] = attempt
-                    raw = self._turn(runtime, prompt, MIGRATION_SCHEMA, read_only=False)
-                    _write(self.run_dir / f'coverage-{attempt}.json', raw)
-                    coverage_error = None
-                    try:
-                        self._coverage(raw, assessment)
-                    except AssessmentError as exc:
-                        coverage_error = str(exc)
-                    patches, verification = {}, {}
-                    for key, child in self.children.items():
-                        child.record['attempt'] = attempt
-                        required_ids = {t['unit_id'] for t in self.mapping_plan.targets(key)
-                                        if t['action'] == 'edit' and t['status'] == 'AFFECTED'}
-                        child._current_hunks = [u for u in self.units if u['id'] in required_ids]
-                        try:
-                            patch = child.export_patch(attempt)
-                        except CandidateRejected as exc:
-                            coverage_error = coverage_error or str(exc)
-                            verification[key] = {'status': 'NOT_RUN',
-                                                 'blocked_by': 'NEW_FILE_INTEGRATION'}
-                            child.record.update(status='VALIDATION_FAILED',
-                                                final_verification=verification[key])
-                            child._write_record()
-                            continue
-                        if patch.strip():
-                            patches[key] = {'file': str(child.run_dir / 'backport.patch'),
-                                            'sha256': child.record['patch_sha256'], 'target': child.case.target_commit,
-                                            'replay': child.record['patch_replay']}
-                            if not coverage_error:
-                                declarations = '\n'.join(
-                                    f"HUNK-RESULT {c['id']} implemented {c['explanation']}"
-                                    for c in raw['coverage'] if c['id'] in required_ids and c['status'] == 'implemented')
-                                ledger = child._check_hunk_results(declarations, child._last_audit['changed_files'], patch)
-                                child.record['hunk_results'] = ledger['claims']
-                                if not ledger['ok']:
-                                    coverage_error = ledger['feedback']
-                            verification[key] = ({'status': 'NOT_RUN', 'blocked_by': 'HUNK_LEDGER'}
-                                if coverage_error else child.verify() if verify else {'status': 'NOT_REQUESTED'})
-                            child.record['final_verification'] = verification[key]
-                        child._write_record()
-                    self._audit()
-                    self.record['patches'], self.record['verification'] = patches, verification
-                    for layer in ('source_contract', 'android_module_build', 'android_runtime'):
-                        outcomes = [v.get('stages', {}).get(layer) for v in verification.values()]
-                        self.record[layer] = ('FAIL' if 'FAIL' in outcomes else
-                            'PASS' if outcomes and all(o == 'PASS' for o in outcomes) else
-                            'PARTIAL' if 'PASS' in outcomes else 'NOT_CONFIGURED')
-                    if not patches:
-                        coverage_error = coverage_error or 'affected assessment produced no patch'
-                    if coverage_error:
-                        self.record.update(status='MIGRATION_INCOMPLETE', coverage_error=coverage_error)
-                    elif any(v['status'] == 'FAIL' for v in verification.values()):
-                        self.record['status'] = 'VALIDATION_FAILED'
-                    else:
-                        self.record.pop('coverage_error', None)
-                        self.record['patch_replay'] = 'pass'
-                        self.record['status'] = ('VALIDATED' if verification and all(
-                            v['status'] == 'PASS' and v.get('sufficient_for_validated', False)
-                            for v in verification.values())
-                                                 else 'PATCH_UNVERIFIED')
-                        break
-                    self._save()
-                    prompt = ('Revise the candidate using the same complete migration coverage schema. Keep the allowlist and plan. '
-                              'Do not weaken validation.\n' + json.dumps({'coverage_error': coverage_error, 'verification': verification}, ensure_ascii=False))
-            _write(self.run_dir / 'patch-bundle.json', self.record['patches'])
-            self._save()
-            return self.record
+            from .text_backend import run_text_backends
+            return run_text_backends(self, assessment, verify=verify, max_attempts=max_attempts)
         except Exception as exc:
             self.record.update(status='FAILED', error={'type': type(exc).__name__, 'kind': getattr(exc, 'kind', 'DIFF_WORKFLOW_ERROR'),
                 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))})

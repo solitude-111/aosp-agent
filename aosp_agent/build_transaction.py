@@ -6,6 +6,7 @@ reported as restoration failures. No reset/clean or recursive deletion is used.
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import fcntl
 import hashlib
 import json
@@ -44,6 +45,14 @@ def fingerprint(path):
 
 def transaction(source_root, lock_path, command, env=None):
     env = dict(os.environ if env is None else env)
+    if env.get('AOSP_AGENT_PATCH_BUNDLE'):
+        return bundle_transaction(source_root, lock_path, command, env)
+    return _single_transaction(source_root, lock_path, command, env)
+
+
+def _single_transaction(source_root, lock_path, command, env=None, *,
+                        _lock_held=False, _check_only=False, _command_cwd=None):
+    env = dict(os.environ if env is None else env)
     required = ['PATCH_FILE', 'PATCH_SHA256', 'TARGET_REPO', 'TARGET_COMMIT', 'WORKTREE', 'RUN_DIR']
     values = {key: env.get('AOSP_AGENT_' + key) for key in required}
     if not all(values.values()) or not command:
@@ -73,8 +82,9 @@ def transaction(source_root, lock_path, command, env=None):
         (snapshot / 'transaction.json').write_text(json.dumps(report, indent=2) + '\n')
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with (nullcontext() if _lock_held else lock_path.open('a')) as lock:
+        if not _lock_held:
+            fcntl.flock(lock, fcntl.LOCK_EX)
         before = state(repo)
         report['before'] = before
         save()
@@ -104,6 +114,8 @@ def transaction(source_root, lock_path, command, env=None):
                     parent = parent.parent
         # Validate before mutating. Git apply without --reject is atomic on errors.
         local_git(repo, 'apply', '--check', '--binary', str(patch_path))
+        if _check_only:
+            return 0
         process = None
         applied = False
         expected = {}
@@ -125,8 +137,14 @@ def transaction(source_root, lock_path, command, env=None):
             save()
             child_env = offline_git_env(env)
             child_env['AOSP_AGENT_TRANSACTION_ACTIVE'] = '1'
-            process = subprocess.Popen(command, cwd=worktree, env=child_env, start_new_session=True)
-            report['build_returncode'] = process.wait()
+            if _command_cwd is not None:
+                child_env['AOSP_AGENT_WORKTREE'] = str(_command_cwd)
+            if callable(command):
+                report['build_returncode'] = command()
+            else:
+                process = subprocess.Popen(command, cwd=_command_cwd or worktree,
+                                           env=child_env, start_new_session=True)
+                report['build_returncode'] = process.wait()
         except BuildInterrupted as exc:
             report.update(build_returncode=130, error=str(exc))
         finally:
@@ -163,6 +181,102 @@ def transaction(source_root, lock_path, command, env=None):
             return 119
         print('RESTORE_VERIFIED_OK', flush=True)
         return report['build_returncode'] or 0
+
+
+def bundle_transaction(source_root, lock_path, command, env):
+    """Validate every member before applying any; unwind nested exact restores.
+
+    All entries share the outer lock. The actual builder runs only at the leaf,
+    while every patched repository is still applied. A failure unwinds every
+    already-applied entry, including failures applying a later repository.
+    """
+    root = Path(source_root).resolve()
+    required = ('PATCH_BUNDLE', 'BUNDLE_SHA256', 'WORKTREE', 'RUN_DIR')
+    if not command or not all(env.get('AOSP_AGENT_' + k) for k in required):
+        raise ValueError('missing controller bundle contract or command')
+    for key in ('PATCH_BUNDLE', 'WORKTREE', 'RUN_DIR'):
+        if not Path(env['AOSP_AGENT_' + key]).is_absolute():
+            raise ValueError('bundle contract paths must be absolute')
+    manifest = Path(env['AOSP_AGENT_PATCH_BUNDLE']).resolve()
+    run_dir = Path(env['AOSP_AGENT_RUN_DIR']).resolve()
+    workspace = Path(env['AOSP_AGENT_WORKTREE']).resolve()
+    if (run_dir.is_relative_to(root) or workspace.is_relative_to(root)
+            or not manifest.is_relative_to(run_dir) or not workspace.is_dir()):
+        raise ValueError('bundle evidence and workspace must be outside source root')
+    data = manifest.read_bytes()
+    if hashlib.sha256(data).hexdigest() != env['AOSP_AGENT_BUNDLE_SHA256']:
+        raise ValueError('bundle hash mismatch')
+    bundle = json.loads(data)
+    if (bundle.get('version') != 1 or not isinstance(bundle.get('repositories'), list)
+            or not 1 <= len(bundle['repositories']) <= 256
+            or not isinstance(bundle.get('dependencies', []), list)):
+        raise ValueError('invalid patch bundle')
+    contracts, seen, dependency_heads = [], {}, {}
+    for writable, entry in ([(True, entry) for entry in bundle['repositories']]
+                            + [(False, entry) for entry in bundle.get('dependencies', [])]):
+        key = validate_relative_path(entry['key'])
+        path = Path(entry['target_repo'])
+        if not path.is_absolute() or not path.resolve().is_relative_to(root) or key in seen:
+            raise ValueError('invalid or duplicate bundle repository')
+        path = path.resolve()
+        if any(path.is_relative_to(p) or p.is_relative_to(path) for p in seen.values()):
+            raise ValueError('overlapping bundle repositories')
+        seen[key] = path
+        if writable:
+            patch_path = Path(entry['patch_file'])
+            candidate = Path(entry['worktree'])
+            if (not patch_path.is_absolute() or not patch_path.resolve().is_relative_to(run_dir)
+                    or not candidate.is_absolute() or not candidate.resolve().is_relative_to(workspace)):
+                raise ValueError('bundle patch/candidate is outside the task receipt/workspace')
+            contract = dict(env)
+            contract.update({
+                'AOSP_AGENT_PATCH_FILE': str(patch_path.resolve()),
+                'AOSP_AGENT_PATCH_SHA256': entry['sha256'],
+                'AOSP_AGENT_TARGET_REPO': str(path),
+                'AOSP_AGENT_TARGET_COMMIT': entry['target_commit'],
+                'AOSP_AGENT_WORKTREE': str(candidate.resolve()),
+                'AOSP_AGENT_RUN_DIR': str(patch_path.resolve().parent),
+                'AOSP_AGENT_WORKSPACE': str(workspace),
+                'AOSP_AGENT_ARTIFACT_DIR': str(run_dir / 'joint-artifacts'),
+            })
+            contracts.append(contract)
+        else:
+            dependency_heads[key] = entry['target_commit']
+    snapshot = run_dir / 'module-build-restore'
+    snapshot.mkdir(parents=True, exist_ok=True)
+    report = {'bundle_sha256': env['AOSP_AGENT_BUNDLE_SHA256'],
+              'validation_id': env.get('AOSP_AGENT_VALIDATION_ID'), 'restore': 'NOT_NEEDED',
+              'before': {}, 'after': {}, 'build_returncode': None}
+    def save():
+        temporary = snapshot / 'bundle.json.tmp'
+        temporary.write_text(json.dumps(report, indent=2) + '\n')
+        temporary.replace(snapshot / 'bundle.json')
+    lock_path = Path(lock_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        report['before'] = {key: state(path) for key, path in seen.items()}
+        save()
+        for key, head in dependency_heads.items():
+            if report['before'][key]['status'] or report['before'][key]['head'] != head:
+                raise ValueError('read-only dependency baseline is dirty or differs from pinned HEAD: ' + key)
+        for contract in contracts:
+            _single_transaction(root, lock_path, command, contract, _lock_held=True, _check_only=True)
+        def enter(number):
+            nested = (lambda: enter(number + 1)) if number + 1 < len(contracts) else command
+            return _single_transaction(root, lock_path, nested, contracts[number],
+                                       _lock_held=True, _command_cwd=workspace)
+        report['restore'] = 'PENDING'
+        save()
+        try:
+            report['build_returncode'] = enter(0)
+        except Exception as exc:
+            report.update(build_returncode=120, error=str(exc))
+        finally:
+            report['after'] = {key: state(path) for key, path in seen.items()}
+            report['restore'] = 'PASS' if report['after'] == report['before'] else 'FAIL'
+            save()
+        return report['build_returncode'] if report['restore'] == 'PASS' else 119
 
 
 def main():

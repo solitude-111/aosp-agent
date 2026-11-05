@@ -16,7 +16,8 @@ shift
 [ "${AOSP_AGENT_TRANSACTION_ACTIVE:-}" = 1 ] || { echo "build transaction required" >&2; exit 120; }
 [ "$#" -gt 0 ] || { echo "explicit build modules required" >&2; exit 120; }
 WORKTREE="$AOSP_AGENT_WORKTREE"
-mkdir -p "$WORKTREE/out-artifacts" || exit 120
+ARTIFACT_DIR="${AOSP_AGENT_ARTIFACT_DIR:-$WORKTREE/out-artifacts}"
+mkdir -p "$ARTIFACT_DIR" || exit 120
 export OUT_DIR="$OUT"
 export TMPDIR=/data/junjie/out-48550-tmp
 cd "$AOSP" || exit 120
@@ -37,7 +38,7 @@ for t in "$@"; do
     done
   fi
   if [ -n "$src" ]; then
-    cp -- "$src" "$WORKTREE/out-artifacts/" || exit 125
+    cp -- "$src" "$ARTIFACT_DIR/" || exit 125
     echo "artifact collected: $(basename "$src")"
   else
     echo "artifact not found for module: $t" >&2

@@ -369,10 +369,11 @@ class DiffWorkflowTest(unittest.TestCase):
             cov['id'] = agent.units[1]['id']
             cov['evidence'][0]['path'] = 'repo2/counter.py'
             coverage['coverage'].append(cov)
-            def edit(cwd):
-                for key in ('repo', 'repo2'):
-                    (cwd / key / 'counter.py').write_text(FIXED)
-            agent.factory = QueueRuntime([(raw, None), (coverage, edit)]).factory
+            first = {**coverage, 'coverage': coverage['coverage'][:1]}
+            second_coverage = {**coverage, 'coverage': coverage['coverage'][1:]}
+            agent.factory = QueueRuntime([(raw, None),
+                (first, lambda cwd: (cwd / 'repo/counter.py').write_text(FIXED)),
+                (second_coverage, lambda cwd: (cwd / 'repo2/counter.py').write_text(FIXED))]).factory
             result = agent.run(max_attempts=1)
             self.assertEqual(set(result['patches']), {'repo', 'repo2'})
             self.assertTrue(all(p['replay'] == 'pass' for p in result['patches'].values()))

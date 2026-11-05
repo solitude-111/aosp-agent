@@ -27,6 +27,7 @@ def main() -> int:
     diff.add_argument("--max-attempts", type=int, default=3)
     diff.add_argument("--verify", action="store_true")
     diff.add_argument("--validation", type=Path, help="optional independent checks JSON keyed by discovered repository key")
+    diff.add_argument("--joint-validation", type=Path, help="fixed checks for the assembled final candidate workspace")
     diff.add_argument("--no-auto-validation", action="store_true",
                       help="disable donor-derived smoke checks and Android.bp module discovery")
     diff.add_argument("--build-runner", type=Path,
@@ -46,6 +47,7 @@ def main() -> int:
     run.add_argument("--mapping-model", help="independent read-only mapping session model; defaults to --model")
     run.add_argument("--build-runner", type=Path)
     run.add_argument("--validation", type=Path, help="explicit staged overrides keyed by discovered repository; dataset validation is ignored")
+    run.add_argument("--joint-validation", type=Path, help="fixed checks for the assembled final candidate workspace")
     run.add_argument("--no-auto-validation", action="store_true")
     run.add_argument("--no-codex", "--inspect-only", dest="no_codex", action="store_true",
                      help="discover pinned source candidates without starting a model; reports DISCOVERED")
@@ -77,6 +79,7 @@ def main() -> int:
             agent = DiffBackportAgent(args.patch, args.target_root, args.run_root, model=args.model,
                 model_provider=args.model_provider, turn_timeout=args.turn_timeout,
                 validation=json.loads(args.validation.read_text()) if args.validation else None,
+                joint_validation=json.loads(args.joint_validation.read_text()) if args.joint_validation else None,
                 donor_repo=args.donor_repo, source_commit=args.source_commit,
                 source_parent=args.source_parent, auto_validation=not args.no_auto_validation,
                 build_runner=args.build_runner, mapping_model=args.mapping_model)
@@ -120,6 +123,7 @@ def main() -> int:
             model=args.model, mapping_model=args.mapping_model, model_provider=args.model_provider,
             turn_timeout=args.turn_timeout, auto_validation=not args.no_auto_validation,
             build_runner=args.build_runner,
+            joint_validation=json.loads(args.joint_validation.read_text()) if args.joint_validation else None,
             validation=json.loads(args.validation.read_text()) if args.validation else None)
         result = agent.run(inspect_only=args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
             mechanical=not args.no_mechanical, impact_only=args.impact_only)
@@ -133,7 +137,8 @@ def main() -> int:
     summary["record"] = str(args.run_root.resolve() / case.cve / "run.json")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return {"DISCOVERED": 0, "PREPARED": 0, "AFFECTED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
-            "PATCH_UNVERIFIED": 3, "INCONCLUSIVE": 4, "VALIDATION_FAILED": 5}.get(result["status"], 2)
+            "PATCH_UNVERIFIED": 3, "INCONCLUSIVE": 4, "VALIDATION_FAILED": 5,
+            "MIGRATION_INCOMPLETE": 6}.get(result["status"], 2)
 
 
 if __name__ == "__main__":

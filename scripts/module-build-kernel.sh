@@ -14,7 +14,8 @@ fi
 shift
 [ "${AOSP_AGENT_TRANSACTION_ACTIVE:-}" = 1 ] || { echo "build transaction required" >&2; exit 120; }
 WORKTREE="$AOSP_AGENT_WORKTREE"
-mkdir -p "$KOUT" "$WORKTREE/out-artifacts" || exit 120
+ARTIFACT_DIR="${AOSP_AGENT_ARTIFACT_DIR:-$WORKTREE/out-artifacts}"
+mkdir -p "$KOUT" "$ARTIFACT_DIR" || exit 120
 export PATH="$CLANG/bin:$PATH"
 build=(make -C "$KROOT" "O=$KOUT" ARCH=arm64 LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- -j32)
 if [ ! -f "$KOUT/.config" ]; then
@@ -24,5 +25,5 @@ fi
 rc=$?
 echo "MODULE_BUILD_EXIT=$rc"
 [ "$rc" -eq 0 ] || exit "$rc"
-cp -- "$KOUT/security/selinux/built-in.a" "$WORKTREE/out-artifacts/" || exit 125
+cp -- "$KOUT/security/selinux/built-in.a" "$ARTIFACT_DIR/" || exit 125
 exit 0

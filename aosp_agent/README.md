@@ -32,6 +32,7 @@ SDK 执行层为 `sdk_runtime.py`，使用 `AsyncCodex`、官方 streaming turn�
 4. 控制器检查引用的 Git blob、文件、行范围和连续摘录；`AFFECTED` 还必须索引覆盖 donor 故障、donor 修复、目标等价故障和目标危害的因果链证据。不一致时在同一线程请求只读纠正。
 5. 仅 AFFECTED 进入迁移。SDK 在独立工作树修改允许文件；每回合后审计路径、HEAD、符号链接和原始 checkout。
 6. 导出暂存、未暂存及新增测试文件，在新的干净 detached worktree 中独立重放补丁；执行控制器持有的分层验证命令并按失败反馈修订。
+7. 多仓候选完成后，在同一组最终补丁上复核本地检查并执行联合检查。普通仓库失败不阻止其他仓库继续；联合失败使用相关仓库剩余的 `--max-attempts` 预算修复，仍保留完整逐 hunk 门禁。
 
 迁移回合必须为输入的每个 donor hunk 提供恰好一条 `HUNK-RESULT` 声明。排除
 hunk 不能只写“outside scope”，必须携带受控证据类别。该账本由控制器根据
@@ -53,11 +54,22 @@ donor diff 统一生成，不依赖按 CVE 手工配置的必需 hunk 白名单�
 | PATCH_UNVERIFIED | 未配置完整检查、仅冒烟通过，或缺少多仓联合验证 | 3 |
 | VALIDATED | 当前候选通过所配置的检查，仅限其覆盖范围 | 0 |
 | VALIDATION_FAILED | 验证重试耗尽，保留候选和失败证据 | 5 |
+| MIGRATION_INCOMPLETE | 文本迁移的映射覆盖、逐 hunk 证据或新增文件接入未通过 | 6 |
 | FAILED | SDK、证据、路径或执行错误 | 2 |
 
-顶层产物包括 `run.json`、`mapping-plan.json`、`validation-plans/`、`patch-bundle.json`。各仓库的运行时 Case、因果判断、逐 hunk 账本、候选补丁和验证输出位于 `repositories/<key>/`；有 donor 的模式另输出全任务 `hunk-ledger.json`。
+顶层产物包括 `run.json`、`mapping-plan.json`、`validation-plans/`、`patch-bundle.json` 和全任务 `hunk-ledger.json`。各仓库的运行时 Case、因果判断（有 donor 时）、逐 hunk 账本、候选补丁和验证输出位于 `repositories/<key>/`。
 
 验证配置既可使用旧的 argv 列表，也可使用带 `stage` 和 `artifacts` 的 `checks` 对象。每个检查记录命令、退出码、日志、阶段和产物哈希；未配置的 JVM、模块构建、设备运行和 PoC 层明确保持 `NOT_CONFIGURED`/`NOT_RUN`。这些有限检查不能代替完整 Android 验证，`VALIDATED` 只表示当前配置覆盖范围内通过。
+
+## 多仓联合验收
+
+`run` 和 `diff` 均支持 `--joint-validation checks.json`。文件包含固定 argv 检查列表（格式同单仓 checks），命令工作目录为组合后的 `workspace/`；仓库路径仍以各自 key 为前缀。显式联合检查声明覆盖整组候选，因此应选择确实检查组合行为的回归脚本。`source_contract` 单独通过不能升级为 `VALIDATED`。不传 `--verify` 时不执行这些命令。
+
+多仓的 `android_module_build` 自动延后到联合阶段。相同显式 `--build-runner` 的字面量模块名取并集后执行；其他命令独立执行。`--joint-validation` 按 stage 覆盖自动联合检查，显式空列表禁用自动联合检查。缺少完整联合覆盖时，多仓结果最多为 `PATCH_UNVERIFIED`。
+
+联合构建传入 `AOSP_AGENT_PATCH_BUNDLE`、`AOSP_AGENT_BUNDLE_SHA256`、`AOSP_AGENT_WORKTREE`、`AOSP_AGENT_RUN_DIR` 和每次调用唯一的 `AOSP_AGENT_VALIDATION_ID`。runner 应调用 `aosp_agent.build_transaction`：在同一锁内预检每个补丁和只读依赖，再临时同时应用全部补丁、构建、逐仓恢复，输出本次 bundle 的恢复回执。返回 0 但缺少新鲜回执的构建不会通过。任一恢复状态异常会失败并保留意外改动。
+
+联合构建产物写入 `AOSP_AGENT_ARTIFACT_DIR`，即运行目录的 `joint-artifacts/`；配置中的产物路径也使用这个前缀。每次检查前归档旧产物，防止上一轮文件充当本轮输出。固定计划、最终补丁集合及联合检查记录分别保存在 `joint-validation-plan.json`、`joint-patch-bundle.json`、`joint-verification.json`。本地验收缓存绑定整组补丁哈希，依赖仓库变化后必须重新检查。
 
 ## 开发测试
 
