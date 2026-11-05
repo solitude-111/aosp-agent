@@ -8,14 +8,14 @@
 
 | 项目 | 当前实现 | 尚需完成的验收/工作 |
 | --- | --- | --- |
-| P0 新文件门禁 | 导出 diff 识别新增（含暂存）；donor 新增也需目标接入；拒绝注释/字符串/import/测试调用/新孤立函数；已有函数调用及 Manifest 注册适配；两模式重试 | 接入证据是结构检查，不等于全程序可达性；扩展动态注册/JNI/多跳 helper；真实漂移案重跑待执行 |
-| P1 donor 接地 | diff 三参数固定 donor repo/commit/parent，父子关系与完整输入 diff 核实，恢复只读历史工具；缺 donor 明确降级 | 多 donor 跨仓输入身份映射仍需适配 |
+| P0 新文件门禁 | 导出 diff 识别新增（含暂存）；donor 新增也需目标接入；拒绝注释/字符串/import/测试调用/新孤立函数；已有函数调用及 Manifest 注册适配；两模式重试 | 接入证据是结构检查，不等于全程序可达性；动态注册/JNI/多跳 helper 尚不支持，可能保守拒绝；真实漂移案重跑待执行 |
+| P1 donor 接地 | diff 三参数固定 donor repo/commit/parent，父子关系与完整输入 diff 核实，恢复只读历史工具；缺 donor 明确降级 | 支持原方案的单 donor 身份和多个目标仓库；多个 donor 提交合并为一个输入的接口尚未实现，属于额外扩展 |
 | P1 discovery | run/diff 共用版本目录归一化；保留候选、歧义和检索证据 | 全量映射计划统一见 P3 |
 | Git 离线基础 | 传输限制通过环境继承，覆盖旧 Git lazy fetch 及 per-protocol override | 缺失对象只能由独立人工准备流程补齐 |
 | P1 自动 validation | diff 在迁移前固定计划；仅从 donor 新增行抽新符号并记录原文/行号；Android.bp 字面量、glob、filegroup 推导；显式 stage 覆盖；run/diff 冒烟单独通过不升级 VALIDATED | 动态/条件源码、源码 defaults 和未覆盖路径明确 UNRESOLVED；构建需显式 runner；真实案例效果待执行 |
 | P1 构建接口与恢复 | run/diff 显式传补丁/哈希/仓库/基线契约；共用构建锁；全部成员预检后临时同时应用整组补丁；只恢复补丁文件；超时停止进程组再逐仓恢复；四项状态核实与独立失败退出码 | 临时仓库测试覆盖脏树拒绝、后续仓 apply 失败回滚、失败/超时恢复、遗留子进程、意外改动保留；真实 AOSP/kernel 编译未运行 |
 | P2 7 漂移案重跑 | 等待执行 | 必须按生产代码、合法测试/资源新增区分；13 个路径重合不等于13个语义成功 |
-| P3 统一出题 | CLI run/diff 共用 MappingPlanner/不可变 MappingPlan；dataset files/validation 不进出题；单独映射模型/会话；自动运行时 Case；固定计划和验证脚本；有 donor 接回原因果门禁、账本、策略阶梯，纯文本 diff 复用区域账本 | 多 donor 输入仍需统一；映射不等于语义证明；真实 6 案/隐藏 GT 待执行 |
+| P3 统一出题 | CLI run/diff 共用 MappingPlanner/不可变 MappingPlan；dataset files/validation 不进出题；单独映射模型/会话；自动运行时 Case；固定计划和验证脚本；有 donor 接回原因果门禁、账本、策略阶梯，纯文本 diff 复用区域账本 | 映射不等于语义证明；多个 donor 的单任务组合是额外扩展；真实 6 案/隐藏 GT 待执行 |
 | P4 跨仓重试 | 有 donor 和纯文本两种后端均按仓独立运行；普通失败后继续其他仓；跨仓误改拒绝；联合失败按固定检查声明的覆盖组使用各仓剩余预算修复；保留完整映射、逐 hunk 门禁与其他仓候选 | 联合故障按声明覆盖组处理，不从错误日志猜测单仓责任；真实跨仓案例效果待执行 |
 | P4 联合验收 | 多仓构建延后到整组候选形成后；合并同 runner 的模块；本地缓存绑定整组哈希；构建需匹配本轮 nonce 的应用/恢复回执；旧产物归档；联合成功后补做只读业务影响分析 | `--joint-validation` 的独立检查需实际覆盖组合行为；自动未覆盖仓库、仅冒烟或未执行验证仍不能升级 VALIDATED；多 donor 身份支持见 P1 |
 | P4 大重构账本 | run/diff 输出完整 hunk 阅读分组；按 donor 文件分批（默认每批8个），记录操作类别、词法线索及原文坐标/哈希；发现、donor 答题和纯文本答题均使用分组提示；影响判断保留完整 diff，不再按版本噪声删掉输入 | 分类仅辅助阅读，不能免除或合并任何 hunk 账本；64-hunk 合成回归，真实大重构案效果待执行 |
@@ -43,3 +43,23 @@
 大重构批次新增5项合成测试：64-hunk完整分批、原文证据可追溯、构建/测试/不支持记录不被丢弃、遗漏逐项账本拒绝，以及实际模型提示保留完整版本复制 diff。
 
 输入预检批次新增6项合成测试：有效输入、缺仓库/提交/父子关系区分、promisor 缺 blob 不触发下载、坏行及重复编号、目录/符号链接越界、空或畸形输入。用户暂缓数据准备后未对真实漏洞执行该清单。
+
+## 当前约定范围的收尾核对（2026-11-05）
+
+代码基线：`58f60f66cce605138ffb46d5c094490c52b2840b`。核对原方案 P0–P4 的代码要求以及用户后续“先优化、不重跑、暂不处理输入和编号”的指示。此处完成的是代码实现与合成回归，不表示原方案的真实实验已经完成。
+
+| 原方案要求 | 当前实现证据 | 已检查的回归证据 | 结论 |
+| --- | --- | --- | --- |
+| P0 新生产文件需已有目标代码接入；合法测试新增不误伤 | `engine.py:_new_file_integration_audit/export_patch`、`integration.py:activation`；拒绝时清除旧验收缓存并反馈具体文件 | `test_agent.py` 的 `test_missing_modified_donor_file_cannot_validate_as_dead_new_source`、`test_donor_source_addition_still_requires_target_integration`、`test_new_helper_is_allowed_when_existing_target_code_activates_it`、`test_new_untracked_test_is_in_exported_applicable_patch`；`test_diff_workflow.py` 的新文件拒绝/新增测试回归 | 已实现；不宣称完整调用图证明 |
+| P1.1 自动冒烟与构建目标；显式配置覆盖 | `validation_plan.py:make_plan/added_lines`、`build_discovery.py:discover_build`，目标树固定提交和新增行来源记录 | `test_validation_plan.py` 的新增行坐标、filegroup/glob、歧义拒绝、显式覆盖测试；冒烟单独通过不能 VALIDATED | 已实现；未解析的构建表达式明确未解决 |
+| P1.2 donor 历史与 blob 锚定；无身份显式降级 | `donor.py:verify_donor`、`diff_engine.py:_donor_tools_context`、`mapped_backend.py:run_backends`、`git_policy.py` | `test_donor.py` 的父子关系/完整 diff 一致性/历史工具/缺身份测试，离线 Git 测试 | 已实现单 donor 身份接口 |
+| P1.3 版本目录与关系映射 | `path_mapping.py:version_normalized_paths`、`discovery.py`、`mapping_plan.py:ground` | `test_diff_workflow.py` 的版本目录、改名、拆分、歧义和缺失证据测试；`test_mapping_pipeline.py` 的改名 donor 落入旧目标文件测试 | 已实现 |
+| P3 出题前端统一，历史答案不进入模型，判卷标准固定 | `mapped_run.py:from_case` 忽略历史 files/validation；`MappingPlan` 与运行时 Case；映射会话独立；计划/脚本哈希审计 | `test_dataset_answers_are_ignored_and_backend_ledger_is_retained`、`test_writer_cannot_modify_controller_plans`、`test_mapping_cannot_bypass_run_causal_assessment`、`test_plan_returns_copies_and_records_fixed_revisions` | 已实现；未使用 GT 生成验收 |
+| P4 按仓隔离重试 | `mapped_backend.py`、`text_backend.py`；独立预算和跨仓误改审计 | `test_repository_retries.py` 覆盖首仓失败仍继续、局部重试不重做成功仓、跨仓误改拒绝、联合修复预算和耗尽 | 已实现 |
+| P4 大重构分类辅助，逐 hunk 约束不变 | `hunk_groups.py`；完整 diff 不再按版本噪声过滤；分组进入映射及答题提示 | `test_hunk_groups.py` 的64个 hunk、原文哈希、特殊类型保留、遗漏声明拒绝和完整实际提示测试 | 已实现阅读辅助，非语义分类裁决 |
+| P4 四类旧账本边界 | `engine.py:_is_metadata_hunk/_falsify_exclusion_against_target/_implemented_hunk_evidence`、`hunk_scope.py` | `test_ledger_boundaries.py` 的文件名免检、旧宏、无 anchor 新增、运算符重排测试；`test_mapping_pipeline.py` 的区域隔离 | 已加固；同一映射区域内部的语义仍为近似检查 |
+| 额外构建与联合验收加固 | `build_transaction.py`、`joint_validation.py`、两个 module-build runner | 单仓/多仓临时 Git 测试覆盖同时应用、失败/超时恢复、脏树拒绝、意外修改保留；联合检查覆盖新鲜回执、缓存失效、旧产物、覆盖不足与禁用验证 | 已实现并通过合成回归；未执行真实构建 |
+| P2 七漂移案/20案成绩、P1 六案对照、17CVE/40补丁隐藏 GT | 尚无新运行结果，旧成绩不可当作本实现的成绩 | 用户明确暂不重跑，后续另选漏洞 | 暂缓，不计作已通过 |
+| P4 缺8行 donor、正式/临时编号批量重命名 | 离线预检工具已提供，未猜测编号或抓取对象 | 用户明确暂不考虑此数据准备工作 | 暂缓，待后续输入 |
+
+核对结果：当前约定范围的代码优化已完成。完整单元回归 283 项（282通过、1跳过）；构建脚本语法和 CLI 帮助检查通过；本地与服务器分支基线一致且工作区干净。后续按用户指定的漏洞做真实有效性测试；不从合成测试推导成功率、性能收益或真实安全结论。
