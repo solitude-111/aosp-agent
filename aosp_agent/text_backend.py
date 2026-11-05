@@ -28,12 +28,17 @@ def migrate_repository(controller, assessment, key, *, verify, max_attempts, fee
     local = repository_assessment(controller, assessment, key)
     required = {u['id'] for u in local['units']}
     child._current_hunks = [u for u in controller.units if u['id'] in required]
+    from .hunk_groups import review_groups, review_prompt
+    review = review_groups(child._current_hunks)
+    _write(child.run_dir / 'hunk-review-groups.json', review)
+    controller._protect(child.run_dir / 'hunk-review-groups.json')
     peers = controller._candidate_hashes(except_key=key)
     try:
         with controller._runtime('migration-' + quote(key, safe='')) as runtime:
             runtime.start(controller.workspace, SYSTEM)
             base = (migration_prompt(controller.diff, local, local['writable_paths'], controller.workspace)
                     + controller._donor_tools_context()
+                    + review_prompt(review)
                     + '\nThis session owns ONLY repository ' + key + '. Other candidate repositories are READ ONLY.'
                     + '\nCoverage is required for every unit in the repository assessment above, including all its local split regions.'
                     + '\nComplete fixed mapping (context only; it does not expand your write scope):\n'

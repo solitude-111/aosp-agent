@@ -295,6 +295,11 @@ class DiffBackportAgent:
             _write(self.run_dir / 'inventory.json', inventory)
             self.record['repositories'] = inventory
             self.record['source_provenance'] = self.donor
+            from .hunk_groups import review_groups, review_prompt
+            review = review_groups(self.units)
+            _write(self.run_dir / 'hunk-review-groups.json', review)
+            self._protect(self.run_dir / 'hunk-review-groups.json')
+            self.record['hunk_review_groups'] = 'hunk-review-groups.json'
             if self.donor['status'] == 'VERIFIED':
                 from .agent_tools import _write_wrappers
                 self.record.update({key: self.donor[key] for key in
@@ -317,7 +322,7 @@ class DiffBackportAgent:
                 return self.record
             with self._runtime('assessment') as runtime:
                 runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
-                prompt = assessment_prompt(self.diff, inventory, location) + self._donor_tools_context()
+                prompt = assessment_prompt(self.diff, inventory, location) + self._donor_tools_context() + review_prompt(review)
                 for attempt in range(1, max_attempts + 1):
                     raw = self._turn(runtime, prompt, ASSESSMENT_SCHEMA, read_only=True)
                     _write(self.run_dir / f'assessment-{attempt}.json', raw)

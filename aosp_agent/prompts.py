@@ -337,8 +337,8 @@ def impact_prompt(case: Case, source_diff: str = "", commit_message: str = "",
                      f"{symbol_report}\n")
     strategy_block = ""
     if vulnerability_class and vulnerability_class in SEARCH_STRATEGIES:
-        preprocess_note = ("\nNOTE: The donor diff is a version copy; the controller has "
-                           "extracted only the security-relevant hunks below.\n" if preprocessed else "\n")
+        preprocess_note = ("\nNOTE: Lexical heuristics suggest a version-copy diff. The complete diff is retained; "
+                           "all hunks, including metadata and build changes, require assessment.\n" if preprocessed else "\n")
         strategy_block = preprocess_note + SEARCH_STRATEGIES[vulnerability_class]
     dependencies = [item.get("path", "") for item in case.repositories
                     if item.get("role") == "read_only_dependency"]

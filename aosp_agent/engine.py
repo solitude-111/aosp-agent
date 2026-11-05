@@ -433,11 +433,14 @@ class AospBackportAgent:
             hunks = [h for h in hunks if h['id'] in self.selected_hunk_ids]
             source_diff = ''.join(h['patch'] for h in hunks)
         self._source_changed_paths = {h["path"] for h in hunks if h.get("path")}
+        from .hunk_groups import review_groups
+        review = review_groups(hunks)
+        self._json('hunk-review-groups.json', review)
         for hunk in hunks:
             hunk["application_check"] = (self._check_application(hunk["patch"])
                                           if hunk["supported"] else {"status": "UNSUPPORTED"})
         result = {"target_files": files, "source_diff": source_diff, "source_commit": self.case.source_commit,
-                  "target_commit": self.case.target_commit, "hunks": hunks,
+                  "target_commit": self.case.target_commit, "hunks": hunks, "review_groups": review,
                   "commit_message": self.commit_message,
                   "whole_patch_application": self._check_application(source_diff),
                   "limitation": "Textual applicability does not establish impact or API compatibility."}
@@ -1423,6 +1426,8 @@ class AospBackportAgent:
                    + tools_context
                    + "Controller runs configured validation. Do not commit, stage, reset, clean, fetch, pull, or run unbounded recursive searches; use the controlled tools instead. Do not read oracles or run PoCs.\n")
         source_diff = inspection["source_diff"]
+        from .hunk_groups import review_prompt
+        context += review_prompt(inspection['review_groups'])
         self._current_hunks = inspection["hunks"]
         symbol_report = inspection.get("symbol_report")
         symbol_report_text = (symbol_report.get("summary", "") +
@@ -1438,12 +1443,14 @@ class AospBackportAgent:
             from .diff_analysis import preprocess_donor_diff
             preprocessed = preprocess_donor_diff(source_diff, self.commit_message)
             if preprocessed["preprocessed"]:
-                source_diff = preprocessed["security_diff"]
+                # Classification is a retrieval hint only. Never remove build,
+                # metadata or unfamiliar changes from the causal assessment.
                 self.record["donor_diff_preprocessed"] = {
                     "type": preprocessed["type"],
                     "vulnerability_class": preprocessed["vulnerability_class"],
                     "extracted_hunks": preprocessed["extracted_hunks"],
-                    "filtered_hunks": preprocessed["filtered_hunks"],
+                    "suggested_focus_omissions": preprocessed["filtered_hunks"],
+                    "filtered_hunks": 0,
                     "original_diff_lines": preprocessed["original_diff_lines"]}
                 self._event("donor_diff_preprocessed", **self.record["donor_diff_preprocessed"])
             impact_request = impact_prompt(self.case, source_diff, self.commit_message,
