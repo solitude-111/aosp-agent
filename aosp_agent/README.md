@@ -75,6 +75,14 @@ donor diff 统一生成，不依赖按 CVE 手工配置的必需 hunk 白名单�
 
 ## 开发测试
 
+输入准备可先运行离线清单检查（不启动模型、不 fetch、不构建）：
+
+```sh
+.venv-sdk/bin/python -m aosp_agent.input_audit --dataset aosp_agent/dataset/cases-new16 --donor-root /path/to/donor-git --output /path/to/new-input-audit.json
+```
+
+输出逐行区分缺 donor 仓库、缺提交、父提交不匹配、diff 不可读和重复编号；某行无效不会吞掉其他输入。`READY` 仅代表本地 donor 输入可读取，临时编号仍需权威映射，未出现在输入表中的行也无法纳入统计。工具拒绝覆盖已有输出。补齐对象仍须独立准备，不能把此清单当作回移或 CVE 身份验证成绩。
+
 ```sh
 .venv-sdk/bin/python -m unittest discover -s aosp_agent/tests -v
 ```
