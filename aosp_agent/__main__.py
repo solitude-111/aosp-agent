@@ -26,6 +26,10 @@ def main() -> int:
     diff.add_argument("--max-attempts", type=int, default=3)
     diff.add_argument("--verify", action="store_true")
     diff.add_argument("--validation", type=Path, help="optional independent checks JSON keyed by discovered repository key")
+    diff.add_argument("--no-auto-validation", action="store_true",
+                      help="disable donor-derived smoke checks and Android.bp module discovery")
+    diff.add_argument("--build-runner", type=Path,
+                      help="trusted executable accepting inferred module names and the AOSP_AGENT_* build contract")
     diff.add_argument("--donor-repo", type=Path, help="local donor bare repository or checkout")
     diff.add_argument("--source-commit", help="donor fix object ID (requires donor-repo and source-parent)")
     diff.add_argument("--source-parent", help="direct parent object ID; verified against input patch")
@@ -69,7 +73,8 @@ def main() -> int:
                 model_provider=args.model_provider, turn_timeout=args.turn_timeout,
                 validation=json.loads(args.validation.read_text()) if args.validation else None,
                 donor_repo=args.donor_repo, source_commit=args.source_commit,
-                source_parent=args.source_parent)
+                source_parent=args.source_parent, auto_validation=not args.no_auto_validation,
+                build_runner=args.build_runner)
             result = agent.run(inspect_only=args.inspect_only, max_attempts=args.max_attempts, verify=args.verify)
         except Exception as exc:
             result = {"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}}

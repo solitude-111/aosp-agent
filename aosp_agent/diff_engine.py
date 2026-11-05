@@ -19,6 +19,7 @@ from .donor import verify_donor
 from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt, migration_prompt
 from .engine import AospBackportAgent, AssessmentError, CandidateRejected
 from .prompts import SYSTEM
+from .validation_plan import make_plan, normalize_checks
 
 
 def _write(path, value):
@@ -47,7 +48,8 @@ def _excerpt(lines, evidence):
 class DiffBackportAgent:
     def __init__(self, patch: Path, target_root: Path, run_root: Path, *, model=None,
                  model_provider=None, turn_timeout=900, runtime_factory=None, validation=None,
-                 donor_repo=None, source_commit=None, source_parent=None):
+                 donor_repo=None, source_commit=None, source_parent=None,
+                 auto_validation=True, build_runner=None):
         self.patch_bytes = patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -61,10 +63,19 @@ class DiffBackportAgent:
             raise ValueError('run directory must be outside original repositories')
         self.workspace = self.run_dir / 'workspace'
         self.model, self.provider, self.timeout = model, model_provider or os.environ.get('AOSP_AGENT_MODEL_PROVIDER'), turn_timeout
-        self.factory, self.validation = runtime_factory, validation or {}
+        self.factory, self.validation = runtime_factory, {} if validation is None else validation
+        if not isinstance(self.validation, dict):
+            raise ValueError('validation must be an object keyed by repository')
+        self.auto_validation = auto_validation
+        self.build_runner = Path(build_runner).resolve(strict=True) if build_runner else None
+        if self.build_runner and (not self.build_runner.is_file() or not os.access(self.build_runner, os.X_OK)
+                                  or any(self.build_runner.is_relative_to(r.root) for r in self.repos)):
+            raise ValueError('build runner must be executable and outside supplied target repositories')
         unknown = set(self.validation) - set(self.by_key)
         if unknown:
             raise ValueError(f'validation names unknown repositories: {sorted(unknown)}')
+        for spec in self.validation.values():
+            normalize_checks(spec)
         self.before = {r.key: r.state() for r in self.repos}
         self.children = {}
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZED',
@@ -229,10 +240,20 @@ class DiffBackportAgent:
         for key in sorted(selected):
             repo = self.by_key[key]
             files = tuple(self._owner(p)[1] for p in assessment['writable_paths'] if self._owner(p)[0].key == key)
-            spec = self.validation.get(key, [])
+            mappings = {}
+            for unit in assessment['units']:
+                if unit['status'] != 'AFFECTED':
+                    continue
+                edited = {t['path'] for t in unit['targets'] if t['action'] == 'edit'}
+                edited.update(a['path'] for a in assessment['new_files'] if a['anchor_path'] in edited)
+                mappings[unit['id']] = [self._owner(p)[1] for p in edited if self._owner(p)[0].key == key]
+            plan = make_plan(repo, self.units, mappings, files, self.diff,
+                             explicit=self.validation.get(key), auto=self.auto_validation,
+                             build_runner=self.build_runner)
+            _write(self.run_dir / 'validation-plans' / key / 'plan.json', plan)
             validation_case = Case.from_dict({'cve': 'CVE-2099-0000', 'project': 'validation contract',
                 'repository': 'repo', 'source_commit': '0', 'source_parent': '0', 'target_commit': repo.head,
-                'files': ['placeholder'], 'validation': spec})
+                'files': ['placeholder'], 'validation': plan['checks']})
             case = Case(cve=self.task_id, project='AOSP diff-only backport', repository=repo.root.name,
                         source_commit='', source_parent='', target_commit=repo.head, files=files,
                         validation=validation_case.validation, validation_checks=validation_case.validation_checks)
@@ -242,6 +263,8 @@ class DiffBackportAgent:
             child.worktree = self.workspace / key
             self.children[key] = child
             child.prepare()
+            child.record['validation_plan'] = str(self.run_dir / 'validation-plans' / key / 'plan.json')
+            child._write_record()
         self._audit()
 
     def _coverage(self, raw, assessment):
@@ -376,6 +399,11 @@ class DiffBackportAgent:
                         child._write_record()
                     self._audit()
                     self.record['patches'], self.record['verification'] = patches, verification
+                    for layer in ('source_contract', 'android_module_build', 'android_runtime'):
+                        outcomes = [v.get('stages', {}).get(layer) for v in verification.values()]
+                        self.record[layer] = ('FAIL' if 'FAIL' in outcomes else
+                            'PASS' if outcomes and all(o == 'PASS' for o in outcomes) else
+                            'PARTIAL' if 'PASS' in outcomes else 'NOT_CONFIGURED')
                     if not patches:
                         coverage_error = coverage_error or 'affected assessment produced no patch'
                     if coverage_error:
@@ -385,7 +413,9 @@ class DiffBackportAgent:
                     else:
                         self.record.pop('coverage_error', None)
                         self.record['patch_replay'] = 'pass'
-                        self.record['status'] = ('VALIDATED' if verification and all(v['status'] == 'PASS' for v in verification.values())
+                        self.record['status'] = ('VALIDATED' if verification and all(
+                            v['status'] == 'PASS' and v.get('sufficient_for_validated', False)
+                            for v in verification.values())
                                                  else 'PATCH_UNVERIFIED')
                         break
                     self._save()

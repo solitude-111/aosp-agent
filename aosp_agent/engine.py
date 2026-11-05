@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -17,6 +18,7 @@ from .ladder import ladder_plan, strategy_prompt
 from .patch_repair import repair_hunk
 from .patches import split_hunks
 from .path_mapping import version_normalized_paths as _version_normalized_paths
+from .validation_process import run_check
 from .prompts import (IMPACT_SCHEMA, POST_FIX_SCHEMA, SYSTEM, backport_prompt,
                       impact_prompt, parse_impact_response, post_fix_prompt)
 from . import symbols
@@ -1587,6 +1589,9 @@ class AospBackportAgent:
                 self.record["final_verification"] = verification
                 self.record["attempt_verifications"][str(attempt)] = verification
                 if verification["status"] == "PASS":
+                    if not verification['sufficient_for_validated']:
+                        self.record['status'] = 'PATCH_UNVERIFIED'
+                        return
                     self.record["status"] = "VALIDATED"
                     # 功能二：修复后业务影响评估（doc E 类）。补丁验证通过后，
                     # 用一个只读回合分析补丁对系统的业务影响。评估失败不回退
@@ -1859,9 +1864,19 @@ class AospBackportAgent:
                 continue
             start = time.monotonic()
             try:
-                completed = subprocess.run(list(argv), cwd=self.worktree, text=True, capture_output=True,
-                                           timeout=1800, env=_safe_env())
-                stdout, stderr, code = completed.stdout, completed.stderr, completed.returncode
+                verification_env = _safe_env()
+                # Explicit controller contract: neither a model nor cwd ancestry
+                # chooses which original checkout a build is allowed to mutate.
+                verification_env.update({
+                    'AOSP_AGENT_PATCH_FILE': str(self.run_dir / 'backport.patch'),
+                    'AOSP_AGENT_PATCH_SHA256': before or '',
+                    'AOSP_AGENT_TARGET_REPO': str(self.repo),
+                    'AOSP_AGENT_TARGET_COMMIT': self.record.get('target_commit', self.case.target_commit),
+                    'AOSP_AGENT_WORKTREE': str(self.worktree),
+                    'AOSP_AGENT_RUN_DIR': str(self.run_dir),
+                    'AOSP_AGENT_PYTHON': sys.executable,
+                })
+                stdout, stderr, code = run_check(list(argv), self.worktree, verification_env)
             except subprocess.TimeoutExpired as exc:
                 stdout, stderr, code = _decoded(exc.stdout), "validation timed out after 1800 seconds", 124
             except OSError as exc:
@@ -1895,6 +1910,9 @@ class AospBackportAgent:
                                                   if outcome == "PASS")}
         result = {"commands": results, "stages": stages, "status": status,
                   "scope": "configured_commands_only",
+                  "sufficient_for_validated": status == 'PASS' and any(
+                      stage != 'source_contract' for stage in stages),
+                  "runtime_security_proven": False,
                   "patch_sha256": self.record.get("patch_sha256"),
                   "skipped_stages": sorted(passed_stages & set(stages))}
         for layer in ("source_extracted_jvm", "android_module_build", "android_runtime"):

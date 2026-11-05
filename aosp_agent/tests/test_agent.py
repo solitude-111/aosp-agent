@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import sys
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from aosp_agent.case import Case
@@ -180,6 +181,16 @@ class AgentTest(unittest.TestCase):
             self.assertIn("contract verified", result["final_verification"]["commands"][0]["stdout"])
             self.assertEqual(len(runtime.calls), 3)
             self.assertEqual(result["post_fix_impact"]["overall_risk"], "low")
+
+    def test_source_contract_only_never_reports_validated(self):
+        with GitFixture() as fixture:
+            case = replace(fixture.case(), validation_checks=({'stage': 'source_contract',
+                'argv': ['grep', '-q', 'max', 'counter.py'], 'artifacts': []},))
+            runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
+            result = self.agent(fixture, runtime, case).run(verify=True)
+            self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
+            self.assertEqual(result['final_verification']['status'], 'PASS')
+            self.assertFalse(result['final_verification']['sufficient_for_validated'])
 
     def test_validation_failure_guides_revision_and_rechecks_it(self):
         with GitFixture() as fixture:

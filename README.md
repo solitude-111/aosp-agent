@@ -154,6 +154,25 @@ agent 会在 `--run-root` 下创建隔离 worktree。编译脚本会在受控流
 `show-commit`、`view-code` 工具。所有 Git 子进程通过空的 `GIT_ALLOW_PROTOCOL` 禁止传输，
 即使旧 Git 忽略 `GIT_NO_LAZY_FETCH` 或仓库设置单独的协议许可，也不能隐式下载对象。
 
+diff 在映射核实后、迁移前生成 `validation-plans/<仓库>/plan.json`：
+`source_contract` 仅从上游新增行抽取目标基线没有的符号，保存 hunk、行号、原文和目标路径；
+它只是词法冒烟检查，单独通过仍报告 `PATCH_UNVERIFIED`。
+Android.bp 解析只支持字面量源码列表、glob 和 filegroup 引用；动态表达式、条件源码、
+含源码的 defaults、重名模块及未覆盖文件保留为 `UNRESOLVED`。
+构建归属不等于产品可达性，不能替代运行时安全验证。
+
+提供 `--build-runner /absolute/path/to/module-build-r760.sh` 后，仅在全部写入路径
+都有明确构建归属时生成 `android_module_build` 检查。没有 runner 就不执行构建。
+`--validation` 的 JSON 按仓库 key 提供检查，同名 stage 整体覆盖自动检查，其他 stage 合并；
+仓库值为 `[]` 可关闭该仓库自动验收。`--no-auto-validation` 关闭全部自动生成，仍保留显式检查。
+未传 `--verify` 时不执行任何验收命令。
+
+run/diff 的验证器都会显式传入 `AOSP_AGENT_PATCH_FILE`、`PATCH_SHA256`、`TARGET_REPO`、
+`TARGET_COMMIT`、`WORKTREE`、`RUN_DIR`（后五项同样带 `AOSP_AGENT_` 前缀）。
+模块 runner 通过共用锁执行“核实干净基线 → 校验哈希和 HEAD → 应用 → 构建 → 精确恢复”。
+恢复只处理补丁涉及的文件；意外改动被保留并使验证失败。超时先停止构建进程组并留出恢复时间，
+恢复结果记录在仓库运行目录的 `module-build-restore/transaction.json`。
+
 分析补丁是否可继承到旧标签：
 
 ```sh

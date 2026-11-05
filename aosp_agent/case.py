@@ -60,9 +60,14 @@ class Case:
         commands: list[tuple[str, ...]] = []
         checks: list[dict[str, Any]] = []
         if isinstance(validation_raw, dict):
-            entries = validation_raw.get("checks", [])
-            if not isinstance(entries, list):
+            if "checks" in validation_raw:
+                entries = validation_raw["checks"]
+                if not isinstance(entries, list) or set(validation_raw) != {"checks"}:
+                    raise ValueError(f"case {cve} validation checks must be a list without sibling stages")
+            else:
                 # Also accept {stage: [argv, ...]} for concise multi-stage cases.
+                if any(not isinstance(commands, list) for commands in validation_raw.values()):
+                    raise ValueError(f"case {cve} validation stages must contain lists")
                 entries = [{"stage": stage, "argv": command}
                            for stage, commands_for_stage in validation_raw.items()
                            if stage != "checks"

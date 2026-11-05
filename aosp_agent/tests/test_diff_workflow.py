@@ -210,6 +210,10 @@ class DiffWorkflowTest(unittest.TestCase):
             agent.factory = runtime.factory
             result = agent.run(verify=True)
             self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
+            self.assertEqual(result['verification']['repo']['stages'], {'source_contract': 'PASS'})
+            self.assertFalse(result['verification']['repo']['sufficient_for_validated'])
+            plan = json.loads((agent.run_dir / 'validation-plans/repo/plan.json').read_text())
+            self.assertEqual(plan['provenance'][0]['terms'], ['max', 'min'])
             self.assertEqual(result['patch_replay'], 'pass')
             patch = Path(result['patches']['repo']['file']).read_text()
             self.assertIn('counter.py', patch)
@@ -223,7 +227,7 @@ class DiffWorkflowTest(unittest.TestCase):
                 (self.coverage(agent), lambda cwd: (cwd / 'repo/counter.py').write_text(FIXED))]).factory
             result = agent.run(verify=True)
             self.assertEqual(result['status'], 'VALIDATED')
-            self.assertIn('contract verified', result['verification']['repo']['commands'][0]['stdout'])
+            self.assertTrue(any('contract verified' in c['stdout'] for c in result['verification']['repo']['commands']))
 
     def test_unmodified_excerpts_do_not_establish_migration_coverage(self):
         with GitFixture() as fx:
