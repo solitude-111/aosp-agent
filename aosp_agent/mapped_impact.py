@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 
 from .discovery import Repository
-from .impact_proof import AssessmentError, CausalityChecks
+from .impact_proof import AssessmentError, CausalityChecks, PROOF_STEP_REQUIREMENTS
 from .mapping_plan import _excerpt
 from .prompts import parse_impact_response
 from .retrieval import LazyTree
@@ -36,8 +36,25 @@ This represents prerequisites, helper integration, tests and configuration,
 not permission to discard difficult changes. A group cannot consist only of
 support units. Every mapped target region and each available source side must
 be cited by the proof steps, causal chain or support links, not unused padding.
-The scope contract uses the same authorization_boundary, resource_bound,
-persistent_state_pollution or generic_data_flow obligations as the run backend.
+Choose scope_contract.vulnerability_pattern from the donor fault: authorization_boundary
+for missing authority checks, persistent_state_pollution for state reused by the wrong
+consumer, resource_bound for attacker-influenced values reaching an expensive sink,
+and generic_data_flow only when no specialized pattern fits. Category denial_of_service
+requires resource_bound; permission_bypass requires authorization_boundary.
+Use the exact required impact.proof_steps IDs below for the selected pattern:
+''' + ''.join(f'- {pattern}: {", ".join(ids)}\n' for pattern, ids in PROOF_STEP_REQUIREMENTS.items()) + '''
+These are distinct from scope_closure proof roles. Each resolved step requires 1-based
+indices into this group's impact.evidence. For AFFECTED, every pattern-required step
+except donor_fault must cite only executable target statements. Do not cite donor
+code, imports, or comments in those steps. Use donor evidence in causal_chain.
+Classify representation_change by the faulty value and operation, not by the name
+of a new helper introduced by the fix. If it is equivalent_representation, include
+representation_equivalence. For AFFECTED, that step must cite both executable target
+and executable donor evidence, including at least one donor citation overlapping the
+fix delta. Import-only donor citations can support a support_link, not equivalence.
+For NOT_AFFECTED or ALREADY_FIXED include a resolved clearing step anchored to target
+evidence (counterpart_absence or equivalent_protection, with equivalent_protection
+mandatory for ALREADY_FIXED). UNKNOWN needs an unresolved material proof step.
 Unresolved required behavior remains UNKNOWN. Do not claim AFFECTED from
 uncited framework assumptions. Negative conclusions still need independent
 exclusion review. Exact excerpts establish provenance, not formal semantics.
@@ -108,7 +125,7 @@ def _check(controller, assessment, required):
         raise ImpactProofError('causal proof group IDs must be unique')
     checks = MappedProofChecks(controller, units.values())
     receipts = []
-    for group in groups:
+    for group_index, group in enumerate(groups):
         members, primaries = set(group['unit_ids']), set(group['primary_unit_ids'])
         if (not primaries or not primaries <= members or len(primaries) != len(group['primary_unit_ids'])):
             raise ImpactProofError('each causal group needs unique primary units from its own members')
@@ -129,7 +146,10 @@ def _check(controller, assessment, required):
                 raise ImpactProofError('causal evidence belongs to another source unit/group')
             checks.ground(entry, units[entry['unit_id']], mapped[entry['unit_id']])
         checks._current_hunks = [units[u] for u in members]
-        checks._validate_impact_causality(proof)
+        try:
+            checks._validate_impact_causality(proof)
+        except AssessmentError as exc:
+            raise ImpactProofError(f'/proof_groups/{group_index}/impact: {exc}') from exc
         if proof['status'] != 'UNKNOWN' and not any(e['revision'] != 'target' for e in evidence):
             raise ImpactProofError('determinate causal group requires donor evidence')
 

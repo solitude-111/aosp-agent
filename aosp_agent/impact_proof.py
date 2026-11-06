@@ -180,22 +180,29 @@ class CausalityChecks:
             target_proof_ids = tuple(step_id for step_id in PROOF_STEP_REQUIREMENTS[pattern]
                                      if step_id != "donor_fault")
             for step_id in target_proof_ids:
-                entries = [assessment["evidence"][index - 1] for index in by_id[step_id]["evidence"]]
-                if not entries or any(entry["revision"] != "target" for entry in entries):
-                    raise AssessmentError(f"AFFECTED proof step {step_id} requires target-only evidence")
-                if not all(self._is_executable_evidence(entry) for entry in entries):
-                    raise AssessmentError(f"AFFECTED proof step {step_id} must cite executable target statements")
+                indices = by_id[step_id]["evidence"]
+                wrong_revision = [i for i in indices if assessment["evidence"][i - 1]["revision"] != "target"]
+                if not indices or wrong_revision:
+                    raise AssessmentError(f"AFFECTED proof step {step_id} requires target-only evidence "
+                                          f"(non-target indices: {wrong_revision})")
+                non_executable = [i for i in indices if not self._is_executable_evidence(assessment["evidence"][i - 1])]
+                if non_executable:
+                    raise AssessmentError(f"AFFECTED proof step {step_id} must cite executable target statements "
+                                          f"(non-executable indices: {non_executable})")
             if scope["representation_change"] == "equivalent_representation":
-                entries = [assessment["evidence"][index - 1] for index in by_id["representation_equivalence"]["evidence"]]
-                if not all(self._is_executable_evidence(entry) for entry in entries):
-                    raise AssessmentError(
-                        "representation_equivalence must cite executable donor and target statements")
-                if not any(self._evidence_overlaps_donor_delta(entry) for entry in entries):
-                    raise AssessmentError(
-                        "representation_equivalence donor evidence must overlap the donor fix delta")
+                indices = by_id["representation_equivalence"]["evidence"]
+                entries = [assessment["evidence"][i - 1] for i in indices]
+                non_executable = [i for i, entry in zip(indices, entries) if not self._is_executable_evidence(entry)]
                 revisions = {entry["revision"] for entry in entries}
+                issues = []
+                if non_executable:
+                    issues.append(f"must cite executable donor and target statements (non-executable indices: {non_executable})")
+                if not any(self._evidence_overlaps_donor_delta(entry) for entry in entries):
+                    issues.append("donor evidence must overlap the donor fix delta")
                 if not revisions & {"source_parent", "source_fix"} or "target" not in revisions:
-                    raise AssessmentError("representation_equivalence must compare donor and target evidence")
+                    issues.append("must compare donor and target evidence")
+                if issues:
+                    raise AssessmentError("representation_equivalence " + ", ".join(issues))
 
         causal = assessment.get("causal_chain")
         if status != "AFFECTED":
