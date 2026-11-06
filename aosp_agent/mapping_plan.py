@@ -27,6 +27,13 @@ def _excerpt(lines, evidence):
         raise AssessmentError(f'excerpt mismatches exact range: {evidence["path"]}:{start}-{end}')
 
 
+class MappingEvidenceError(AssessmentError):
+    """Independent locations can be corrected together without weakening checks."""
+    def __init__(self, errors):
+        self.errors = errors
+        super().__init__('assessment evidence errors: ' + json.dumps(errors, ensure_ascii=False))
+
+
 class MappingPlanner:
     def __init__(self, repositories, units):
         self.repos, self.units = repositories, units
@@ -41,49 +48,85 @@ class MappingPlanner:
         validate_relative_path(relative)
         return repo, relative
 
+    def _check_target(self, item, target, read):
+        lines = read(target["path"])
+        start, end = target['line_start'], target['line_end']
+        if start < 1 or end < start or end > len(lines):
+            raise AssessmentError(f'invalid target mapping range: {target["path"]}:{start}-{end}; pinned file has {len(lines)} lines')
+        if target['relationship'] not in ('dependency', 'test', 'data_or_configuration'):
+            name = target['symbol'].strip()
+            signature = re.fullmatch(r'([A-Za-z_$][\w$]*(?:(?:[.#]|::)[A-Za-z_$][\w$]*)*)(?:\([^()\n]*\))?', name)
+            symbol = re.split(r'[.#]|::', signature[1])[-1] if signature else ''
+            if (not re.fullmatch(r'[A-Za-z_$][\w$]*', symbol)
+                    or not re.search(r'\b' + re.escape(symbol) + r'\s*\(', '\n'.join(lines[start - 1:end]))):
+                raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
+        if not any(e['origin'] == 'target' and e['path'] == target['path']
+                   and start <= e['line_start'] <= e['line_end'] <= end for e in item['evidence']):
+            raise AssessmentError(f'target mapping lacks an excerpt within its range: {target["path"]}')
+
+    def _check_evidence(self, unit, item, evidence, read):
+        if evidence['origin'] == 'target':
+            _excerpt(read(evidence['path']), evidence)
+            if evidence['path'] not in {t['path'] for t in item['targets']}:
+                raise AssessmentError('target evidence must be included in the mapping')
+        else:
+            side = 'before' if evidence['origin'] == 'patch_before' else 'after'
+            source_path = unit['old_path'] if side == 'before' else unit['new_path']
+            if source_path != evidence['path']:
+                raise AssessmentError('source excerpt path is not this unit diff side')
+            start, end = evidence['line_start'], evidence['line_end']
+            if start < 1 or end < start or end - start > len(unit[side]):
+                raise AssessmentError('invalid diff evidence range')
+            try:
+                excerpt = '\n'.join(unit[side][n] for n in range(start, end + 1))
+            except KeyError as exc:
+                raise AssessmentError('source evidence refers to lines outside the supplied diff') from exc
+            if excerpt.strip() != evidence['excerpt'].strip():
+                raise AssessmentError('source evidence mismatches supplied diff')
+
+    def _check_all_evidence(self, raw, expected):
+        cache, errors = {}, []
+        def read(path):
+            if path not in cache:
+                repo, relative = self._owner(path)
+                cache[path] = repo.read(relative).splitlines()
+            return cache[path]
+        def check(pointer, callback):
+            try:
+                callback()
+            except AssessmentError as exc:
+                errors.append({'path': pointer, 'error': str(exc)})
+                if len(errors) >= 32:
+                    raise MappingEvidenceError(errors) from exc
+        for i, item in enumerate(raw['units']):
+            for j, target in enumerate(item['targets']):
+                check(f'/units/{i}/targets/{j}', lambda: self._check_target(item, target, read))
+            for j, evidence in enumerate(item['evidence']):
+                check(f'/units/{i}/evidence/{j}',
+                      lambda: self._check_evidence(expected[item['id']], item, evidence, read))
+        # Report repeated bad target quotations across sections together. Their
+        # scope, role, donor provenance and causal checks still run afterwards.
+        rows = [(f'/scope_closure/units/{i}', r) for i, r in
+                enumerate(raw.get('scope_closure', {}).get('units', []))]
+        rows += [(f'/proof_groups/{i}/impact', g['impact']) for i, g in
+                 enumerate(raw.get('proof_groups', []))]
+        for pointer, row in rows:
+            for j, evidence in enumerate(row['evidence']):
+                if evidence.get('origin', evidence.get('revision')) == 'target':
+                    check(f'{pointer}/evidence/{j}', lambda: _excerpt(read(evidence['path']), evidence))
+        if errors:
+            raise MappingEvidenceError(errors)
+
     def ground(self, raw):
         _shape(raw, ASSESSMENT_SCHEMA)
         expected = {u['id']: u for u in self.units}
         if len(raw['units']) != len(expected) or {u['id'] for u in raw['units']} != set(expected):
             raise AssessmentError('assessment must cover every diff unit exactly once')
+        self._check_all_evidence(raw, expected)
         for item in raw['units']:
             unit = expected[item['id']]
             if not unit['supported'] and item['status'] != 'UNKNOWN':
                 raise AssessmentError('unsupported change units require UNKNOWN')
-            for target in item['targets']:
-                repo, path = self._owner(target['path'])
-                lines = repo.read(path).splitlines()
-                start, end = target['line_start'], target['line_end']
-                if start < 1 or end < start or end > len(lines):
-                    raise AssessmentError(f'invalid target mapping range: {target["path"]}')
-                if target['relationship'] not in ('dependency', 'test', 'data_or_configuration'):
-                    symbol = re.split(r'[.#]|::', target['symbol'])[-1]
-                    if (not re.fullmatch(r'[A-Za-z_$][\w$]*', symbol)
-                            or not re.search(r'\b' + re.escape(symbol) + r'\s*\(', '\n'.join(lines[start - 1:end]))):
-                        raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
-                if not any(e['origin'] == 'target' and e['path'] == target['path']
-                           and start <= e['line_start'] <= e['line_end'] <= end for e in item['evidence']):
-                    raise AssessmentError(f'target mapping lacks an excerpt within its range: {target["path"]}')
-            for evidence in item['evidence']:
-                if evidence['origin'] == 'target':
-                    repo, path = self._owner(evidence['path'])
-                    _excerpt(repo.read(path).splitlines(), evidence)
-                    if evidence['path'] not in {t['path'] for t in item['targets']}:
-                        raise AssessmentError('target evidence must be included in the mapping')
-                else:
-                    side = 'before' if evidence['origin'] == 'patch_before' else 'after'
-                    source_path = unit['old_path'] if side == 'before' else unit['new_path']
-                    if source_path != evidence['path']:
-                        raise AssessmentError('source excerpt path is not this unit diff side')
-                    start, end = evidence['line_start'], evidence['line_end']
-                    if start < 1 or end < start or end - start > len(unit[side]):
-                        raise AssessmentError('invalid diff evidence range')
-                    try:
-                        excerpt = '\n'.join(unit[side][n] for n in range(start, end + 1))
-                    except KeyError as exc:
-                        raise AssessmentError('source evidence refers to lines outside the supplied diff') from exc
-                    if excerpt.strip() != evidence['excerpt'].strip():
-                        raise AssessmentError('source evidence mismatches supplied diff')
             if item['status'] != 'UNKNOWN':
                 origins = {e['origin'] for e in item['evidence']}
                 if 'target' not in origins or not origins & {'patch_before', 'patch_after'}:

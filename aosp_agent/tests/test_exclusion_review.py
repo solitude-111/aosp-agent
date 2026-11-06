@@ -69,7 +69,13 @@ class ExclusionReviewTest(unittest.TestCase):
         }], 'limitations': ['Synthetic source fixture only.']}
 
     def wire(self, agent, mapping_replies, review_replies):
-        mapping = workflow.QueueRuntime([(r, None) for r in mapping_replies])
+        from aosp_agent.assessment_repair import digest
+        replies = [mapping_replies[0]]
+        for previous, current in zip(mapping_replies, mapping_replies[1:]):
+            replies.append({'base_sha256': digest(previous), 'replacements': [
+                {'path': '/' + key, 'value_json': json.dumps(value)}
+                for key, value in current.items() if previous.get(key) != value]})
+        mapping = workflow.QueueRuntime([(r, None) for r in replies])
         reviewer = workflow.QueueRuntime([(r, None) for r in review_replies])
         options = []
         def factory(**kwargs):

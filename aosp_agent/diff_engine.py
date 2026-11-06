@@ -516,6 +516,7 @@ class DiffBackportAgent:
                     self._save()
                 return self.record
             with self._runtime('assessment') as runtime:
+                from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
                 from .exclusion_review import ExclusionReviewError, review_exclusions, unresolved_exclusions
                 from .mapped_impact import ImpactProofError, PROOF_CONTEXT, check_impact_proofs
                 require_causality = self.require_scope_closure or self.donor['status'] == 'VERIFIED_SEQUENCE'
@@ -523,10 +524,17 @@ class DiffBackportAgent:
                 prompt = (assessment_prompt(self.diff, inventory, location) + self._donor_tools_context()
                           + review_prompt(review) + self.assessment_context
                           + (PROOF_CONTEXT if require_causality else ''))
+                raw = None
                 for attempt in range(1, max_attempts + 1):
-                    raw = self._turn(runtime, prompt, ASSESSMENT_SCHEMA, read_only=True)
-                    _write(self.run_dir / f'assessment-{attempt}.json', raw)
+                    response = self._turn(runtime, prompt, ASSESSMENT_SCHEMA if attempt == 1 else REPAIR_SCHEMA,
+                                          read_only=True)
                     try:
+                        if attempt == 1:
+                            raw = response
+                        else:
+                            _write(self.run_dir / f'assessment-repair-{attempt}.json', response)
+                            raw = apply_repair(raw, response)
+                        _write(self.run_dir / f'assessment-{attempt}.json', raw)
                         assessment = self.ground(raw)
                         from .scope_evidence import check_scope
                         scope = check_scope(self, assessment, self.require_scope_closure)
@@ -542,6 +550,7 @@ class DiffBackportAgent:
                         break
                     except AssessmentError as exc:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))
+                        self._save()
                         if attempt == max_attempts:
                             if isinstance(exc, ImpactProofError):
                                 self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN',
@@ -554,9 +563,7 @@ class DiffBackportAgent:
                                 assessment = unresolved_exclusions(self, assessment, str(exc))
                                 break
                             raise
-                        prompt = (f'Correct the complete read-only assessment. Evidence rejection: {exc}. '
-                                  'Return all units in the same schema. Do not edit files.'
-                                  + (PROOF_CONTEXT if require_causality else ''))
+                        prompt = repair_prompt(raw, exc)
             _write(self.run_dir / 'assessment.json', assessment)
             self._protect(self.run_dir / 'assessment.json')
             self.record.update(model_execution='succeeded', impact_decision=assessment['status'])

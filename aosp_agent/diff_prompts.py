@@ -121,12 +121,19 @@ Return the JSON schema. For EACH change-unit id exactly once:
 2. List ALL required target functions/callers/dependencies as targets (one-to-many is allowed).
    Paths are workspace paths prefixed by the repository key, e.g. frameworks/base/services/X.java.
    Give exact target function/region ranges and symbol names, or a descriptive name for data/config.
+   For imports, includes, fields and other non-function regions use relationship=data_or_configuration,
+   with a descriptive symbol and the narrow actual region. Never classify imports as same_function or
+   expand to a whole class to satisfy a function check. For function mappings include the declaration
+   in the range; use its identifier (optionally qualified or with a parameter signature), not prose.
+   Every range uses the pinned target's line numbers, never donor line numbers or a guessed file end.
    action=edit means THIS region must change; read_dependency is inspected but remains read-only.
    For a split function list every old region needing the protection separately with action=edit.
    Explain ambiguity and why competing candidates do or do not represent the same functionality.
 3. Cite exact contiguous target excerpts AND patch_before/patch_after excerpts. Target path includes
    repository key; patch evidence path is the original old/new diff path, with ORIGINAL source line
    numbers shown in the location report. Never cite lines outside the diff as patch evidence.
+   Prefer short exact excerpts sufficient to establish each claim; do not copy whole functions when
+   a few lines suffice. Reuse evidence indices within proof sections instead of repeating entries.
 4. Missing/new helpers: locate the old callers and decide inline/adapt/create/irrelevant with evidence.
    NOT_AFFECTED with feature_absent needs at least two target excerpts including the relevant entry point.
    Feature-absence proposals receive a separate read-only challenge before acceptance. Prove why the
