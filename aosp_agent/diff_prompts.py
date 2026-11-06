@@ -122,6 +122,8 @@ complete old/new diff-side text match is only a candidate hint, not semantic ide
 scope. Investigate competing implementations, callers and dependencies before conclusions. Use
 aosp_source search/paths with a literal path to expand within a directory first; omit path only
 when project-wide investigation is necessary. Request other projects through grounded scope expansion.
+Reuse earlier pinned reads for each unit and proof section. Read a nearby contiguous window once
+when several needed regions are adjacent. Reopen a range only for new lines or a truncated result.
 Only retrieval counts/stages and bounded candidates are inlined; complete scopes and text-anchor
 coordinates remain in location.json. Truncated hints never imply missing implementations.
 Work READ ONLY. Use aosp_source view/search/paths/history with pinned revisions and repository

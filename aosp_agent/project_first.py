@@ -306,7 +306,11 @@ class ProjectFirstAgent:
                                'security_condition and dependency exactly once, each with reasoning and 1-based evidence indices. '
                                'Every step needs target evidence inside the mapped region; dependencies_checked must name '
                                'exactly the evidenced mapped projects. Cite both available donor diff sides and every mapped '
-                               'target region, including read dependencies. Open necessary questions block a final conclusion. '
+                               'target region, including read dependencies. Put a question in unresolved_questions only if '
+                               'its answer is necessary to determine the pinned target impact or the safe migration scope. '
+                               'Use an empty array when those questions are resolved. Put future design choices, out-of-scope '
+                               'behavior, migration notes and unperformed runtime tests in top-level limitations instead. '
+                               'For each material gap state which decision depends on it and what specific evidence is missing. '
                                'Do not treat a missing modern interface as an absent older operation. '
                                'Use the saved project catalogue for project names, not arbitrary filesystem scans.\n'
                                + json.dumps({'preanalysis': plan, 'catalog_file': str(self.run_dir / 'project-catalog.json'),
