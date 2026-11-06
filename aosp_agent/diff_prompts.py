@@ -50,6 +50,9 @@ ASSESSMENT_SCHEMA['properties']['proof_groups'] = array(PROOF_GROUP)
 # Preserve the materialized format for the checks and downstream consumers.
 ASSESSMENT_RESPONSE_SCHEMA = deepcopy(ASSESSMENT_SCHEMA)
 _response_fields = ASSESSMENT_RESPONSE_SCHEMA['properties']
+# A provider can duplicate the per-unit summary at the top level. Keep the raw
+# response for audit, but never let that extra summary enter the mapping plan.
+_response_fields['candidate_resolution'] = STRING
 _closure_row = _response_fields['scope_closure']['properties']['units']['items']['properties']
 _closure_row['evidence'] = array({'anyOf': [LINE, deepcopy(EVIDENCE)]})
 _proof_impact = _response_fields['proof_groups']['items']['properties']['impact']['properties']
@@ -141,7 +144,8 @@ Return the JSON schema. For EACH change-unit id exactly once:
    Every range uses the pinned target's line numbers, never donor line numbers or a guessed file end.
    action=edit means THIS region must change; read_dependency is inspected but remains read-only.
    For a split function list every old region needing the protection separately with action=edit.
-   Explain ambiguity and why competing candidates do or do not represent the same functionality.
+   Explain ambiguity and why competing candidates do or do not represent the same functionality
+   in that unit's candidate_resolution field. Each unit needs its own field.
 3. Cite exact contiguous target excerpts AND patch_before/patch_after excerpts. Target path includes
    repository key; patch evidence path is the original old/new diff path, with ORIGINAL source line
    numbers shown in the location report. Never cite lines outside the diff as patch evidence.

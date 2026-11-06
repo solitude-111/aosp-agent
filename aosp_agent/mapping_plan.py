@@ -38,6 +38,7 @@ class MappingEvidenceError(AssessmentError):
 
 def _expand_evidence_references(raw):
     assessment = deepcopy(raw)
+    assessment.pop('candidate_resolution', None)
     unit_evidence = {row['id']: row['evidence'] for row in assessment['units']}
     errors = []
 
