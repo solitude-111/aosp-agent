@@ -20,6 +20,7 @@ under <run_dir>/bin/. Hard constraints enforced inside every command:
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import re
@@ -75,7 +76,7 @@ class ToolError(Exception):
 def _optional_log(path, text):
     """Legacy readonly wrappers report markers when sandbox forbids logs.
 
-    Only a permission denial permits this fallback. Exhaustion, corruption and
+    Only a permission denial or read-only mount permits this fallback. Exhaustion, corruption and
     other storage failures must still stop work; the controller captures the
     stdout marker under its own output budget.
     """
@@ -84,7 +85,8 @@ def _optional_log(path, text):
         write_text(path, text, append=True)
     except (OSError, OutputBudgetUnavailable) as exc:
         cause = exc.__cause__ if isinstance(exc, OutputBudgetUnavailable) else exc
-        if not isinstance(cause, PermissionError):
+        if not (isinstance(cause, PermissionError)
+                or isinstance(cause, OSError) and cause.errno == errno.EROFS):
             raise
 
 

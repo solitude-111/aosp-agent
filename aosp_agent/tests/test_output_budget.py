@@ -1,6 +1,7 @@
 """Managed-output exhaustion must stop work without preventing restoration."""
 from contextlib import ExitStack
 from dataclasses import replace
+import errno
 import fcntl
 import json
 import os
@@ -178,10 +179,12 @@ class OutputBudgetTest(unittest.TestCase):
         from aosp_agent.agent_tools import _optional_log
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve(); create_budget(root, 131072)
-            with patch('aosp_agent.output_budget.os.open', side_effect=PermissionError('readonly sandbox')):
-                _optional_log(root / 'usage', 'ordinary marker')
-            with patch('aosp_agent.output_budget.os.open', side_effect=OSError('disk full')):
-                with self.assertRaises(OutputBudgetUnavailable): _optional_log(root / 'usage', 'marker')
+            for error in (PermissionError('readonly sandbox'), OSError(errno.EROFS, 'read-only mount')):
+                with self.subTest(error=error), patch('aosp_agent.output_budget.os.open', side_effect=error):
+                    _optional_log(root / 'usage', 'ordinary marker')
+            for code in (errno.ENOSPC, errno.EIO, errno.ENOENT):
+                with self.subTest(errno=code), patch('aosp_agent.output_budget.os.open', side_effect=OSError(code, 'storage failure')):
+                    with self.assertRaises(OutputBudgetUnavailable): _optional_log(root / 'usage', 'marker')
             with self.assertRaises(OutputBudgetExceeded): _optional_log(root / 'usage', 'x' * 131072)
             self.assertFalse((root / 'usage').exists())
 
