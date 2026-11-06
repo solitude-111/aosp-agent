@@ -73,6 +73,8 @@ The base is your last assessment with all successfully applied corrections, not 
 Return only base_sha256 and replacements. Each replacement has a JSON pointer path (zero-based array
 indices, e.g. /units/0/targets/1/line_end) and value_json containing the JSON-encoded new value.
 Replace only incorrect fields or entries. Do not re-emit unchanged units, quotations or proof groups.
+To add array entries, replace that array with its existing entries and the additions. A pointer to
+an index outside the existing array cannot be replaced. Preserve indices referenced by other fields.
 Optional top-level sections may be added. Do not overlap replacement paths. If an attempted correction
 was rejected structurally or had a stale hash, NONE of that attempt's replacements were applied.
 Address all reported locations, including duplicate quotations in other sections. Read the pinned source

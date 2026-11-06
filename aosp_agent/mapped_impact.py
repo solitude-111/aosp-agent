@@ -62,14 +62,19 @@ fix delta. Import-only donor citations can support a support_link, not equivalen
 For NOT_AFFECTED or ALREADY_FIXED include a resolved clearing step anchored to target
 evidence (counterpart_absence or equivalent_protection, with equivalent_protection
 mandatory for ALREADY_FIXED). UNKNOWN needs an unresolved material proof step.
-Unresolved required behavior remains UNKNOWN. Do not claim AFFECTED from
-uncited framework assumptions. Negative conclusions still need independent
-exclusion review. Exact excerpts establish provenance, not formal semantics.
-Platform behavior needs implementation_evidence indices citing actual definitions
-at the pinned target, separate from relied_at_evidence call sites. These may be
-read_dependency mappings in admitted projects, included in scope_closure and
-dependencies_checked but never edit targets merely to cite behavior. API names and
-model prose alone cannot establish behavior; missing decisive evidence is UNKNOWN.
+For AFFECTED, causal_chain.external_behavior_assumptions must be an empty array.
+Put source-backed facts in the reasoning and the causal chain, with evidence indices
+that establish them. Keep nonblocking limitations separate. If a material fact
+remains unverified, request its project with evidence or report UNKNOWN. Negative
+conclusions still need independent exclusion review. Exact excerpts establish
+provenance, not formal semantics.
+Use ordinary mapped evidence for AOSP framework and app code, including android.*
+and com.android.* implementations. Cite the actual definition and relying call site.
+Reserve causal_chain.platform_semantics for recognized standard-library APIs such
+as java.* and libc. These entries need implementation_evidence indices for the
+pinned definition and relied_at_evidence indices from the causal target fault/harm
+call sites. Use read_dependency mappings when reading definitions, and include them
+in scope_closure. Missing decisive behavior remains UNKNOWN.
 '''
 
 

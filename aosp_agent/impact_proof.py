@@ -254,10 +254,12 @@ class CausalityChecks:
         assumptions = causal.get("external_behavior_assumptions", [])
         if assumptions:
             raise AssessmentError(
-                "AFFECTED cannot rest on uncited repository/framework behavior: cite the "
-                "decisive behavior in evidence (platform_semantics also requires the "
-                "actual target implementation, not just the relying call site); answer UNKNOWN only when a material step "
-                "is genuinely unresolved by available evidence")
+                "AFFECTED cannot rest on uncited repository/framework behavior: "
+                "causal_chain.external_behavior_assumptions must be empty. Put already "
+                "grounded facts in the causal explanation and reference their source evidence. "
+                "For any material unverified behavior, cite its implementation or keep the impact UNKNOWN. "
+                "Use ordinary evidence for android.* and com.android.* behavior; reserve "
+                "platform_semantics for recognized standard-library APIs with target implementations.")
         repository = getattr(getattr(self, "case", None), "repository", "") or ""
         repository_roots = getattr(self, '_causality_repository_roots', {repository.split("/", 1)[0]} - {""})
         causal_anchor_indices = (set(causal.get("target_fault_evidence") or [])
