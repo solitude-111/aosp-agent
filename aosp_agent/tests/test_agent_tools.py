@@ -198,8 +198,9 @@ class ThreeCommitRun:
     the hunk-history range empty; history tools need three distinct commits.
     """
 
-    def __init__(self, shallow: bool = False):
+    def __init__(self, shallow: bool = False, bulk_history=False):
         self.shallow = shallow
+        self.bulk_history = bulk_history
 
     def __enter__(self):
         import tempfile
@@ -215,6 +216,9 @@ class ThreeCommitRun:
         git(repo, "commit", "-q", "-m", "target baseline")
         self.target = git(repo, "rev-parse", "HEAD")
         (repo / "widget.py").write_text("alpha\nctx\nbeta\nomega\n")
+        if self.bulk_history:
+            (repo / 'unrelated.txt').write_text('unrelated history\n' * 300000)
+            git(repo, 'add', 'unrelated.txt')
         git(repo, "add", "widget.py")
         git(repo, "commit", "-q", "-m", "donor parent")
         self.parent = git(repo, "rev-parse", "HEAD")

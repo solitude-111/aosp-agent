@@ -418,6 +418,12 @@ def _hunk_history_data(ctx: RunContext, hunk_id: str) -> tuple[dict, str, list[s
     if log is None or log.returncode != 0 or not log.stdout.strip():
         raise ToolError(DEEPEN_HINT, code=0)
     shas = re.findall(r"(?m)^([0-9a-f]{40})$", log.stdout)
+    if shas:
+        _metadata, _parents, boundary = _history_commit_metadata(ctx, shas[-1])
+        if boundary:
+            raise ToolError('HISTORY_INCOMPLETE: line history reaches a shallow/grafted boundary. '
+                            'Its apparent additions do not establish code introduction or target absence. '
+                            'Use pinned source views; additional history requires operator action.', code=0)
     add_percent = _add_percent_of_last_block(log.stdout)
     return hunk, log.stdout, shas, add_percent
 
@@ -439,41 +445,80 @@ def cmd_hunk_history(ctx: RunContext, args) -> int:
                    extra={"hunk_path": hunk["path"], "history_shas": shas[:20]})
 
 
+def _history_commit_metadata(ctx, sha):
+    """Read actual parents, independently of Git's shallow traversal view."""
+    raw = _git(["--git-dir", ctx.donor_git], "cat-file", "commit", sha, check=False)
+    if raw.returncode:
+        raise ToolError(f"cannot read commit metadata for {sha}: {raw.stderr[-200:]}")
+    header, _, message = raw.stdout.partition("\n\n")
+    parents = [line.split()[1] for line in header.splitlines() if line.startswith('parent ')]
+    traversal = _git(["--git-dir", ctx.donor_git], 'rev-list', '--parents', '-n', '1', sha, check=False)
+    if traversal.returncode:
+        raise ToolError('cannot establish commit history boundary')
+    boundary = traversal.stdout.split()[1:] != parents
+    subject = message.splitlines()[0] if message.splitlines() else ''
+    text = f"commit {sha}\nParents: {', '.join(parents) or '(root)'}\nSubject: {subject[:STAT_LIMIT]}\n"
+    return text, parents, boundary
+
+
 def cmd_show_commit(ctx: RunContext, args) -> int:
     sha = ctx.check_sha(args.sha)
     if not ctx.donor_git:
         raise ToolError("this run has no donor store for history")
-    stat = _git(["--git-dir", ctx.donor_git], "show", "--stat", sha, check=False)
-    full = _git(["--git-dir", ctx.donor_git], "show", sha, check=False)
-    if full.returncode != 0:
-        raise ToolError(f"cannot show {sha} in the donor store: {full.stderr[-200:]}")
-    ret = stat.stdout[:STAT_LIMIT]
-    add_percent = None
+    hunk = None
     if args.hunk_id:
-        hunk, _log, _shas, add_percent = _hunk_history_data(ctx, args.hunk_id)
-        context_lines = extract_context(
-            [line for line in hunk["patch"].splitlines()
-             if line.startswith((" ", "-")) and not line.startswith("---")])[0]
-        best = _locate_block_in_commit(full.stdout, context_lines)
-        ret += "\n"
-        if add_percent is not None and add_percent < 0.6:
-            ret += ("[IMPORTANT] The relevant code shown by hunk-history is not fully '+' lines.\n"
-                    "[IMPORTANT] This means the code in question was not added or migrated in "
-                    "this commit; the patch context should remain in a similar location.\n"
-                    "Check the commit abstract carefully; ignore this hint if it is wrong.\n")
-        elif best:
-            file_path, line_no, snippet = best
-            ret += (f"This commit's changes may contain the counterpart of the hunk code: file "
-                    f"{file_path} around line {line_no} to {line_no + len(context_lines)}. "
-                    f"The code is:\n{snippet}\n"
-                    "Use view-code and locate-symbol to verify this location step by step.\n")
-        else:
-            ret += ("This commit shows a high probability that this code is new, so the "
-                    "corresponding code segment cannot be found in the older version.\n"
-                    "Verify with view-code and locate-symbol; newly introduced code suggests "
-                    "the hunk may be declared need_not_ported (with evidence).\n")
-    output = ret + "\nTruncated to the commit stat; use view-code for full file context.\n"
-    return _finish(ctx, "show-commit", args, _truncate_head(output))
+        hunk = ctx.hunks.get(args.hunk_id)
+        if not hunk or hunk.get('path') not in ctx.hunk_paths() | set(ctx.inspection.get('case_files', [])):
+            raise ToolError(f"unknown or out-of-scope hunk id: {args.hunk_id}")
+        validate_relative_path(hunk['path'])
+    text, parents, boundary = _history_commit_metadata(ctx, sha)
+    extra = {'commit_parents': parents, 'history_boundary': boundary, 'absence_proven': False}
+    if boundary:
+        # A shallow commit can look like a repository-wide addition even when
+        # its parent objects exist locally. Never use that synthetic diff as
+        # evidence of when code was introduced, and never fetch automatically.
+        extra['read_status'] = 'HISTORY_INCOMPLETE'
+        return _finish(ctx, 'show-commit', args, _truncate_head(text +
+            'HISTORY_INCOMPLETE: Git traversal stops at this shallow/grafted boundary. '
+            'No introduction or absence conclusion is justified. Use view-code at the pinned '
+            'commit for file contents; missing history requires operator action.\n'), extra=extra)
+    if hunk is None:
+        extra['read_status'] = 'METADATA_ONLY'
+        return _finish(ctx, 'show-commit', args, _truncate_head(text +
+            'METADATA_ONLY: provide hunk_id for a path-scoped diff; no repository-wide diff was read.\n'), extra=extra)
+    path = hunk['path']; extra['path_scope'] = path
+    if len(parents) > 1:
+        extra['read_status'] = 'MERGE_REQUIRES_PARENT'
+        return _finish(ctx, 'show-commit', args, _truncate_head(text +
+            'MERGE_REQUIRES_PARENT: this is a merge, not a single-parent change. '
+            'No combined diff or introduction inference is supplied. Inspect the pinned file and history.\n'), extra=extra)
+    # Bound the input before asking Git to construct a patch, including large
+    # single-file changes. The broker's existing process/task limits still apply.
+    total = 0
+    for revision in [sha, *parents]:
+        entry = _git(['--git-dir', ctx.donor_git], 'ls-tree', '-l', revision,
+                     '--', ':(literal)' + path, check=False)
+        if entry.returncode:
+            raise ToolError('cannot inspect scoped historical blob size')
+        for row in entry.stdout.splitlines():
+            fields = row.split('\t', 1)[0].split()
+            if len(fields) != 4 or fields[1] != 'blob' or not fields[3].isdigit():
+                raise ToolError('historical hunk path is not an ordinary blob')
+            total += int(fields[3])
+    if total > 512 * 1024:
+        extra['read_status'] = 'SCOPED_DIFF_DEFERRED'
+        return _finish(ctx, 'show-commit', args, _truncate_head(text +
+            f'SCOPED_DIFF_DEFERRED: {path} exceeds the bounded diff input size. '
+            'Use targeted source views; this is not evidence of absence.\n'), extra=extra)
+    diff = _git(['--git-dir', ctx.donor_git], 'show', '--format=', '--root', '--no-renames',
+                '--no-ext-diff', '--no-textconv', '--unified=3', sha, '--', ':(literal)' + path, check=False)
+    if diff.returncode:
+        raise ToolError(f'cannot read scoped commit diff: {diff.stderr[-200:]}')
+    output = (text + f'Path scope: {path}; other paths were not searched. '
+              'A missing match does not prove the operation was absent or newly introduced.\n' + diff.stdout +
+              '\nUse view-code for source context. Large replies may be truncated below.\n')
+    extra.update(read_status='SCOPED_DIFF', diff_complete=len(output.encode('utf-8')) <= MAX_OUTPUT_BYTES)
+    return _finish(ctx, 'show-commit', args, _truncate_head(output), extra=extra)
 
 
 def _locate_block_in_commit(show_text: str, context_lines: list[str]):
