@@ -53,7 +53,8 @@ def check_scope(controller, assessment, required=False):
     if len(rows) != len(expected) or {r['unit_id'] for r in rows} != expected:
         raise AssessmentError('scope closure must cover every source unit exactly once')
     open_questions = []
-    for row in rows:
+    definitions_by_path = {}
+    for row_index, row in enumerate(rows):
         open_questions.extend({'unit_id': row['unit_id'], 'question': q} for q in row['unresolved_questions'])
         for evidence in row['evidence']:
             ground_evidence(controller, row['unit_id'], evidence)
@@ -76,27 +77,39 @@ def check_scope(controller, assessment, required=False):
             roles = {'entrypoint', 'state_flow', 'security_condition', 'dependency'}
             if len(steps) != len(roles) or {s['role'] for s in steps} != roles:
                 raise AssessmentError('scope closure requires entrypoint, state flow, security condition and dependency obligations')
-            for step in steps:
+            for step_index, step in enumerate(steps):
                 indices = step['evidence']
                 if not indices or any(not 1 <= i <= len(row['evidence']) for i in indices):
                     raise AssessmentError('scope proof obligation lacks valid evidence indices')
-                anchors = [row['evidence'][i - 1] for i in indices if row['evidence'][i - 1]['origin'] == 'target']
+                target_indices = [i for i in indices if row['evidence'][i - 1]['origin'] == 'target']
+                anchors = [row['evidence'][i - 1] for i in target_indices]
                 if not anchors:
                     raise AssessmentError('each scope proof obligation needs mapped target evidence')
                 if step['role'] == 'dependency':
                     if {controller._owner(e['path'])[0].key for e in anchors} != projects:
                         raise AssessmentError('dependency obligation must cite every mapped project')
                     continue
-                for e in anchors:
+                for evidence_index, e in zip(target_indices, anchors):
                     regions = _mapped_anchor(e, targets)
                     # Data/configuration and test changes still need exact mapped
                     # evidence; code claims must anchor inside a real function.
                     if all(t['relationship'] in ('data_or_configuration', 'test') for t in regions):
                         continue
                     repo, path = controller._owner(e['path'])
-                    definitions = functions(repo.read(path), Path(path).suffix)
+                    if e['path'] not in definitions_by_path:
+                        definitions_by_path[e['path']] = functions(repo.read(path), Path(path).suffix)
+                    definitions = definitions_by_path[e['path']]
                     if not any(d['line_start'] <= e['line_start'] <= e['line_end'] <= d['line_end'] for d in definitions):
-                        raise AssessmentError('code scope obligations require function-region evidence')
+                        overlaps = [d for d in definitions if d['line_start'] <= e['line_end']
+                                    and e['line_start'] <= d['line_end']]
+                        ranges = ', '.join(f"{d['symbol']}:{d['line_start']}-{d['line_end']}"
+                                           for d in overlaps[:8]) or 'none'
+                        raise AssessmentError(
+                            'code scope obligations require function-region evidence: '
+                            f'/scope_closure/units/{row_index}/proof_steps/{step_index}/evidence '
+                            f"({row['unit_id']} {step['role']}) cites closure evidence #{evidence_index} "
+                            f"at {e['path']}:{e['line_start']}-{e['line_end']}; "
+                            f'overlapping functions: {ranges}. Cite a separate exact excerpt within each needed function.')
     return {'status': 'OPEN_QUESTIONS' if open_questions else 'GROUNDED_MODEL_SCOPE',
             'unresolved_questions': open_questions,
             'limitation': 'Grounded scope claims are model-assessed; not a whole-program or product reachability proof.'}
