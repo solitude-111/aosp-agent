@@ -76,8 +76,10 @@ Replace only incorrect fields or entries. Do not re-emit unchanged units, quotat
 Optional top-level sections may be added. Do not overlap replacement paths. If an attempted correction
 was rejected structurally or had a stale hash, NONE of that attempt's replacements were applied.
 Address all reported locations, including duplicate quotations in other sections. Read the pinned source
-only where needed. Imports/includes/fields use data_or_configuration; function ranges must contain the
-declaration and stay within the file. Do not widen a mapping merely to silence a validator.
+only where needed. For an absent or invalid path, find the actual pinned path and update all affected
+references and their ranges and excerpts. Imports/includes/fields use data_or_configuration.
+Function ranges must contain the declaration and stay within the file. Do not widen a mapping merely
+to silence a validator.
 The merged document must still cover every unit and pass ALL original evidence, scope and causal checks.
 Unresolved facts must remain UNKNOWN. Do not edit source files or claim successful validation.
 '''

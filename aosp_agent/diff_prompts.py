@@ -120,6 +120,8 @@ Return the JSON schema. For EACH change-unit id exactly once:
 1. State the safety invariant and compare the actual old-version code with the diff.
 2. List ALL required target functions/callers/dependencies as targets (one-to-many is allowed).
    Paths are workspace paths prefixed by the repository key, e.g. frameworks/base/services/X.java.
+   Copy the actual path from the pinned source tool and reuse it in every evidence section.
+   Derive neither the file path from a package name nor a new prefix from memory.
    Give exact target function/region ranges and symbol names, or a descriptive name for data/config.
    For imports, includes, fields and other non-function regions use relationship=data_or_configuration,
    with a descriptive symbol and the narrow actual region. Never classify imports as same_function or

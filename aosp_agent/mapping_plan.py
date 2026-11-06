@@ -8,6 +8,7 @@ import re
 
 from .case import validate_relative_path
 from .diff_prompts import ASSESSMENT_SCHEMA
+from .discovery import RepositoryReadConstraintError
 from .engine import AssessmentError
 
 
@@ -39,13 +40,19 @@ class MappingPlanner:
         self.repos, self.units = repositories, units
 
     def _owner(self, workspace_path):
-        validate_relative_path(workspace_path)
+        try:
+            validate_relative_path(workspace_path)
+        except ValueError as exc:
+            raise AssessmentError(str(exc)) from exc
         matches = [r for r in self.repos if workspace_path.startswith(r.key + '/')]
         if not matches:
             raise AssessmentError(f'path does not belong to a supplied repository: {workspace_path}')
         repo = max(matches, key=lambda r: len(r.key))
         relative = workspace_path[len(repo.key) + 1:]
-        validate_relative_path(relative)
+        try:
+            validate_relative_path(relative)
+        except ValueError as exc:
+            raise AssessmentError(str(exc)) from exc
         return repo, relative
 
     def _check_target(self, item, target, read):
@@ -94,7 +101,7 @@ class MappingPlanner:
         def check(pointer, callback):
             try:
                 callback()
-            except AssessmentError as exc:
+            except (AssessmentError, RepositoryReadConstraintError) as exc:
                 errors.append({'path': pointer, 'error': str(exc)})
                 if len(errors) >= 32:
                     raise MappingEvidenceError(errors) from exc

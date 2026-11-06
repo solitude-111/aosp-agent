@@ -94,6 +94,10 @@ def read_git(repo, *args, stage, check=True, timeout=None, progress=None):
             return result
 
 
+class RepositoryReadConstraintError(ValueError):
+    """The requested pinned path is outside the readable file policy."""
+
+
 @dataclass
 class Repository:
     key: str
@@ -116,10 +120,10 @@ class Repository:
     def read(self, path: str) -> str:
         validate_relative_path(path)
         if self.files.get(path) not in ('100644', '100755'):
-            raise ValueError(f'not a regular tracked file: {self.key}/{path}')
+            raise RepositoryReadConstraintError(f'not a regular tracked file: {self.key}/{path}')
         size = int(self.object_query('cat-file', '-s', f'{self.head}:{path}', stage='blob_size').stdout)
         if size > 32 * 1024 * 1024:
-            raise ValueError(f'blob exceeds 32 MiB retrieval limit: {path}')
+            raise RepositoryReadConstraintError(f'blob exceeds 32 MiB retrieval limit: {path}')
         return self.object_query('show', '--no-ext-diff', '--no-textconv', f'{self.head}:{path}', stage='blob_read').stdout
 
     def state(self, *, timeout=45) -> dict:
