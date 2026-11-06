@@ -21,6 +21,13 @@ class ImpactProofError(AssessmentError):
 
 PROOF_CONTEXT = '''
 Provide proof_groups for the complete repair input using the impact schema.
+Each group's impact object must include its own reasoning field as well as the required
+status, scope_contract, proof_steps, root_cause, evidence and limitations fields. The top-level
+reasoning does not replace the group's reasoning. For an excerpt already cited in
+units[].evidence, use an impact.evidence entry {unit_id, evidence_index, claim}, where
+evidence_index is the 1-based index in that unit's evidence array. Only use a full
+evidence object for a new excerpt. All other proof indices still point into this group's
+impact.evidence array, including references.
 Every source unit must occur exactly once in one group. Groups may combine
 dependent source steps, but each group's units must have the same impact status.
 Use separate groups for independent repairs or different impact decisions.

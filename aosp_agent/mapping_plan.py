@@ -1,13 +1,14 @@
 """Shared, grounded mapping front end; no dataset target filenames are inputs."""
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
 import re
 
 from .case import validate_relative_path
-from .diff_prompts import ASSESSMENT_SCHEMA
+from .diff_prompts import ASSESSMENT_RESPONSE_SCHEMA
 from .discovery import RepositoryReadConstraintError
 from .engine import AssessmentError
 
@@ -33,6 +34,37 @@ class MappingEvidenceError(AssessmentError):
     def __init__(self, errors):
         self.errors = errors
         super().__init__('assessment evidence errors: ' + json.dumps(errors, ensure_ascii=False))
+
+
+def _expand_evidence_references(raw):
+    assessment = deepcopy(raw)
+    unit_evidence = {row['id']: row['evidence'] for row in assessment['units']}
+    errors = []
+
+    def resolve(unit_id, index, pointer):
+        evidence = unit_evidence.get(unit_id, [])
+        if not 1 <= index <= len(evidence):
+            errors.append({'path': pointer, 'error': f'invalid evidence index {index} for unit {unit_id}'})
+            return None
+        return evidence[index - 1]
+
+    for i, row in enumerate(assessment.get('scope_closure', {}).get('units', [])):
+        for j, entry in enumerate(row['evidence']):
+            if type(entry) is int:
+                row['evidence'][j] = resolve(row['unit_id'], entry, f'/scope_closure/units/{i}/evidence/{j}')
+    revisions = {'target': 'target', 'patch_before': 'source_parent', 'patch_after': 'source_fix'}
+    for i, group in enumerate(assessment.get('proof_groups', [])):
+        evidence = group['impact']['evidence']
+        for j, entry in enumerate(evidence):
+            if 'evidence_index' not in entry:
+                continue
+            source = resolve(entry['unit_id'], entry['evidence_index'], f'/proof_groups/{i}/impact/evidence/{j}')
+            if source is not None:
+                evidence[j] = {key: source[key] for key in ('path', 'line_start', 'line_end', 'excerpt')}
+                evidence[j].update(unit_id=entry['unit_id'], revision=revisions[source['origin']], claim=entry['claim'])
+    if errors:
+        raise MappingEvidenceError(errors[:32])
+    return assessment
 
 
 class MappingPlanner:
@@ -125,10 +157,11 @@ class MappingPlanner:
             raise MappingEvidenceError(errors)
 
     def ground(self, raw):
-        _shape(raw, ASSESSMENT_SCHEMA)
+        _shape(raw, ASSESSMENT_RESPONSE_SCHEMA)
         expected = {u['id']: u for u in self.units}
         if len(raw['units']) != len(expected) or {u['id'] for u in raw['units']} != set(expected):
             raise AssessmentError('assessment must cover every diff unit exactly once')
+        raw = _expand_evidence_references(raw)
         self._check_all_evidence(raw, expected)
         for item in raw['units']:
             unit = expected[item['id']]

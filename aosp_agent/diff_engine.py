@@ -18,7 +18,7 @@ from .case import Case, validate_relative_path
 from .git_policy import OFFLINE_GIT_ENV
 from .discovery import Locator, diff_units, local_git, repositories, repository_roots, repository_issue, READ_BUDGETS
 from .donor import verify_donor, verify_source_sequence
-from .diff_prompts import ASSESSMENT_SCHEMA, MIGRATION_SCHEMA, assessment_prompt
+from .diff_prompts import ASSESSMENT_RESPONSE_SCHEMA, MIGRATION_SCHEMA, assessment_prompt
 from .engine import AospBackportAgent, AssessmentError
 from .prompts import SYSTEM
 from .validation_plan import make_plan, normalize_checks
@@ -526,7 +526,7 @@ class DiffBackportAgent:
                           + (PROOF_CONTEXT if require_causality else ''))
                 raw = None
                 for attempt in range(1, max_attempts + 1):
-                    response = self._turn(runtime, prompt, ASSESSMENT_SCHEMA if attempt == 1 else REPAIR_SCHEMA,
+                    response = self._turn(runtime, prompt, ASSESSMENT_RESPONSE_SCHEMA if attempt == 1 else REPAIR_SCHEMA,
                                           read_only=True)
                     try:
                         if attempt == 1:

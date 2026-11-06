@@ -46,6 +46,17 @@ PROOF_GROUP = obj({'id': STRING, 'unit_ids': array(STRING), 'primary_unit_ids': 
         'unit_id': STRING, 'supports': array(STRING), 'reason': STRING,
         'evidence': array({'type': 'integer', 'minimum': 1})}))})
 ASSESSMENT_SCHEMA['properties']['proof_groups'] = array(PROOF_GROUP)
+
+# Preserve the materialized format for the checks and downstream consumers.
+ASSESSMENT_RESPONSE_SCHEMA = deepcopy(ASSESSMENT_SCHEMA)
+_response_fields = ASSESSMENT_RESPONSE_SCHEMA['properties']
+_closure_row = _response_fields['scope_closure']['properties']['units']['items']['properties']
+_closure_row['evidence'] = array({'anyOf': [LINE, deepcopy(EVIDENCE)]})
+_proof_impact = _response_fields['proof_groups']['items']['properties']['impact']['properties']
+_proof_impact['evidence'] = array({'anyOf': [
+    obj({'unit_id': STRING, 'evidence_index': LINE, 'claim': STRING}),
+    _proof_impact['evidence']['items'],
+]})
 MIGRATION_SCHEMA = obj({'summary': STRING, 'limitations': array(STRING), 'coverage': array(obj({
     'id': STRING, 'status': enum('implemented', 'not_required', 'unresolved'), 'explanation': STRING,
     'evidence': array(obj({'path': STRING, 'line_start': LINE, 'line_end': LINE, 'excerpt': STRING}))}))})
@@ -134,8 +145,9 @@ Return the JSON schema. For EACH change-unit id exactly once:
 3. Cite exact contiguous target excerpts AND patch_before/patch_after excerpts. Target path includes
    repository key; patch evidence path is the original old/new diff path, with ORIGINAL source line
    numbers shown in the location report. Never cite lines outside the diff as patch evidence.
-   Prefer short exact excerpts sufficient to establish each claim; do not copy whole functions when
-   a few lines suffice. Reuse evidence indices within proof sections instead of repeating entries.
+   Prefer short exact excerpts sufficient to establish each claim. Quote each snippet once in its
+   unit's evidence array. In scope_closure.units[].evidence use its 1-based index in that same unit
+   instead of copying the object. Scope proof_steps still index the closure evidence array itself.
 4. Missing/new helpers: locate the old callers and decide inline/adapt/create/irrelevant with evidence.
    NOT_AFFECTED with feature_absent needs at least two target excerpts including the relevant entry point.
    Feature-absence proposals receive a separate read-only challenge before acceptance. Prove why the

@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 
-from .diff_prompts import ASSESSMENT_SCHEMA, STRING, array, obj
+from .diff_prompts import ASSESSMENT_RESPONSE_SCHEMA, STRING, array, obj
 from .engine import AssessmentError
 from .mapping_plan import _shape
 
@@ -33,7 +33,7 @@ def apply_repair(raw, repair):
         if not path.startswith('/') or re.search(r'~(?![01])', path):
             raise AssessmentError('invalid assessment correction JSON pointer: ' + path)
         parts = [p.replace('~1', '/').replace('~0', '~') for p in path[1:].split('/')]
-        if parts[0] not in ASSESSMENT_SCHEMA['properties']:
+        if parts[0] not in ASSESSMENT_RESPONSE_SCHEMA['properties']:
             raise AssessmentError('correction cannot set controller-derived or unknown fields: ' + path)
         if any(parts[:len(old)] == old or old[:len(parts)] == parts for old in paths):
             raise AssessmentError('overlapping assessment corrections: ' + path)
@@ -61,7 +61,7 @@ def apply_repair(raw, repair):
                 raise ValueError('replacement path does not exist')
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise AssessmentError(f'invalid assessment correction at {path}: {exc}') from exc
-    _shape(candidate, ASSESSMENT_SCHEMA)
+    _shape(candidate, ASSESSMENT_RESPONSE_SCHEMA)
     return candidate
 
 
@@ -78,6 +78,7 @@ was rejected structurally or had a stale hash, NONE of that attempt's replacemen
 Address all reported locations, including duplicate quotations in other sections. Read the pinned source
 only where needed. For an absent or invalid path, find the actual pinned path and update all affected
 references and their ranges and excerpts. Imports/includes/fields use data_or_configuration.
+If an evidence entry is a reference, fix the referenced unit evidence or change the index.
 Function ranges must contain the declaration and stay within the file. Do not widen a mapping merely
 to silence a validator.
 The merged document must still cover every unit and pass ALL original evidence, scope and causal checks.
