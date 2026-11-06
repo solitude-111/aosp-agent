@@ -138,8 +138,9 @@ IMPACT_SCHEMA = {
                             "api": {"type": "string", "minLength": 1},
                             "behavior": {"type": "string", "minLength": 1},
                             "relied_at_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+                            "implementation_evidence": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
                         },
-                        "required": ["api", "behavior", "relied_at_evidence"],
+                        "required": ["api", "behavior", "relied_at_evidence", "implementation_evidence"],
                     },
                 },
             },
@@ -245,13 +246,15 @@ def parse_impact_response(payload: "str | dict[str, Any]") -> dict[str, Any]:
         if not isinstance(semantics, list):
             raise ValueError("impact causal_chain platform_semantics must be a list")
         for item in semantics:
-            if (not isinstance(item, dict) or set(item) != {"api", "behavior", "relied_at_evidence"}
+            if (not isinstance(item, dict) or set(item) != {"api", "behavior", "relied_at_evidence", "implementation_evidence"}
                     or not isinstance(item["api"], str) or not item["api"].strip()
                     or not isinstance(item["behavior"], str) or not item["behavior"].strip()
                     or not isinstance(item["relied_at_evidence"], list) or not item["relied_at_evidence"]
-                    or any(type(index) is not int or index < 1 for index in item["relied_at_evidence"])):
+                    or any(type(index) is not int or index < 1 for index in item["relied_at_evidence"])
+                    or not isinstance(item["implementation_evidence"], list) or not item["implementation_evidence"]
+                    or any(type(index) is not int or index < 1 for index in item["implementation_evidence"])):
                 raise ValueError("impact causal_chain platform_semantics entries must be "
-                                 "{api, behavior, relied_at_evidence} with nonempty 1-based indices")
+                                 "{api, behavior, relied_at_evidence, implementation_evidence} with nonempty 1-based indices")
     fields = set(IMPACT_SCHEMA["properties"]["evidence"]["items"]["required"])
     for item in raw["evidence"]:
         if not isinstance(item, dict) or set(item) != fields:
@@ -501,14 +504,16 @@ Fix-defined causal chain (required for every AFFECTED conclusion):
   flow is affirmatively absent from the target, and UNKNOWN only when a material step is
   genuinely unresolved by available evidence — never to avoid a difficult, source-provable
   conclusion.
-- Documented semantics of standard libraries and the platform runtime that exist outside
-  both repositories (java.*, javax.*, libcore, the C/libc runtime) do not vary between the
-  donor and target branches. When the harm path relies on such semantics (for example
-  java.io.File parent/child resolution, libc string handling), list each one in
-  platform_semantics with its api name, the documented behavior relied on, and the 1-based
-  index of the target evidence excerpt at the call site that relies on it. Verified
-  platform_semantics do not block AFFECTED; repository-defined behavior must never be
-  listed there.
+- Standard-library and runtime behavior may differ across versions. A familiar API name
+  or a call site alone does not verify its behavior. For material platform_semantics,
+  provide api, behavior, relied_at_evidence (target causal call sites) and
+  implementation_evidence (separate target-version source excerpts containing the actual
+  API definition and executable body). Include package/class context for JVM definitions.
+  Request a bounded read-only dependency expansion when the implementation is in another
+  project; do not add dependency files to the edit allowlist just to cite them. If decisive
+  implementation or binding cannot be established, answer UNKNOWN with the missing premise.
+  Source provenance is checked; behavior interpretation remains model reasoning, not a
+  controller-verified semantic fact. Never assume behavior is identical across releases.
 
 Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
 Limit exploration to the named candidate files and a small number of directly referenced API files;
@@ -579,7 +584,8 @@ POST_FIX_SCHEMA = {
 def post_fix_prompt(case: Case, patch_diff: str = "") -> str:
     return f"""Assess the business impact of the backported patch for {case.cve} on the AOSP 12 target system.
 
-The following patch has been generated and validated (compiles, passes contract checks):
+The following candidate patch has been generated. Its actual verification evidence
+is provided separately; do not assume it compiled or passed checks that are absent:
 ```diff
 {patch_diff}
 ```
@@ -594,7 +600,7 @@ callers and context. Consider:
 3. Compatibility risks: does the patch change any public API signature, AIDL interface,
    file format, or externally observable behavior?
 4. Performance: does the patch add locks, allocations, or change hot paths?
-5. Test recommendations: what should be tested beyond the already-passed contract checks?
+5. Test recommendations: which checks are missing or needed beyond the recorded evidence?
 
 Return a JSON object with this schema:
 {json.dumps(POST_FIX_SCHEMA, ensure_ascii=False)}

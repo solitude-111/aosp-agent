@@ -13,12 +13,19 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any, Iterable
 
 from .discovery import local_git
 
-DEFAULT_PATHSPECS = ("*.java", "*.kt", "*.aidl", "*.py")
+LANGUAGE_PATHSPECS = {
+    'java': ('*.java',), 'kotlin': ('*.kt', '*.kts'),
+    'native': ('*.c', '*.C', '*.cc', '*.cpp', '*.cxx', '*.h', '*.hh', '*.hpp', '*.hxx', '*.m', '*.mm'),
+    'python': ('*.py',), 'rust': ('*.rs',), 'go': ('*.go',),
+    'interfaces': ('*.aidl', '*.proto'), 'assembly': ('*.s', '*.S'),
+}
+DEFAULT_PATHSPECS = tuple(p for patterns in LANGUAGE_PATHSPECS.values() for p in patterns)
 IMPORT_RE = re.compile(r"\bimport\s+(?:static\s+)?([\w.]+)\s*;")
 ANNOTATION_RE = re.compile(r"@([A-Z]\w*)")
 NEW_RE = re.compile(r"\bnew\s+([A-Z]\w*)\s*\(")
@@ -102,11 +109,21 @@ def locate_in_revision(repo_args: list[str], revision: str, name: str, limit: in
     if cwd is None and repo_args[:1] == ["--git-dir"] and len(repo_args) > 1:
         candidate = Path(repo_args[1])
         cwd = candidate if candidate.is_dir() else None
-    result = local_git(cwd or Path.cwd(), *repo_args, "grep", "-n", "-I", "-w", "-F",
-                       "-e", name, *([revision] if revision else []), "--", *pathspecs,
-                       check=False, timeout=timeout)
+    pathspecs = tuple(pathspecs)
+    if not pathspecs:
+        raise ValueError('symbol lookup needs an explicit nonempty search scope')
+    scope = {'revision': revision, 'pathspecs': list(pathspecs),
+             'match_kind': 'lexical_identifier', 'absence_proven': False}
+    try:
+        result = local_git(cwd or Path.cwd(), *repo_args, "grep", "-n", "-I", "-w", "-F",
+                           "-e", name, *([revision] if revision else []), "--", *pathspecs,
+                           check=False, timeout=timeout)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {'name': name, 'found': False, 'matches': [], 'status': 'READ_FAILED',
+                'scope': scope, 'error': type(exc).__name__ + ': ' + str(exc)[-400:]}
     if result.returncode not in (0, 1):
-        return {"name": name, "found": False, "matches": [], "error": result.stderr[-400:]}
+        return {"name": name, "found": False, "matches": [], "error": result.stderr[-400:] or f'Git exited {result.returncode}',
+                'status': 'READ_FAILED', 'scope': scope}
     matches = []
     for line in result.stdout.splitlines():
         if revision and line.startswith(revision + ":"):
@@ -114,7 +131,9 @@ def locate_in_revision(repo_args: list[str], revision: str, name: str, limit: in
         parts = line.split(":", 2)
         if len(parts) >= 2 and parts[1].isdigit():
             matches.append(f"{parts[0]}:{parts[1]}")
-    return {"name": name, "found": bool(matches), "matches": matches[:limit]}
+    return {"name": name, "found": bool(matches), "matches": matches[:limit],
+            'status': 'FOUND' if matches else 'NOT_FOUND_IN_SCOPE', 'scope': scope,
+            'matches_truncated': len(matches) > limit}
 
 
 def nearest_symbols(name: str, candidates: Iterable[str], n: int = 3) -> list[str]:
@@ -123,14 +142,14 @@ def nearest_symbols(name: str, candidates: Iterable[str], n: int = 3) -> list[st
 
 
 def _harvest_candidates(repo_args: list[str], revision: str, name: str, *,
-                        cwd: Path | None = None) -> list[str]:
+                        cwd: Path | None = None, pathspecs=DEFAULT_PATHSPECS) -> list[str]:
     """Harvest identifier candidates sharing the name's 4-char stem."""
     if len(name) < 4:
         return []
     stem = re.escape(name[:4])
     result = local_git(cwd or Path.cwd(), *repo_args, "grep", "-h", "-o", "-I", "-E",
                        "-e", rf"\b{stem}\w+", *([revision] if revision else []),
-                       "--", *DEFAULT_PATHSPECS, check=False, timeout=45)
+                       "--", *pathspecs, check=False, timeout=45)
     if result.returncode not in (0, 1):
         return []
     return result.stdout.split()[:2000]
@@ -164,7 +183,7 @@ def existence_report(hunks: list[dict[str, Any]], target_repo: Path,
                 name = match.group(1).split(".")[-1]
                 package = match.group(1).rsplit(".", 1)[0].replace(".", "/")
                 import_paths.setdefault(name, package)
-    found_entries, missing_entries = [], []
+    found_entries, missing_entries, failed_entries = [], [], []
     for entry in ordered:
         name = entry["name"]
         located: dict[str, Any] | None = None
@@ -177,23 +196,34 @@ def existence_report(hunks: list[dict[str, Any]], target_repo: Path,
         if located is None or not located["found"]:
             located = locate_in_revision([], target_commit, name, cwd=target_repo)
         record = {key: value for key, value in entry.items() if key != "origins"}
-        if located.get("error"):
+        record['status'] = located['status']
+        if located['status'] == 'READ_FAILED':
             record["error"] = located["error"]
-        if located["found"]:
+            failed_entries.append(record)
+        elif located["found"]:
             record["matches"] = located["matches"]
             found_entries.append(record)
         else:
             record["origins"] = entry["origins"]
-            candidates = _harvest_candidates([], target_commit, name, cwd=target_repo)
+            try:
+                candidates = _harvest_candidates([], target_commit, name, cwd=target_repo)
+            except (OSError, subprocess.SubprocessError):
+                candidates = []
             hints = nearest_symbols(name, candidates)
             if hints:
                 record["nearest"] = hints
             missing_entries.append(record)
     missing_names = [item["name"] for item in missing_entries]
-    summary = (f"{len(found_entries) + len(missing_entries)} referenced symbols checked at the "
-               f"target baseline: {len(found_entries)} found, {len(missing_entries)} missing"
+    summary = (f"{len(ordered)} referenced symbols searched at the "
+               f"target baseline: {len(found_entries)} found, {len(missing_entries)} not found in scope, "
+               f"{len(failed_entries)} read failures"
                + (f" ({', '.join(missing_names[:10])})." if missing_names else "."))
-    report = {"missing": missing_entries, "found": found_entries, "summary": summary}
+    # Retain the legacy key for ladder consumers; it means a scoped lexical
+    # miss only. Failed reads belong in a separate bucket, never in "missing".
+    report = {"missing": missing_entries, "found": found_entries, 'read_failed': failed_entries,
+              'scope': {'revision': target_commit, 'pathspecs': list(DEFAULT_PATHSPECS),
+                        'absence_proven': False, 'match_kind': 'lexical_identifier'},
+              "summary": summary + ' Neither a scoped miss nor a read failure proves API/operation absence.'}
     for allowed in (MAX_MATCHES, 5, 2, 0):
         for entry in report["found"]:
             entry["matches"] = entry["matches"][:allowed]

@@ -44,3 +44,25 @@ def verify_donor(repo, commit, parent, patch):
             'donor_git': local_git(root, 'rev-parse', '--absolute-git-dir').stdout.strip(),
             'evidence_scope': 'pinned_donor_blobs', 'history': 'LOCAL_ONLY',
             'commit_message': raw.split('\n\n', 1)[-1]}
+
+
+def verify_source_sequence(sequence, patch):
+    """Verify every step before routing; IDs are evidence identities, not answers."""
+    if not isinstance(sequence, list) or not sequence:
+        raise ValueError('source sequence must be a nonempty list')
+    if ''.join(s['patch'].rstrip('\n') + '\n' for s in sequence) != patch:
+        raise ValueError('source sequence does not match the complete supplied patch')
+    units, steps, seen = [], [], set()
+    for step in sequence:
+        ident = step['id']
+        if not isinstance(ident, str) or not re.fullmatch(r's\d{3}', ident) or ident in seen:
+            raise ValueError('invalid or duplicate source step identity')
+        seen.add(ident)
+        provenance = verify_donor(step['provenance']['donor_git'], step['source_commit'], step['source_parent'], step['patch'])
+        steps.append({'id': ident, **provenance, 'source_candidates': step.get('source_candidates', [])})
+        for unit in diff_units(step['patch']):
+            units.append({**unit, 'id': ident + ':' + unit['id'], 'source_id': ident})
+    edges = [{'before': a['id'], 'after': b['id'], 'basis': 'direct_parent'}
+             for a in steps for b in steps if a['source_commit'] == b['source_parent']]
+    return units, {'status': 'VERIFIED_SEQUENCE', 'steps': steps, 'history': 'LOCAL_ONLY',
+                   'dependency_edges': edges, 'sequence_policy': 'input order is not ancestry proof'}

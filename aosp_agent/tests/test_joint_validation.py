@@ -1,3 +1,5 @@
+# Executor regression fixtures explicitly select the legacy exhaustive adapter.
+# Default project-first entrypoints are covered by test_runtime_entrypoints.py.
 import copy
 import json
 import os
@@ -5,13 +7,61 @@ from pathlib import Path
 import sys
 import unittest
 
-from aosp_agent.joint_validation import verify_joint
+from aosp_agent.joint_validation import verify_joint, assess_joint_impact
 from aosp_agent.mapped_run import from_case
 from engine_fixtures import BASELINE, FIXED, PARTIAL, GitFixture, ScriptedRuntime, git, write_counter
 import test_diff_workflow as diff_fixtures
 
 
 class JointValidationTest(unittest.TestCase):
+    def review(self):
+        return {'overall_risk': 'low', 'affected_callers': [], 'behavior_changes': [],
+                'compatibility_risks': [], 'performance_notes': [], 'test_recommendations': [],
+                'reasoning': 'Ordinary two-repository candidate review.'}
+
+    def test_successful_generic_joint_checks_do_not_cover_required_production_builds(self):
+        with GitFixture() as fx:
+            script = self.script(fx, 'noop.py', 'pass\n')
+            agent = self.controller(fx, joint=[[sys.executable, str(script)]], prepare=True)
+            result = verify_joint(agent)
+            self.assertEqual(result['status'], 'PASS')
+            self.assertFalse(result['sufficient_for_validated'])
+            self.assertEqual(result['uncovered_repositories'], ['repo', 'repo2'])
+
+    def test_review_rechecks_unchanged_peer_when_final_bundle_changes(self):
+        with GitFixture() as fx:
+            agent = self.controller(fx, prepare=True)
+            runtimes = {}
+            for key, child in agent.children.items():
+                runtimes[key] = diff_fixtures.QueueRuntime([(self.review(), None), (self.review(), None)])
+                child.runtime_factory = runtimes[key].factory
+            assess_joint_impact(agent)
+            first = agent.record['post_fix_review']['bundle_sha256']
+            assess_joint_impact(agent)  # Same successfully reviewed vector is reusable.
+            self.assertTrue(all(len(r.calls) == 1 for r in runtimes.values()))
+            peer = agent.children['repo2']
+            (peer.worktree / 'counter.py').write_text(FIXED.replace('max(0, min(value, 10))', 'min(10, max(value, 0))'))
+            peer.export_patch(2)
+            assess_joint_impact(agent)
+            self.assertNotEqual(first, agent.record['post_fix_review']['bundle_sha256'])
+            self.assertTrue(all(len(r.calls) == 2 for r in runtimes.values()))
+            self.assertEqual(agent.record['post_fix_review']['status'], 'COMPLETED')
+
+    def test_failed_review_is_explicit_and_not_reused_as_success(self):
+        with GitFixture() as fx:
+            agent = self.controller(fx, prepare=True)
+            runtimes = {}
+            for key, child in agent.children.items():
+                runtimes[key] = diff_fixtures.QueueRuntime([({}, None)])
+                child.runtime_factory = runtimes[key].factory
+            assess_joint_impact(agent)
+            self.assertEqual(agent.record['post_fix_review']['status'], 'INCOMPLETE')
+            self.assertEqual(set(agent.record['post_fix_review']['repositories'].values()), {'FAILED'})
+            for runtime in runtimes.values(): runtime.replies.append((self.review(), None))
+            assess_joint_impact(agent)
+            self.assertEqual(agent.record['post_fix_review']['status'], 'COMPLETED')
+            self.assertTrue(all(len(r.calls) == 2 for r in runtimes.values()))
+
     def script(self, fx, name, source):
         path = fx.root / name
         path.write_text(f'#!{sys.executable}\n' + source)
@@ -23,7 +73,7 @@ class JointValidationTest(unittest.TestCase):
         git(fx.source_root, 'clone', '-q', '--no-hardlinks', str(fx.repo), str(second))
         git(second, 'checkout', '--detach', '-q', fx.target)
         agent = from_case(fx.case(), fx.source_root, fx.run_root, auto_validation=False,
-                          validation=validation, joint_validation=joint, build_runner=runner)
+                          validation=validation, joint_validation=joint, build_runner=runner, exhaustive_discovery=True)
         raw = diff_fixtures.DiffWorkflowTest().assessment(agent)
         target = copy.deepcopy(raw['units'][0]['targets'][0])
         target['path'] = 'repo2/counter.py'
@@ -95,7 +145,7 @@ artifacts.mkdir(parents=True, exist_ok=True)
                 validation = {key: [[sys.executable, '-B', 'verify_contract.py']] for key in ('repo', 'repo2')}
                 agent = self.controller(fx, validation=validation, joint=[[sys.executable, str(checker)]])
                 result = agent.run(verify=True, max_attempts=1)
-                self.assertEqual(result['status'], 'VALIDATED' if passing else 'VALIDATION_FAILED')
+                self.assertEqual(result['status'], 'PATCH_UNVERIFIED' if passing else 'VALIDATION_FAILED')
                 self.assertEqual(result['joint_verification']['commands'][0]['returncode'], 0 if passing else 7)
                 self.assertEqual(len(result['patches']), 2)
 

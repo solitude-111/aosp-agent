@@ -77,6 +77,7 @@ def _single_transaction(source_root, lock_path, command, env=None, *,
     snapshot = run_dir / 'module-build-restore'
     snapshot.mkdir(parents=True, exist_ok=True)
     report = {'patch_sha256': values['PATCH_SHA256'], 'target_commit': values['TARGET_COMMIT'],
+              'target_repo': str(repo), 'validation_id': env.get('AOSP_AGENT_VALIDATION_ID'),
               'paths': paths, 'restore': 'NOT_NEEDED', 'build_returncode': None}
     def save():
         (snapshot / 'transaction.json').write_text(json.dumps(report, indent=2) + '\n')
@@ -142,8 +143,10 @@ def _single_transaction(source_root, lock_path, command, env=None, *,
             if callable(command):
                 report['build_returncode'] = command()
             else:
+                from .lifecycle import source_subprocess_contract
+                child_env, descriptors = source_subprocess_contract(child_env)
                 process = subprocess.Popen(command, cwd=_command_cwd or worktree,
-                                           env=child_env, start_new_session=True)
+                                           env=child_env, start_new_session=True, pass_fds=descriptors)
                 report['build_returncode'] = process.wait()
         except BuildInterrupted as exc:
             report.update(build_returncode=130, error=str(exc))

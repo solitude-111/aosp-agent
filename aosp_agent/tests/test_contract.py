@@ -125,7 +125,7 @@ class ContractTest(unittest.TestCase):
             result = AospBackportAgent(
                 fixture.source_root, fixture.run_root, fixture.case(validation=True),
                 runtime_factory=runtime.factory).run(verify=True)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             # Legacy fields keep their names and meaning...
             for key in ("cve", "status", "backend", "model", "events", "impact_decision",
                         "patch_sha256", "final_verification", "original_checkout"):

@@ -2,6 +2,7 @@
 import subprocess
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from aosp_agent.patches import split_hunks
 from aosp_agent.symbols import (
@@ -80,6 +81,22 @@ class ExtractReferencedSymbolsTest(unittest.TestCase):
 
 
 class LocateInRevisionTest(unittest.TestCase):
+    def test_native_and_rust_symbols_are_searched_at_pinned_revision(self):
+        with SymbolFixture() as fixture:
+            for path in ('native.c', 'native.cpp', 'native.h', 'native.rs'):
+                (fixture.repo / path).write_text('int permission_check(void);\n')
+            git(fixture.repo, 'add', '.')
+            git(fixture.repo, 'commit', '-qm', 'native symbols')
+            pinned = git(fixture.repo, 'rev-parse', 'HEAD')
+            (fixture.repo / 'native.c').write_text('changed_worktree_only\n')
+            hit = locate_in_revision([], pinned, 'permission_check', cwd=fixture.repo)
+            self.assertEqual(hit['status'], 'FOUND')
+            self.assertEqual(set(hit['matches']), {f'{p}:1' for p in ('native.c', 'native.cpp', 'native.h', 'native.rs')})
+            self.assertFalse(hit['scope']['absence_proven'])
+            miss = locate_in_revision([], pinned, 'permission_check', cwd=fixture.repo, pathspecs=('*.java',))
+            self.assertEqual(miss['status'], 'NOT_FOUND_IN_SCOPE')
+            self.assertEqual(miss['scope']['pathspecs'], ['*.java'])
+
     def test_found_missing_and_word_boundaries(self):
         with SymbolFixture() as fixture:
             hit = locate_in_revision([], fixture.target, "Foo", cwd=fixture.repo)
@@ -97,6 +114,17 @@ class LocateInRevisionTest(unittest.TestCase):
         result = locate_in_revision([], "0" * 40, "Foo", cwd=Path.cwd())
         self.assertFalse(result["found"])
         self.assertIn("error", result)
+        self.assertEqual(result['status'], 'READ_FAILED')
+
+    def test_timeout_is_not_a_scoped_miss(self):
+        with patch('aosp_agent.symbols.local_git', side_effect=subprocess.TimeoutExpired('git', 1)):
+            result = locate_in_revision([], '0' * 40, 'Foo')
+        self.assertEqual(result['status'], 'READ_FAILED')
+        self.assertFalse(result['scope']['absence_proven'])
+        with patch('aosp_agent.symbols.local_git', return_value=subprocess.CompletedProcess('git', 128, '', '')):
+            result = locate_in_revision([], '0' * 40, 'Foo')
+        self.assertEqual(result['status'], 'READ_FAILED')
+        self.assertTrue(result['error'])
 
 
 class NearestSymbolsTest(unittest.TestCase):
@@ -120,7 +148,16 @@ class ExistenceReportTest(unittest.TestCase):
             entry = next(item for item in report["missing"] if item["name"] == "Missing")
             self.assertEqual(entry["origins"][0]["hunk_id"], "f001-h001")
             self.assertIn("referenced symbols", report["summary"])
-            self.assertIn("missing", report["summary"])
+            self.assertIn("not found in scope", report["summary"])
+
+    def test_failed_reads_are_excluded_from_missing_symbols(self):
+        with SymbolFixture() as fixture, patch('aosp_agent.symbols.local_git',
+                side_effect=subprocess.TimeoutExpired('git', 1)):
+            report = existence_report(split_hunks(DONOR_DIFF), fixture.repo, fixture.target)
+        self.assertEqual(report['missing'], [])
+        self.assertEqual(report['found'], [])
+        self.assertTrue(report['read_failed'])
+        self.assertIn('read failures', report['summary'])
 
     def test_report_is_size_capped(self):
         import json

@@ -21,7 +21,7 @@ from .mapping_plan import _excerpt, _shape
 INDEXES = array({'type': 'integer', 'minimum': 1})
 REVIEW_SCHEMA = obj({'units': array(obj({
     'id': STRING,
-    'verdict': enum('CONFIRMED_ABSENT', 'COUNTERPART_POSSIBLE', 'UNKNOWN'),
+    'verdict': enum('CONFIRMED_ABSENT', 'CONFIRMED_PROTECTED', 'COUNTERPART_POSSIBLE', 'UNKNOWN'),
     'security_operation': STRING,
     'representation': enum('same', 'equivalent', 'absent', 'unknown'),
     'old_entrypoint_analysis': STRING,
@@ -41,11 +41,15 @@ class ExclusionReviewError(AssessmentError):
 
 
 def review_prompt(controller, assessment, inventory):
-    proposals = [u for u in assessment['units'] if u['status'] == 'NOT_AFFECTED']
-    return '''Independently challenge these proposed feature-absence exclusions. Work READ ONLY.
+    proposals = [u for u in assessment['units'] if u['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED')]
+    return '''Independently challenge these proposed no-fix-needed conclusions. Work READ ONLY.
 The proposals are hypotheses, not reference answers. Do not fetch, edit originals, run builds,
 read previous runs or look for dataset verdicts. Inspect pinned target code and the supplied diff.
 UNAVAILABLE inventory entries cannot be read or mapped; missing objects are not negative evidence.
+Initial discovery may defer directory or project searches after finding a text anchor. DEFERRED
+means not searched, not absent; matching text does not close dependency or competing-path questions.
+Independently investigate the actual old entry/state flow and necessary dependencies. Use bounded
+aosp_source search/paths with a path before escalating to project-wide searches when needed.
 
 For each proposed unit, identify the security-relevant OPERATION and faulty state, separately from
 the new helper, object type, field, flag, hook or API used to fix it. Trace the older entry point,
@@ -56,6 +60,11 @@ or a prerequisite commit missing from the old tree does not establish that the o
 
 Return exactly one review for every proposed unit. Evidence indices are 1-based within that review's
 evidence array. Cite exact pinned target excerpts and original diff-side coordinates for that unit.
+An ALREADY_FIXED proposal requires CONFIRMED_PROTECTED: identify the existing protection, prove
+it applies on the relevant entry/state-flow path before the harmful operation, and compare its
+semantics with the donor fix. Merely finding a guard, matching token or similar helper is insufficient.
+For this verdict representation must be same or equivalent, with no unresolved material assumptions.
+Use UNKNOWN or COUNTERPART_POSSIBLE if coverage, ordering or equivalence is unestablished.
 For CONFIRMED_ABSENT, provide executable target entrypoint, state/dispatch flow AND the condition
 that blocks the faulty operation; compare the donor diff and resolve every material assumption.
 Data/type/registration declarations, comments, absent identifiers and unsuccessful searches alone
@@ -66,16 +75,19 @@ use COUNTERPART_POSSIBLE and cite that path for remapping (including possible ex
 COUNTERPART_POSSIBLE is not an AFFECTED verdict. UNKNOWN is mandatory if proof remains incomplete.
 Never infer runtime safety or affectedness just from compilation, version numbers or API names.
 
-Repository inventory:\n''' + json.dumps(inventory, ensure_ascii=False) + '\nProposals:\n' + json.dumps(
+Repository inventory:\n''' + json.dumps(inventory, ensure_ascii=False) + '\nInitial retrieval limits:\n' + json.dumps(
+        controller.record.get('retrieval_summary', {}), ensure_ascii=False) + '\nProposals:\n' + json.dumps(
         proposals, ensure_ascii=False) + '\nComplete input diff:\n' + controller.diff + controller._donor_tools_context()
 
 
 def ground_review(controller, assessment, raw):
     """Validate citations and proof obligations, returning units needing remapping."""
     _shape(raw, REVIEW_SCHEMA)
-    proposed = {u['id'] for u in assessment['units'] if u['status'] == 'NOT_AFFECTED'}
+    proposed_status = {u['id']: u['status'] for u in assessment['units']
+                       if u['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED')}
+    proposed = set(proposed_status)
     if len(raw['units']) != len(proposed) or {u['id'] for u in raw['units']} != proposed:
-        raise AssessmentError('exclusion review must cover every proposed NOT_AFFECTED unit exactly once')
+        raise AssessmentError('exclusion review must cover every proposed no-fix-needed unit exactly once')
     source = {u['id']: u for u in controller.units}
     cache = {}
 
@@ -132,11 +144,15 @@ def ground_review(controller, assessment, raw):
             if any(not 1 <= n <= len(item['evidence']) for n in indices):
                 raise AssessmentError(f'exclusion review {field} has invalid evidence indices')
             groups[field] = [item['evidence'][n - 1] for n in indices]
-        if item['verdict'] != 'CONFIRMED_ABSENT':
+        expected_verdict = ('CONFIRMED_ABSENT' if proposed_status[item['id']] == 'NOT_AFFECTED'
+                            else 'CONFIRMED_PROTECTED')
+        if item['verdict'] != expected_verdict:
             challenged.append(item['id'])
             continue
-        if item['representation'] != 'absent' or item['unresolved_assumptions']:
-            raise AssessmentError('confirmed absence requires absent operation and no unresolved assumptions')
+        representations = {'absent'} if expected_verdict == 'CONFIRMED_ABSENT' else {'same', 'equivalent'}
+        if item['representation'] not in representations or item['unresolved_assumptions']:
+            requirement = 'absent operation' if expected_verdict == 'CONFIRMED_ABSENT' else 'same or equivalent protection'
+            raise AssessmentError('confirmed exclusion requires ' + requirement + ' and no unresolved assumptions')
         for field in ('entrypoint_evidence', 'state_flow_evidence', 'blocking_evidence'):
             if not groups[field] or not all(executable(e) for e in groups[field]):
                 raise AssessmentError(f'confirmed absence {field} must cite executable target function regions')
@@ -154,7 +170,7 @@ def ground_review(controller, assessment, raw):
 
 def review_exclusions(controller, assessment, inventory, attempt):
     """Run a fresh challenge session within the existing mapping attempt budget."""
-    if not any(u['status'] == 'NOT_AFFECTED' for u in assessment['units']):
+    if not any(u['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED') for u in assessment['units']):
         return
     from .diff_engine import _write
     name = f'exclusion-review-{attempt}'
@@ -178,14 +194,15 @@ def review_exclusions(controller, assessment, inventory, attempt):
         details = [u for u in raw['units'] if u['id'] in challenged]
         raise ExclusionReviewError('feature-absence not established; reconsider old-operation counterparts: '
                                    + json.dumps(details, ensure_ascii=False))
-    entry['status'] = 'CONFIRMED_ABSENT'
+    entry['status'] = ('CONFIRMED_ABSENT' if all(u['status'] != 'ALREADY_FIXED' for u in assessment['units'])
+                       else 'CONFIRMED_EXCLUSIONS')
 
 
 def unresolved_exclusions(controller, assessment, reason):
     """Keep the grounded proposal, but prevent an unreviewed exclusion escaping."""
     result = copy.deepcopy(assessment)
     for unit in result['units']:
-        if unit['status'] == 'NOT_AFFECTED':
+        if unit['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED'):
             unit.update(status='UNKNOWN', absence_basis='none')
             unit['reasoning'] += '\nFeature-absence review did not establish exclusion.'
     result['limitations'].append('Feature-absence review unresolved; see stored review/rejection records.')

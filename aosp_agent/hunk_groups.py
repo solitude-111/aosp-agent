@@ -2,6 +2,7 @@
 import hashlib
 import re
 from collections import Counter
+from .patches import text_hunks
 
 
 HINTS = {
@@ -21,8 +22,9 @@ def review_groups(hunks, batch_size=8):
     for hunk in hunks:
         path = hunk.get('new_path') or hunk.get('old_path') or hunk['path']
         text = hunk['patch']
-        changed = [(n, line) for n, line in enumerate(text.splitlines(), 1)
-                   if line.startswith(('+', '-')) and not line.startswith(('+++', '---'))]
+        changed = [(line['patch_line'], line['marker'] + line['text'])
+                   for part in (text_hunks(text) if hunk['supported'] else ())
+                   for line in part['lines'] if line['marker'] in ('+', '-')]
         labels = [label for label, pattern in HINTS.items() if any(pattern.search(line[1:]) for _, line in changed)]
         role = ('build_configuration' if path.rsplit('/', 1)[-1] in ('Android.bp', 'Android.mk', 'CMakeLists.txt') else
                 'test_candidate' if re.search(r'(^|/)(tests?|testdata)(/|$)|Test\.[^.]+$', path) else

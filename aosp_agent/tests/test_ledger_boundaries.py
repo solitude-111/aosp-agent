@@ -46,7 +46,7 @@ class LedgerBoundaryTest(unittest.TestCase):
         with GitFixture() as fx:
             agent = self.prepared(fx, '#define OLD_LIMIT 10\n')
             hunk = {'path': 'guard.h', 'patch': '@@ -0,0 +1 @@\n+#define NEW_LIMIT 20\n'}
-            self.assertIn('unanchored additions are absent',
+            self.assertIn('unanchored additions lack site-specific evidence',
                           agent._falsify_exclusion_against_target(hunk, {}, 'already_present'))
             self.assertIn('no grounded target anchor',
                           agent._falsify_exclusion_against_target(hunk, {}, 'semantic_equivalence'))

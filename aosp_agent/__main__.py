@@ -6,18 +6,54 @@ from pathlib import Path
 
 from .case import load_cases
 from .engine import AospBackportAgent
+from .lifecycle import LeaseBusy, RecoveryBlocked
 
 
-def main() -> int:
+def scope_options(parser, *, exhaustive=True):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--repository', action='append', dest='repository_keys',
+                       help='initial project path relative to target root; repeat for multiple projects')
+    if exhaustive:
+        group.add_argument('--exhaustive-discovery', action='store_true',
+                           help='explicit legacy fallback: inspect every checkout; disables project-first routing')
+    parser.add_argument('--cache-root', type=Path)
+    parser.add_argument('--max-projects', type=int, default=12)
+    parser.add_argument('--max-rounds', type=int, default=3)
+    parser.add_argument('--investigation-seconds', type=float, default=900)
+    parser.add_argument('--max-git-operations', type=int, default=2000,
+                        help='investigation budget for controller Git and SDK tool invocations')
+    parser.add_argument('--max-model-turns', type=int, default=48)
+    parser.add_argument('--max-output-bytes', type=int, default=256 * 1024 * 1024,
+                        help='cumulative controller output budget shared by all task/batch children')
+
+
+def routing_options(args):
+    return {key: getattr(args, key) for key in ('repository_keys', 'cache_root', 'max_projects', 'max_rounds',
+                                               'investigation_seconds', 'max_git_operations', 'max_model_turns', 'max_output_bytes')}
+
+
+def exit_status(status):
+    return {'DISCOVERED': 0, 'AFFECTED': 0, 'NOT_AFFECTED': 0, 'ALREADY_FIXED': 0, 'VALIDATED': 0,
+            'PATCH_UNVERIFIED': 3, 'NEEDS_REVIEW': 7, 'INCONCLUSIVE': 4, 'INPUT_UNRESOLVED': 4, 'BLOCKED': 4,
+            'VALIDATION_FAILED': 5, 'MIGRATION_INCOMPLETE': 6, 'CANCELLED': 130}.get(status, 2)
+
+
+def _main() -> int:
     parser = argparse.ArgumentParser(description="Data-driven AOSP CVE impact/backport agent")
     parser.add_argument("--dataset", type=Path, default=Path(__file__).parent / "dataset/cases")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list")
+    status = sub.add_parser('status', help='read saved stage plus actual run-lease state')
+    status.add_argument('--record', type=Path, required=True)
+    resume = sub.add_parser('resume', help='resume an interrupted project-first task/batch with fresh candidates and original pins')
+    resume.add_argument('--record', type=Path, required=True)
     diff = sub.add_parser("diff", help="discover, assess and backport from only a diff and target checkout(s)")
     diff.add_argument("--patch", type=Path, required=True)
     diff.add_argument("--target-root", type=Path, required=True,
                       help="standalone target Git checkout or AOSP root containing Git checkouts; pins each HEAD")
     diff.add_argument("--run-root", type=Path, default=Path("runs/diff-input"))
+    scope_options(diff)
+    diff.add_argument('--target-revision', help='versioned repo manifest tag/commit; never falls back to checkout HEAD')
     diff.add_argument("--inspect-only", action="store_true")
     diff.add_argument("--model", default=None,
                       help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
@@ -29,7 +65,7 @@ def main() -> int:
     diff.add_argument("--validation", type=Path, help="optional independent checks JSON keyed by discovered repository key")
     diff.add_argument("--joint-validation", type=Path, help="fixed checks for the assembled final candidate workspace")
     diff.add_argument("--no-auto-validation", action="store_true",
-                      help="disable donor-derived smoke checks and Android.bp module discovery")
+                      help="disable donor-derived lexical hints and Android.bp module discovery")
     diff.add_argument("--build-runner", type=Path,
                       help="trusted executable accepting inferred module names and the AOSP_AGENT_* build contract")
     diff.add_argument("--donor-repo", type=Path, help="local donor bare repository or checkout")
@@ -40,6 +76,7 @@ def main() -> int:
     run.add_argument("--dataset", dest="run_dataset", type=Path)
     run.add_argument("--source-root", type=Path, required=True)
     run.add_argument("--run-root", type=Path, required=True)
+    scope_options(run)
     run.add_argument("--donor-root", type=Path, help="directory containing <repo-path with slashes replaced by hyphens>.git")
     run.add_argument("--model", default=None,
                      help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
@@ -60,6 +97,25 @@ def main() -> int:
                      help="maximum turns per assessment/backport phase, including the initial turn")
     run.add_argument("--turn-timeout", type=float, default=900,
                      help="timeout in seconds for each SDK turn")
+    batch = sub.add_parser('batch', help='serial four-field JSONL input with per-row project-first execution')
+    batch.add_argument('--input', type=Path, required=True)
+    batch.add_argument('--target-root', type=Path, required=True)
+    batch.add_argument('--run-root', type=Path, required=True)
+    batch.add_argument('--donor-root', type=Path, required=True)
+    batch.add_argument('--donor-map', type=Path, help='JSON object mapping donor origins to local Git stores')
+    batch.add_argument('--model')
+    batch.add_argument('--mapping-model')
+    batch.add_argument('--model-provider')
+    batch.add_argument('--turn-timeout', type=float, default=900)
+    batch.add_argument('--max-attempts', type=int, default=3)
+    batch.add_argument('--inspect-only', action='store_true')
+    batch.add_argument('--impact-only', action='store_true')
+    batch.add_argument('--verify', action='store_true')
+    batch.add_argument('--no-auto-validation', action='store_true')
+    batch.add_argument('--build-runner', type=Path)
+    batch.add_argument('--validation', type=Path, help='explicit independent checks keyed by project; not reference answers')
+    batch.add_argument('--joint-validation', type=Path)
+    scope_options(batch, exhaustive=False)
     inherit = sub.add_parser("inherit", help="cross-tag test inheritance analysis")
     inherit.add_argument("cve")
     inherit.add_argument("--dataset", dest="inherit_dataset", type=Path)
@@ -71,32 +127,109 @@ def main() -> int:
     inherit.add_argument("--model", default=None)
     inherit.add_argument("--model-provider")
     inherit.add_argument("--turn-timeout", type=float, default=900)
+    inherit.add_argument('--max-output-bytes', type=int, default=256 * 1024 * 1024)
+    inherit.add_argument("--run-root", type=Path, default=Path('runs/inherit'),
+                         help="external output root for a unique inheritance analysis record")
     args = parser.parse_args()
+    if args.command == 'status':
+        from .lifecycle import process_state
+        from .output_budget import require_output_record, OutputBudgetUnavailable
+        output_error = None
+        try:
+            require_output_record(args.record)
+        except OutputBudgetUnavailable as exc:
+            output_error = exc
+        try:
+            record = json.loads(args.record.read_text())
+            if not isinstance(record, dict):
+                raise ValueError('status record must be an object')
+        except (OSError, ValueError):
+            if output_error is None:
+                raise
+            record = {}
+        from .delivery import update_delivery
+        saved_status = record.get('status')
+        if record.get('execution') != 'serial_project_first':
+            update_delivery(record)
+        if output_error is not None:
+            record.update(status='BLOCKED', delivery_status='BLOCKED', completion_blocked_by=output_error.kind)
+        print(json.dumps({'record': str(args.record.resolve()), 'saved_status': saved_status,
+                          'effective_status': record.get('status'),
+                          'delivery_status': record.get('delivery_status'),
+                          'completion_blocked_by': record.get('completion_blocked_by'),
+                          'build_validation': record.get('build_validation'),
+                          'review_status': record.get('review_status'),
+                          'process_state': process_state(args.record.parent),
+                          'active_round_record': record.get('active_round_record'),
+                          'counts': record.get('counts')}, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == 'resume':
+        from .resume import resume_project, resume_batch
+        try:
+            old = json.loads(args.record.read_text())
+            result = (resume_batch(args.record) if old.get('execution') == 'serial_project_first' else resume_project(args.record))
+            print(json.dumps({k: result[k] for k in ('status', 'impact_decision', 'record', 'resumed_from', 'counts', 'delivery_counts',
+                'build_validation', 'review_status', 'delivery_status', 'delivery', 'error') if k in result},
+                             ensure_ascii=False, indent=2))
+            if result.get('execution') == 'serial_project_first':
+                return (exit_status(result['status']) if result['status'] != 'COMPLETED' else
+                        max((exit_status(row['status']) for row in result['rows']), default=2))
+            return exit_status(result['status'])
+        except Exception as exc:
+            status = 'BLOCKED' if isinstance(exc, (LeaseBusy, RecoveryBlocked)) else 'FAILED'
+            print(json.dumps({'status': status, 'error': {'type': type(exc).__name__, 'message': str(exc)}}, ensure_ascii=False))
+            return exit_status(status)
+    if args.command == 'batch':
+        from .runtime_batch import RuntimeBatch
+        try:
+            runner = RuntimeBatch(args.input, args.target_root, args.run_root, args.donor_root,
+                donor_map=json.loads(args.donor_map.read_text()) if args.donor_map else None,
+                agent_options={**routing_options(args), 'model': args.model, 'mapping_model': args.mapping_model,
+                    'model_provider': args.model_provider, 'turn_timeout': args.turn_timeout,
+                    'auto_validation': not args.no_auto_validation, 'build_runner': args.build_runner,
+                    'validation': json.loads(args.validation.read_text()) if args.validation else None,
+                    'joint_validation': json.loads(args.joint_validation.read_text()) if args.joint_validation else None})
+            result = runner.run(inspect_only=args.inspect_only, impact_only=args.impact_only,
+                                verify=args.verify, max_attempts=args.max_attempts)
+            print(json.dumps({k: result[k] for k in ('task_id', 'status', 'row_count', 'counts', 'delivery_counts')} |
+                             {'record': str(runner.run_dir / 'batch-status.json')}, ensure_ascii=False, indent=2))
+            return (exit_status(result['status']) if result['status'] != 'COMPLETED' else
+                    max((exit_status(row['status']) for row in result['rows']), default=2))
+        except Exception as exc:
+            status = 'BLOCKED' if isinstance(exc, (LeaseBusy, RecoveryBlocked)) else 'FAILED'
+            print(json.dumps({'status': status, 'error': {'type': type(exc).__name__, 'message': str(exc)}}, ensure_ascii=False))
+            return exit_status(status)
     if args.command == "diff":
         from .diff_engine import DiffBackportAgent
+        from .project_first import ProjectFirstAgent
         agent = None
         try:
-            agent = DiffBackportAgent(args.patch, args.target_root, args.run_root, model=args.model,
+            if args.exhaustive_discovery and args.target_revision:
+                raise ValueError('--target-revision requires project-first routing')
+            controller = DiffBackportAgent if args.exhaustive_discovery else ProjectFirstAgent
+            options = ({'max_output_bytes': args.max_output_bytes} if args.exhaustive_discovery else
+                       {**routing_options(args), 'target_revision': args.target_revision})
+            agent = controller(args.patch, args.target_root, args.run_root, model=args.model,
                 model_provider=args.model_provider, turn_timeout=args.turn_timeout,
                 validation=json.loads(args.validation.read_text()) if args.validation else None,
                 joint_validation=json.loads(args.joint_validation.read_text()) if args.joint_validation else None,
                 donor_repo=args.donor_repo, source_commit=args.source_commit,
                 source_parent=args.source_parent, auto_validation=not args.no_auto_validation,
-                build_runner=args.build_runner, mapping_model=args.mapping_model)
+                build_runner=args.build_runner, mapping_model=args.mapping_model, **options)
             result = agent.run(inspect_only=args.inspect_only, max_attempts=args.max_attempts, verify=args.verify)
         except Exception as exc:
-            result = {"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}}
+            result = {"status": "BLOCKED" if isinstance(exc, (LeaseBusy, RecoveryBlocked)) else "FAILED",
+                      "error": {"type": type(exc).__name__, "message": str(exc)}}
             if getattr(exc, 'record_path', None):
                 result['record'] = exc.record_path
         summary = {k: result[k] for k in ("task_id", "status", "impact_decision", "model", "patches", "error", "record",
-                                        "inventory_status", "completion_blocked_by") if k in result}
+                                        "inventory_status", "completion_blocked_by", "execution_path", "selected_projects",
+                                        "build_validation", "review_status", "delivery_status", "delivery") if k in result}
         if agent:
             summary["record"] = str(agent.run_dir / "run.json")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return {"DISCOVERED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
-                "PATCH_UNVERIFIED": 3, "INCONCLUSIVE": 4, "VALIDATION_FAILED": 5,
-                "MIGRATION_INCOMPLETE": 6}.get(result["status"], 2)
-    cases = load_cases(getattr(args, "run_dataset", None) or args.dataset)
+        return exit_status(result['status'])
+    cases = load_cases(getattr(args, "run_dataset", None) or getattr(args, 'inherit_dataset', None) or args.dataset)
     if args.command == "list":
         for case in cases.values():
             print(f"{case.cve}\t{case.project}\t{case.repository}")
@@ -109,39 +242,49 @@ def main() -> int:
                 args.cve, args.fix_patch, args.source_root, case.repository,
                 list(case.files), args.tag1, args.tag2,
                 model=args.model, model_provider=args.model_provider,
-                turn_timeout=args.turn_timeout)
+                turn_timeout=args.turn_timeout, run_root=args.run_root, max_output_bytes=args.max_output_bytes)
         except Exception as exc:
             result = {"verdict": "ERROR", "reasoning": str(exc)}
-        output_path = args.fix_patch.parent / "inherit-result.json"
-        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n")
+            if getattr(exc, 'inheritance_result_file', None):
+                result['result_file'] = exc.inheritance_result_file
         summary = {k: result[k] for k in ("verdict", "confidence", "tag_diff_summary",
-                                           "tests_to_rerun") if k in result}
-        summary["result_file"] = str(output_path)
+                                           "tests_to_rerun", "result_file", "reasoning") if k in result}
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return {"INHERIT": 0, "CONDITIONAL": 1, "RE_TEST": 2}.get(result.get("verdict"), 3)
     case = cases[args.cve]
     try:
         from .mapped_run import from_case
         agent = from_case(case, args.source_root, args.run_root, donor_root=args.donor_root,
+            exhaustive_discovery=args.exhaustive_discovery,
             model=args.model, mapping_model=args.mapping_model, model_provider=args.model_provider,
             turn_timeout=args.turn_timeout, auto_validation=not args.no_auto_validation,
             build_runner=args.build_runner,
             joint_validation=json.loads(args.joint_validation.read_text()) if args.joint_validation else None,
-            validation=json.loads(args.validation.read_text()) if args.validation else None)
+            validation=json.loads(args.validation.read_text()) if args.validation else None,
+            **({'max_output_bytes': args.max_output_bytes} if args.exhaustive_discovery else routing_options(args)))
         result = agent.run(inspect_only=args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
             mechanical=not args.no_mechanical, impact_only=args.impact_only)
     except Exception as exc:
-        print(json.dumps({"status": "FAILED", "error": {"type": type(exc).__name__, "message": str(exc)}},
+        status = 'BLOCKED' if isinstance(exc, (LeaseBusy, RecoveryBlocked)) else 'FAILED'
+        print(json.dumps({"status": status, "error": {"type": type(exc).__name__, "message": str(exc)}},
                          ensure_ascii=False, indent=2))
-        return 2
+        return exit_status(status)
     summary = {key: result[key] for key in ("cve", "status", "backend", "model", "patch_file",
                                           "patch_sha256", "patches", "repository_statuses",
-                                          "final_verification", "error") if key in result}
+                                          "final_verification", "build_validation", "review_status", "delivery_status", "delivery", "error") if key in result}
     summary["record"] = str(args.run_root.resolve() / case.cve / "run.json")
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return {"DISCOVERED": 0, "PREPARED": 0, "AFFECTED": 0, "NOT_AFFECTED": 0, "ALREADY_FIXED": 0, "VALIDATED": 0,
-            "PATCH_UNVERIFIED": 3, "INCONCLUSIVE": 4, "VALIDATION_FAILED": 5,
-            "MIGRATION_INCOMPLETE": 6}.get(result["status"], 2)
+    return exit_status(result['status'])
+
+
+def main() -> int:
+    from .lifecycle import cancellation_signals
+    with cancellation_signals():
+        try:
+            return _main()
+        except KeyboardInterrupt:
+            print(json.dumps({'status': 'CANCELLED', 'impact_decision': 'UNKNOWN'}))
+            return 130
 
 
 if __name__ == "__main__":

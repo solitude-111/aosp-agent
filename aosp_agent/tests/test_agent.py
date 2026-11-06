@@ -34,7 +34,7 @@ class AgentTest(unittest.TestCase):
 
     def test_new_file_activation_ignores_comments_and_imports(self):
         patch = (
-            "@@ -1 +1,7 @@\n"
+            "@@ -0,0 +1,7 @@\n"
             "+/**\n"
             "+ * class CommentOnlyReference\n"
             "+ */\n"
@@ -172,11 +172,11 @@ class AgentTest(unittest.TestCase):
             self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             self.assertEqual(result["final_verification"]["status"], "NOT_CONFIGURED")
 
-    def test_passing_configured_contract_is_validated(self):
+    def test_passing_configured_contract_retains_evidence_without_claiming_build_validation(self):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(verify=True)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             self.assertEqual(result["final_verification"]["status"], "PASS")
             self.assertIn("contract verified", result["final_verification"]["commands"][0]["stdout"])
             self.assertEqual(len(runtime.calls), 3)
@@ -197,7 +197,7 @@ class AgentTest(unittest.TestCase):
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(PARTIAL), write_counter(FIXED)])
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             self.assertEqual(len(runtime.calls), 4)
             self.assertIn("upper bound missing", runtime.calls[2]["prompt"])
             self.assertEqual(result["final_verification"]["status"], "PASS")
@@ -208,7 +208,7 @@ class AgentTest(unittest.TestCase):
             runtime = ScriptedRuntime(fixture.assessment(), [None, write_counter(FIXED)])
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2, mechanical=False)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             self.assertEqual(len(runtime.calls), 4)
             self.assertIn("The AFFECTED assessment produced an empty patch",
                           runtime.calls[2]["prompt"])
@@ -437,6 +437,7 @@ class AgentTest(unittest.TestCase):
                 "class NewHelper:\n"
                 "    clamp = staticmethod(lambda value: max(0, min(value, 10)))\n")
             (agent.worktree / "counter.py").write_text(
+                "from NewHelper import NewHelper\n\n"
                 "def normalize_count(value):\n"
                 "    return NewHelper.clamp(value)\n")
             agent.export_patch(1)
@@ -446,11 +447,37 @@ class AgentTest(unittest.TestCase):
                              "existing_target_integration")
             self.assertEqual(audit["new_files"][0]["activation"]["path"], "counter.py")
 
+    def test_unreachable_helper_is_rejected_then_real_call_passes_functional_check(self):
+        for body in ('    if False:\n        helper.fix(value)\n    return value\n',
+                     '    return value\n    helper.fix(value)\n',
+                     '    helper = lambda x: x\n    return helper(value)\n',
+                     '    helper.fix = lambda x: x\n    return helper.fix(value)\n'):
+            with self.subTest(body=body), GitFixture() as fixture:
+                case = replace(fixture.case(validation=True), files=('counter.py', 'helper.py'))
+                agent = AospBackportAgent(fixture.source_root, fixture.run_root, case)
+                agent.prepare()
+                (agent.worktree / 'helper.py').write_text('def fix(value):\n    return max(0, min(value, 10))\n')
+                (agent.worktree / 'counter.py').write_text('import helper\n\ndef normalize_count(value):\n' + body)
+                with self.assertRaises(CandidateRejected): agent.export_patch(1)
+                self.assertEqual(agent.record['new_file_audits']['1']['status'], 'FAIL')
+                self.assertIsNone(agent.record['patch_file'])
+                self.assertEqual(agent.record['patch_replay'], 'not_run')
+                (agent.worktree / 'counter.py').write_text(
+                    'import helper\n\ndef normalize_count(value):\n    return helper.fix(value)\n')
+                agent.export_patch(2)
+                audit = agent.record['new_file_audits']['2']
+                self.assertEqual(audit['status'], 'PASS')
+                self.assertEqual(audit['scope'], 'local_source_integration')
+                self.assertFalse(audit['production_reachability_proven'])
+                self.assertEqual(audit['new_files'][0]['activation']['binding']['target_source'], 'helper.py')
+                self.assertEqual(agent.verify()['status'], 'PASS')
+                self.assertEqual((fixture.repo / 'counter.py').read_text(), BASELINE)
+
     def test_export_records_independent_clean_replay(self):
         with GitFixture() as fixture:
             def edit_with_test(worktree):
                 write_counter(FIXED)(worktree)
-                (worktree / "test_counter.py").write_text("assert normalize_count(4) == 4\n")
+                (worktree / "test_counter.py").write_text("from counter import normalize_count\nassert normalize_count(4) == 4\n")
             runtime = ScriptedRuntime(fixture.assessment(), [edit_with_test])
             result = self.agent(fixture, runtime).run()
             self.assertEqual(result["patch_replay"], "pass")
@@ -607,7 +634,7 @@ class AgentTest(unittest.TestCase):
             runtime = ScriptedRuntime(fixture.assessment(), [stray_edit, corrected])
             result = self.agent(fixture, runtime, fixture.case(validation=True)).run(
                 verify=True, max_attempts=2)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             events = [e.get("event") for e in result["events"] if isinstance(e, dict)]
             self.assertIn("patch_export_rejected", events)
             self.assertEqual(len(result["attempts"]), 2)
@@ -801,7 +828,7 @@ class AgentTest(unittest.TestCase):
         "    pCur->ix = 0;\n"
         "    pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);\n")
     GUARD_HUNK_PATCH = (
-        "@@ -6,7 +6,7 @@\n"
+        "@@ -6,2 +6,2 @@\n"
         "   }else if( loc<0 ){\n"
         "-    pCur->curFlags &= ~BTCF_ValidNKey;\n"
         "+    pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);\n")
@@ -900,7 +927,7 @@ class AgentTest(unittest.TestCase):
                     for item in claims["contradictions"]),
                 claims["contradictions"])
 
-    def test_already_present_accepted_when_addition_shares_the_anchor_function(self):
+    def test_already_present_rejected_when_same_function_addition_is_in_another_branch(self):
         with GitFixture() as fixture:
             agent = self._guard_agent(fixture, self.GUARD_SAME_FUNCTION_FIX)
             claims = agent._check_hunk_results(
@@ -908,7 +935,8 @@ class AgentTest(unittest.TestCase):
                 "evidence=already_present tools=f3e8e566198a "
                 "target overwriteCell already clears both flags",
                 changed_files=[])
-            self.assertTrue(claims["ok"], claims["contradictions"])
+            self.assertFalse(claims["ok"], claims["contradictions"])
+            self.assertIn('different branch', '\n'.join(claims['contradictions']))
 
     def test_already_present_accepts_pure_reformat_hunk(self):
         # new16-par2/CVE-0000-340480881 lesson: a donor hunk that only
@@ -959,7 +987,7 @@ class AgentTest(unittest.TestCase):
             agent = self._guard_agent(fixture, baseline)
             agent._current_hunks = [{
                 "id": "f001-h001", "path": "guard.c",
-                "patch": ("@@ -6,7 +6,7 @@\n"
+                "patch": ("@@ -6,2 +6,2 @@\n"
                           "   }else if( loc<0 ){\n"
                           "-    pCur->curFlags &= ~BTCF_ValidNKey; /* keep */\n"
                           "+    pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);"
@@ -1013,7 +1041,7 @@ class AgentTest(unittest.TestCase):
             agent = self._guard_agent(fixture, self.GUARD_SIBLING)
             agent._current_hunks = [{
                 "id": "f001-h005", "path": "guard.c",
-                "patch": ("@@ -6,7 +6,7 @@\n"
+                "patch": ("@@ -6,2 +6,2 @@\n"
                           "   }else if( loc<0 ){\n"
                           "-    pCur->curFlags &= ~BTCF_ValidNKey;\n"
                           "+    pCur->curFlags &= ~(BTCF_ValidNKey|BTCF_ValidOvfl);"
@@ -1047,7 +1075,7 @@ class AgentTest(unittest.TestCase):
                 "id": "f004-h001",
                 "path": "wm/WindowProcessController.java",
                 "patch": (
-                    "@@ -727,7 +727,8 @@\n"
+                    "@@ -727,2 +727,3 @@\n"
                     "                 mInfo.packageName, appSwitchState, checkConfiguration,\n"
                     "-                hasActivityInVisibleTask(), "
                     "mInstrumentingWithBackgroundActivityStartPrivileges,\n"
@@ -1084,7 +1112,7 @@ class AgentTest(unittest.TestCase):
                 "id": "f006-h002",
                 "path": "services/am/ActivityManagerService.java",
                 "patch": (
-                    "@@ -3543,7 +3543,8 @@\n"
+                    "@@ -3543,1 +3543,2 @@\n"
                     "-                permitted = (applicationInfo != null && "
                     "applicationInfo.uid == uid) // own uid data\n"
                     "+                permitted = (applicationInfo != null && "
@@ -1166,11 +1194,8 @@ class AgentTest(unittest.TestCase):
                 any("f002-h001" in item for item in claims["contradictions"]),
                 claims["contradictions"])
 
-    def test_affected_platform_semantics_do_not_block_impact(self):
-        # seven-410ea70/CVE-2025-48550 lesson: when the harm path flows through
-        # documented standard-library semantics (java.io.File parent/child
-        # resolution), listing them as platform_semantics anchored at the
-        # executable target call site must not force AFFECTED down to UNKNOWN.
+    def test_platform_call_site_without_implementation_is_unresolved(self):
+        # A familiar API name does not substantiate the model's behavior claim.
         with GitFixture() as fixture:
             agent = self.agent(fixture)
             assessment = fixture.assessment("AFFECTED")
@@ -1187,7 +1212,8 @@ class AgentTest(unittest.TestCase):
                 "relied_at_evidence": [4],
             }]
             self._with_counter_hunk(agent)
-            agent._validate_impact_causality(assessment)
+            with self.assertRaisesRegex(AssessmentError, 'implementation_evidence'):
+                agent._validate_impact_causality(assessment)
 
     def test_platform_semantics_rejects_unanchored_api_name(self):
         # A libc-colliding bare name whose cited anchor never mentions the
@@ -1316,7 +1342,7 @@ class AgentTest(unittest.TestCase):
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(FIXED)])
             agent = self.agent(fixture, runtime, fixture.case(validation=True))
             result = agent.run(verify=True)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             # The impact turn ran while the worktree was still at the clean
             # baseline (r2 revision 1) and mechanical landing happened after.
             self.assertEqual((agent.worktree / "counter.py").read_text(), FIXED)
@@ -1334,25 +1360,26 @@ class AgentTest(unittest.TestCase):
                 {"stage": "upper_bound", "argv": [sys.executable, "-B", "check_upper.py"]}]}
         })
 
-    def test_passed_stages_are_skipped_while_patch_is_unchanged(self):
+    def test_passed_stages_rerun_without_a_closed_validation_input_set(self):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(PARTIAL), None])
             result = self.agent(fixture, runtime, self._staged_case(fixture)).run(
                 verify=True, max_attempts=2)
             self.assertEqual(result["status"], "VALIDATION_FAILED")
             commands = result["final_verification"]["commands"]
-            self.assertTrue(commands[0]["skipped_passed"])
+            self.assertFalse(commands[0].get("skipped_passed"))
+            self.assertIsNotNone(commands[0]["stdout_log"])
             self.assertEqual(commands[0]["returncode"], 0)
             self.assertIsNotNone(commands[1]["stdout_log"])
             self.assertEqual(result["verification_memory"]["passed_stages"], ["lower_bound"])
-            self.assertEqual(result["final_verification"]["skipped_stages"], ["lower_bound"])
+            self.assertEqual(result["final_verification"]["skipped_stages"], [])
 
     def test_patch_change_resets_verification_memory(self):
         with GitFixture() as fixture:
             runtime = ScriptedRuntime(fixture.assessment(), [write_counter(PARTIAL), write_counter(FIXED)])
             result = self.agent(fixture, runtime, self._staged_case(fixture)).run(
                 verify=True, max_attempts=2)
-            self.assertEqual(result["status"], "VALIDATED")
+            self.assertEqual(result["status"], "PATCH_UNVERIFIED")
             commands = result["final_verification"]["commands"]
             self.assertNotIn("skipped_passed", commands[0])
             self.assertEqual(result["final_verification"]["skipped_stages"], [])

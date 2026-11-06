@@ -2,6 +2,7 @@ import copy
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 from aosp_agent.diff_engine import DiffBackportAgent
 from engine_fixtures import BASELINE, FIXED, GitFixture, git
@@ -11,6 +12,19 @@ UNRELATED = BASELINE.replace('return value', 'return -value')
 
 
 class RepositoryRetryTest(unittest.TestCase):
+    def test_verifier_cleanup_barrier_stops_later_repositories(self):
+        from aosp_agent.validation_process import VerifierCleanupBlocked
+        with GitFixture() as fx:
+            agent, raw = self.setup_agent(fx, validation={'repo': [[sys.executable, 'verify_contract.py']]})
+            runtimes = self.attach(agent, raw, {'repo': [self.turn(agent, 'repo')],
+                                              'repo2': [self.turn(agent, 'repo2')]})
+            with patch('aosp_agent.engine.run_check', side_effect=VerifierCleanupBlocked('unverified group')):
+                with self.assertRaises(VerifierCleanupBlocked):
+                    agent.run(verify=True, max_attempts=1)
+            self.assertEqual(agent.record['status'], 'BLOCKED')
+            self.assertEqual(agent.children['repo'].record['status'], 'BLOCKED')
+            self.assertEqual(len(runtimes['repo2'].calls), 0)
+
     def setup_agent(self, fx, *, validation=None, joint=None):
         git(fx.source_root, 'clone', '-q', '--no-hardlinks', str(fx.repo), str(fx.source_root / 'repo2'))
         path = fx.root / 'input.patch'
@@ -104,7 +118,7 @@ class RepositoryRetryTest(unittest.TestCase):
                 'repo2': [self.turn(agent, 'repo2'),
                           (repair, lambda cwd: (cwd / 'repo2/counter.py').write_text(FIXED + '# coordinated\n'))]})
             result = agent.run(max_attempts=2, verify=True)
-            self.assertEqual(result['status'], 'VALIDATED', result)
+            self.assertEqual(result['status'], 'PATCH_UNVERIFIED', result)
             self.assertEqual(result['joint_attempt'], 2)
             self.assertEqual(result['joint_attempt_results'][0]['status'], 'FAIL')
             self.assertEqual(result['combined_verification'], 'PASS')

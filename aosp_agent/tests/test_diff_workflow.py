@@ -172,7 +172,9 @@ class DiffWorkflowTest(unittest.TestCase):
             raw = self.assessment(agent, 'ALREADY_FIXED')
             raw['units'][0]['absence_basis'] = 'equivalent_protection'
             raw['units'][0]['evidence'][0]['excerpt'] = FIXED.strip()
-            agent.factory = QueueRuntime([(raw, None)]).factory
+            from test_exclusion_review import ExclusionReviewTest
+            reviewer = ExclusionReviewTest()
+            reviewer.wire(agent, [raw], [reviewer.review(agent, 'CONFIRMED_PROTECTED')])
             result = agent.run()
             self.assertEqual(result['status'], 'ALREADY_FIXED')
             self.assertFalse(agent.workspace.exists())
@@ -210,7 +212,8 @@ class DiffWorkflowTest(unittest.TestCase):
             agent.factory = runtime.factory
             result = agent.run(verify=True)
             self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
-            self.assertEqual(result['verification']['repo']['stages'], {'source_contract': 'PASS'})
+            self.assertEqual(result['verification']['repo']['stages'], {})
+            self.assertEqual(result['verification']['repo']['status'], 'NOT_CONFIGURED')
             self.assertFalse(result['verification']['repo']['sufficient_for_validated'])
             plan = json.loads((agent.run_dir / 'validation-plans/repo/plan.json').read_text())
             self.assertEqual(plan['provenance'][0]['terms'], ['max', 'min'])
@@ -226,7 +229,7 @@ class DiffWorkflowTest(unittest.TestCase):
             agent.factory = QueueRuntime([(self.assessment(agent), None),
                 (self.coverage(agent), lambda cwd: (cwd / 'repo/counter.py').write_text(FIXED))]).factory
             result = agent.run(verify=True)
-            self.assertEqual(result['status'], 'VALIDATED')
+            self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
             self.assertTrue(any('contract verified' in c['stdout'] for c in result['verification']['repo']['commands']))
 
     def test_text_diff_uses_backend_hunk_ledger_before_verification(self):

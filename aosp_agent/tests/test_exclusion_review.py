@@ -1,3 +1,5 @@
+# Executor regression fixtures explicitly select the legacy exhaustive adapter.
+# Default project-first entrypoints are covered by test_runtime_entrypoints.py.
 """Generic old/new representation regressions, without CVE labels or exploits."""
 import copy
 from dataclasses import replace
@@ -24,7 +26,7 @@ class ExclusionReviewTest(unittest.TestCase):
         if dataset:
             case = replace(fx.case(), target_commit=git(fx.repo, 'rev-parse', 'HEAD'))
             return from_case(case, fx.source_root, fx.run_root, auto_validation=False,
-                             model='writer', mapping_model='mapper')
+                             model='writer', mapping_model='mapper', exhaustive_discovery=True)
         return DiffBackportAgent(workflow.diff('new/metrics.py', BASELINE, FIXED).encode(),
                                  fx.source_root, fx.run_root, auto_validation=False,
                                  model='writer', mapping_model='mapper')

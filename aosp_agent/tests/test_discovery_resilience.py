@@ -121,26 +121,32 @@ class DiscoveryResilienceTest(unittest.TestCase):
             raw = workflow.DiffWorkflowTest().assessment(agent, 'ALREADY_FIXED')
             raw['units'][0]['absence_basis'] = 'equivalent_protection'
             raw['units'][0]['evidence'][0]['excerpt'] = FIXED.strip()
-            agent.factory = workflow.QueueRuntime([(raw, None)]).factory
+            from test_exclusion_review import ExclusionReviewTest
+            reviewer = ExclusionReviewTest()
+            reviewer.wire(agent, [raw], [reviewer.review(agent, 'CONFIRMED_PROTECTED')])
             result = agent.run()
             self.assertEqual(result['status'], 'INCONCLUSIVE')
             self.assertEqual(result['impact_decision'], 'UNKNOWN')
             self.assertEqual(result['available_scope_impact'], 'ALREADY_FIXED')
 
     def test_two_repo_joint_pass_does_not_hide_unavailable_third_repo(self):
-        with GitFixture() as fx:
+        for build in (False, True):
+          with self.subTest(build=build), GitFixture() as fx:
             helper = joint.JointValidationTest()
             checker = helper.script(fx, 'joint.py',
                 f'from pathlib import Path\nassert all(Path(k, "counter.py").read_text() == {FIXED!r} for k in ("repo", "repo2"))\n')
+            runner = helper.build_runner(fx) if build else None
+            validation = {k: ([{'stage': 'android_module_build', 'argv': [str(runner), 'module_' + k]}]
+                             if build else [[sys.executable, '-B', 'verify_contract.py']]) for k in ('repo', 'repo2')}
             with self.unavailable(self.peer(fx)):
-                agent = helper.controller(fx, joint=[[sys.executable, str(checker)]],
-                    validation={k: [[sys.executable, '-B', 'verify_contract.py']] for k in ('repo', 'repo2')})
+                agent = helper.controller(fx, joint=[[sys.executable, str(checker)]], runner=runner,
+                    validation=validation)
             result = agent.run(verify=True, max_attempts=1)
             self.assertEqual(result['combined_verification'], 'PASS')
             self.assertEqual(set(result['patches']), {'repo', 'repo2'})
             self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
             self.assertEqual(result['completion_blocked_by'], 'INCOMPLETE_REPOSITORY_INVENTORY')
-            self.assertEqual(result['available_scope_status'], 'VALIDATED')
+            self.assertEqual(result['available_scope_status'], 'VALIDATED' if build else 'PATCH_UNVERIFIED')
             self.assertEqual((fx.repo / 'counter.py').read_text(), BASELINE)
             self.assertEqual((fx.source_root / 'repo2/counter.py').read_text(), BASELINE)
 
@@ -213,7 +219,9 @@ class DiscoveryResilienceTest(unittest.TestCase):
             raw = workflow.DiffWorkflowTest().assessment(agent, 'ALREADY_FIXED')
             raw['units'][0]['absence_basis'] = 'equivalent_protection'
             raw['units'][0]['evidence'][0]['excerpt'] = FIXED.strip()
-            agent.factory = workflow.QueueRuntime([(raw, None)]).factory
+            from test_exclusion_review import ExclusionReviewTest
+            reviewer = ExclusionReviewTest()
+            reviewer.wire(agent, [raw], [reviewer.review(agent, 'CONFIRMED_PROTECTED')])
             original = discovery.local_git
             def read(root, *args, **kwargs):
                 if args[0] == 'grep':

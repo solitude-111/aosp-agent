@@ -9,6 +9,8 @@ import time
 from .engine import _safe_env
 from .validation_plan import normalize_checks
 from .validation_process import run_check
+from .verification_evidence import validation_policy
+from .delivery import CANDIDATE_STATUSES, update_delivery
 
 
 def prepare_joint(controller, deferred):
@@ -77,23 +79,28 @@ def verify_joint(controller):
     from .diff_engine import _write
     checks = controller.joint_plan['checks']
     if not checks:
-        return {'status': 'NOT_CONFIGURED', 'sufficient_for_validated': False, 'commands': []}
+        policy = validation_policy([], controller.joint_plan['required_repositories'], expected_checks=0)
+        return {'status': 'NOT_CONFIGURED', 'sufficient_for_validated': False, 'commands': [],
+                'policy': policy, 'uncovered_repositories': policy['missing_build_repositories']}
     controller._audit()
     bundle = candidate_bundle(controller)
+    identity = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
+    controller.record['candidate_bundle_sha256'] = identity
     path = controller.run_dir / 'joint-patch-bundle.json'
     _write(path, bundle)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     controller._protect(path)
     attempt = controller.record.get('joint_attempt', 0) + 1
     controller.record['joint_attempt'] = attempt
-    results, covered = [], set()
+    results = []
     # Local checks may depend on another candidate. Recheck against the final
     # vector, and include that vector in the cache key so no earlier PASS leaks.
     for key, child in controller.children.items():
         if not child.case.files:
             continue
         child.record['verification_context'] = digest
-        local = child.verify()
+        from .lifecycle import operation_lease
+        local = child.verify(_source_lease=operation_lease(controller))
         child.record['final_verification'] = local
         child._write_record()
         controller.record.setdefault('verification', {})[key] = local
@@ -106,6 +113,8 @@ def verify_joint(controller):
             _write(controller.run_dir / 'joint-verification.json', result)
             return result
     for number, check in enumerate(checks, 1):
+        from .output_budget import require_output_record
+        require_output_record(controller.run_dir / 'run.json')
         controller._audit()
         if candidate_bundle(controller) != bundle:
             raise RuntimeError('candidate changed before joint verification')
@@ -137,14 +146,16 @@ def verify_joint(controller):
             stdout, stderr, code = run_check(check['argv'], controller.workspace, env)
         except OSError as exc:
             stdout, stderr, code = '', str(exc), 127
+        build_receipt_verified = False
         if check['stage'] == 'android_module_build' and code == 0:
             receipt = controller.run_dir / 'module-build-restore/bundle.json'
             try:
                 evidence = json.loads(receipt.read_text())
             except (OSError, ValueError):
                 evidence = {}
-            if (evidence.get('bundle_sha256') != digest or evidence.get('validation_id') != nonce
-                    or evidence.get('restore') != 'PASS' or evidence.get('build_returncode') != 0):
+            build_receipt_verified = (evidence.get('bundle_sha256') == digest and evidence.get('validation_id') == nonce
+                    and evidence.get('restore') == 'PASS' and evidence.get('build_returncode') == 0)
+            if not build_receipt_verified:
                 code = 125
                 stderr += '\nmissing fresh successful build/apply/restore receipt for this exact bundle'
         artifacts = []
@@ -157,23 +168,25 @@ def verify_joint(controller):
                 code = code or 125
                 stderr += '\nmissing joint artifact: ' + name
         stem = f'joint-validation-{attempt}-{number}'
-        (controller.run_dir / (stem + '.stdout')).write_text(stdout)
-        (controller.run_dir / (stem + '.stderr')).write_text(stderr)
+        from .output_budget import write_text
+        write_text(controller.run_dir / (stem + '.stdout'), stdout)
+        write_text(controller.run_dir / (stem + '.stderr'), stderr)
         results.append({'stage': check['stage'], 'argv': check['argv'], 'covers': check['covers'],
                         'returncode': code, 'stdout': stdout[-10000:], 'stderr': stderr[-10000:],
                         'stdout_log': stem + '.stdout', 'stderr_log': stem + '.stderr',
-                        'elapsed_seconds': round(time.monotonic() - started, 3), 'artifacts': artifacts})
+                        'elapsed_seconds': round(time.monotonic() - started, 3), 'artifacts': artifacts,
+                        'build_receipt_verified': build_receipt_verified})
         controller._audit()
         if candidate_bundle(controller) != bundle:
             raise RuntimeError('joint validation mutated the candidate bundle')
         if code:
             break
-        if check['stage'] != 'source_contract':
-            covered.update(check['covers'])
     passed = all(r['returncode'] == 0 for r in results)
+    policy = validation_policy(results, controller.joint_plan['required_repositories'], expected_checks=len(checks))
     result = {'status': 'PASS' if passed else 'FAIL', 'commands': results, 'bundle_sha256': digest,
-              'sufficient_for_validated': passed and covered == set(controller.joint_plan['required_repositories']),
-              'uncovered_repositories': sorted(set(controller.joint_plan['required_repositories']) - covered),
+              'candidate_bundle_sha256': identity,
+              'sufficient_for_validated': policy['satisfied'], 'policy': policy,
+              'uncovered_repositories': policy['missing_build_repositories'],
               'scope': controller.joint_plan['scope'], 'runtime_security_proven': False}
     _write(controller.run_dir / 'joint-verification.json', result)
     return result
@@ -181,7 +194,7 @@ def verify_joint(controller):
 
 def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
     # This does not turn a partial migration or a failed independent gate green.
-    if controller.record['status'] not in ('VALIDATED', 'PATCH_UNVERIFIED'):
+    if controller.record['status'] not in CANDIDATE_STATUSES:
         return
     count = len(controller.joint_plan['required_repositories'])
     if count > 1:
@@ -203,7 +216,7 @@ def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
                 max_attempts=max_attempts, feedback={'joint_verification': result,
                     'scope': 'failure belongs to this declared group; repository blame is not established'})
         collect_results(controller, assessment)
-        if controller.record['status'] not in ('VALIDATED', 'PATCH_UNVERIFIED'):
+        if controller.record['status'] not in CANDIDATE_STATUSES:
             result = {**result, 'repair_status': controller.record['status']}
             break
         result = verify_joint(controller)
@@ -217,21 +230,33 @@ def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
             controller.record[layer] = ('FAIL' if any(c['returncode'] for c in checks) else
                                          'PASS' if covered == required else 'PARTIAL')
     if result['status'] == 'FAIL':
-        if controller.record['status'] in ('VALIDATED', 'PATCH_UNVERIFIED'):
+        if controller.record['status'] in CANDIDATE_STATUSES:
             controller.record['status'] = 'VALIDATION_FAILED'
     elif result.get('sufficient_for_validated'):
         controller.record['status'] = 'VALIDATED'
-        if controller.donor['status'] == 'VERIFIED':
-            assess_joint_impact(controller)
+    if verify and controller.record['status'] in CANDIDATE_STATUSES:
+        assess_joint_impact(controller)
+    elif not verify:
+        controller.record['post_fix_review'] = {'status': 'NOT_REQUESTED'}
+    update_delivery(controller.record)
 
 
 def assess_joint_impact(controller):
-    """Retain the donor backend's optional business-impact review after joint success."""
+    """Review the exact final vector regardless of source-input packaging."""
     from .git_policy import OFFLINE_GIT_ENV
     from .prompts import SYSTEM
     bundle = candidate_bundle(controller)
+    bundle_digest = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
+    controller.record['candidate_bundle_sha256'] = bundle_digest
+    statuses = {}
     for key, child in controller.children.items():
-        if not child.case.files or child.record.get('post_fix_patch_sha256') == child.record.get('patch_sha256'):
+        if not child.case.files:
+            continue
+        previous = child.record.get('post_fix_impact') or {}
+        if (child.record.get('post_fix_patch_sha256') == child.record.get('patch_sha256')
+                and child.record.get('post_fix_bundle_sha256') == bundle_digest
+                and previous and not previous.get('error')):
+            statuses[key] = 'COMPLETED'
             continue
         factory = child.runtime_factory
         if factory is None:
@@ -240,17 +265,31 @@ def assess_joint_impact(controller):
         try:
             with factory(events_path=child.run_dir / 'sdk-post-fix.jsonl', model=child.model,
                          model_provider=child.model_provider, turn_timeout=child.turn_timeout,
-                         env=OFFLINE_GIT_ENV) as runtime:
-                runtime.start(child.worktree, SYSTEM + '\nRead-only review of the exact validated candidate bundle.')
+                         env=OFFLINE_GIT_ENV, read_scope=child.model_scope(read_only=True)) as runtime:
+                runtime.start(child.worktree, SYSTEM + '\nRead-only review of the exact candidate bundle and recorded verification evidence.')
                 child.assess_post_fix(runtime, child._render_patch(),
-                    '\nJoint verification scope: configured checks only; Android runtime security is not proven.\n'
-                    + json.dumps(bundle, ensure_ascii=False))
+                    '\nFinal bundle (review all affected repositories and source steps together):\n'
+                    + json.dumps(bundle, ensure_ascii=False) + '\nActual combined verification evidence:\n'
+                    + json.dumps({k: controller.record.get('joint_verification', {}).get(k)
+                                  for k in ('status', 'policy', 'sufficient_for_validated')})
+                    + controller._donor_tools_context()
+                    + '\nNo Android runtime security proof is implied.\n')
         except Exception as exc:
             child.record['post_fix_impact'] = {'error': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))[:200]}
         finally:
             controller._audit()
             if candidate_bundle(controller) != bundle:
                 raise RuntimeError('post-fix review mutated the validated candidate bundle')
+        child.record['post_fix_bundle_sha256'] = bundle_digest
+        statuses[key] = 'FAILED' if child.record.get('post_fix_impact', {}).get('error') else 'COMPLETED'
         child._write_record()
     controller.record['post_fix_impact'] = {key: c.record.get('post_fix_impact') for key, c in controller.children.items()
                                           if c.case.files}
+    controller.record['post_fix_review'] = {'status': 'COMPLETED' if statuses and all(
+        v == 'COMPLETED' for v in statuses.values()) else 'INCOMPLETE',
+        'repositories': statuses, 'bundle_sha256': bundle_digest,
+        'patches': {entry['key']: entry['sha256'] for entry in bundle['repositories']},
+        'scope': 'model_business_impact_review', 'runtime_security_proven': False}
+    controller.record['repository_statuses'] = {key: child.record['status']
+        for key, child in controller.children.items() if child.case.files}
+    update_delivery(controller.record)

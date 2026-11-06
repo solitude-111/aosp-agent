@@ -1,32 +1,38 @@
 """Conservative source-integration evidence; not a whole-program reachability proof."""
-import ast
 import re
 import xml.etree.ElementTree as ET
 
-from .discovery import functions
+from .activation_flow import python_activation, tree_activation
+from .patches import text_hunks
 
 
 def added_numbers(hunks):
-    numbers = set()
-    for hunk in hunks:
-        current = None
-        for line in hunk['patch'].splitlines():
-            header = re.match(r'^@@ -\d+(?:,\d+)? \+(\d+)', line)
-            if header:
-                current = int(header[1])
-            elif current is not None:
-                if line.startswith('+'):
-                    numbers.add(current)
-                    current += 1
-                elif line.startswith(' '):
-                    current += 1
-    return numbers
+    return {line['new_line'] for unit in hunks for hunk in text_hunks(unit['patch'])
+            for line in hunk['lines'] if line['marker'] == '+'}
 
 
-def activation(path, baseline, candidate, hunks, identities):
+def activation(path, baseline, candidate, hunks, identities, *, new_source):
+    """Production entry point: an actual new source and bound edge are required."""
+    from .case import validate_relative_path
+    if not isinstance(new_source, dict) or not isinstance(new_source.get('text'), str):
+        raise ValueError('new-file activation requires the actual new source text and path')
+    validate_relative_path(new_source.get('path'))
+    if max(len(text.encode()) for text in (baseline, candidate, new_source['text'])) > 4 * 1024 * 1024:
+        return None
+    return _activation(path, baseline, candidate, hunks, identities, new_source=new_source)
+
+
+def local_flow_probe(path, baseline, candidate, hunks, identities):
+    """Diagnostic-only flow filter. Its NOT_CHECKED binding cannot pass export."""
+    return _activation(path, baseline, candidate, hunks, identities)
+
+
+def _activation(path, baseline, candidate, hunks, identities, *, new_source=None):
     """Return an added call in an existing function or a new manifest component.
 
-    No credit for comments, log strings, type declarations, imports, tests,
+    The production gate supplies new_source={path, text}; names-only callers
+    obtain a flow probe explicitly marked binding NOT_CHECKED, never a bound
+    production-file result. No credit for comments, log strings, imports, tests,
     build inclusion or newly invented caller functions. Unsupported dynamic
     registration requires a future typed evidence adapter and fails closed here.
     """
@@ -36,47 +42,43 @@ def activation(path, baseline, candidate, hunks, identities):
     if path.endswith('AndroidManifest.xml'):
         try:
             def components(text):
-                return {(node.tag, node.get('{http://schemas.android.com/apk/res/android}name'))
-                        for node in ET.fromstring(text).iter()
-                        if node.tag in {'activity', 'service', 'receiver', 'provider', 'application'}}
-            for tag, name in sorted(components(candidate) - components(baseline)):
-                if name and name.rsplit('.', 1)[-1] in names:
+                android = '{http://schemas.android.com/apk/res/android}'
+                result = {}
+                for app in ET.fromstring(text).iter('application'):
+                    if app.get(android + 'enabled', 'true').lower() == 'false': continue
+                    for node in (app, *list(app)):
+                        if node.tag not in {'activity', 'service', 'receiver', 'provider', 'application'}: continue
+                        if node.get(android + 'enabled', 'true').lower() == 'false': continue
+                        result[(node.tag, node.get(android + 'name'))] = [value for value in
+                            (app.get(android + 'enabled', 'true'), node.get(android + 'enabled', 'true'))
+                            if value.lower() != 'true']
+                return result
+            before, after = components(baseline), components(candidate)
+            for tag, name in sorted(set(after) - set(before), key=str):
+                if name and (new_source or name.rsplit('.', 1)[-1] in names):
+                    binding = None
+                    if new_source:
+                        from .activation_binding import manifest_binding
+                        binding = manifest_binding(new_source['path'], new_source['text'], name,
+                                                   ET.fromstring(candidate).get('package', ''))
+                        if not binding: continue
                     return {'path': path, 'kind': 'manifest_component', 'identifier': name,
-                            'component': tag}
+                            'component': tag, 'scope': 'manifest_registration_only',
+                            'unresolved_conditions': after[(tag, name)], 'production_reachability_proven': False,
+                            'binding': binding or {'status': 'NOT_CHECKED'}}
         except ET.ParseError:
             return None
         return None
-    old_functions = {f['symbol'] for f in functions(baseline, '.' + suffix)}
-    scopes = [f for f in functions(candidate, '.' + suffix) if f['symbol'] in old_functions]
-    if suffix == 'py':
-        try:
-            tree = ast.parse(candidate)
-        except SyntaxError:
-            return None
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or node.lineno not in changed:
-                continue
-            call = node.func
-            tokens = {n.id for n in ast.walk(call) if isinstance(n, ast.Name)}
-            tokens.update(n.attr for n in ast.walk(call) if isinstance(n, ast.Attribute))
-            for scope in scopes:
-                if scope['line_start'] < node.lineno <= scope['line_end'] and tokens & names:
-                    return {'path': path, 'kind': 'call_in_existing_function',
-                            'function': scope['symbol'], 'line': node.lineno,
-                            'identifier': sorted(tokens & names)[0]}
+    if max(len(baseline.encode()), len(candidate.encode())) > 4 * 1024 * 1024:
+        return None  # No unbounded parser input or fallback to token matching.
+    try:
+        bind = None
+        if new_source:
+            from .activation_binding import binding_for
+            if len(new_source['text'].encode()) > 4 * 1024 * 1024: return None
+            bind = binding_for(new_source['path'], new_source['text'], path)
+            if bind is None: return None
+        check = python_activation if suffix == 'py' else tree_activation
+        return check(path, baseline, candidate, changed, names, bind=bind)
+    except RecursionError:
         return None
-    # Preserve line numbers while removing complete multiline comments/strings.
-    masked = re.sub(r'//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'',
-                    lambda m: ''.join('\n' if c == '\n' else ' ' for c in m[0]), candidate)
-    for number, code in enumerate(masked.splitlines(), 1):
-        if number not in changed or re.match(r'^\s*(?:import|package)\b', code):
-            continue
-        for scope in scopes:
-            if not scope['line_start'] < number <= scope['line_end']:
-                continue
-            for name in sorted(names):
-                # Constructor, direct call or Class.staticMethod(...).
-                if re.search(r'\b' + re.escape(name) + r'\s*(?:\.\s*[\w$]+\s*)?\(', code):
-                    return {'path': path, 'kind': 'call_in_existing_function',
-                            'function': scope['symbol'], 'line': number, 'identifier': name}
-    return None

@@ -2,20 +2,26 @@
 
 Given a validated fix patch and two AOSP tags, determine whether the
 validation result on the newer tag can be inherited by the older tag,
-or whether re-testing is required. The analysis is deterministic first
-(tag diff + function overlap check); the model is only consulted when
-the deterministic check finds relevant overlap.
+or whether re-testing is required. Line overlap is a review hint, never proof
+of behavioral independence. This command reports revision compatibility;
+it does not import validation receipts.
 """
 from __future__ import annotations
 
 import json
 import re
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from .prompts import SYSTEM
 from .git_policy import OFFLINE_GIT_ENV
+from .case import validate_relative_path
+
+
+class InheritanceReadError(RuntimeError):
+    kind = 'READ_FAILED'
 
 
 INHERIT_SCHEMA = {
@@ -35,16 +41,16 @@ INHERIT_SCHEMA = {
 
 
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    env = {**OFFLINE_GIT_ENV,
-           "PATH": "/usr/bin:/bin", "HOME": str(Path.home())}
-    return subprocess.run(["git", "-c", "protocol.allow=never", "-c",
-                           "core.hooksPath=/dev/null", "-C", str(repo), *args],
-                          text=True, capture_output=True, check=check, env=env, timeout=120)
+    from .discovery import local_git
+    try:
+        return local_git(repo, *args, check=check, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise InheritanceReadError('Cannot read inheritance evidence: ' + str(exc)) from exc
 
 
 def resolve_tag(repo: Path, tag: str) -> str:
     """Map an Android tag name (or raw SHA) to a commit SHA."""
-    result = _git(repo, "rev-parse", "--verify", f"{tag}^{{commit}}", check=False)
+    result = _git(repo, "rev-parse", "--verify", '--end-of-options', f"{tag}^{{commit}}", check=False)
     if result.returncode != 0:
         raise ValueError(f"tag not found in repository: {tag}")
     return result.stdout.strip()
@@ -54,10 +60,14 @@ def compute_tag_diff(repo: Path, tag1_sha: str, tag2_sha: str,
                      files: list[str]) -> str:
     """Diff the case-relevant files between two tag commits."""
     if not files:
-        return ""
+        raise ValueError('inheritance requires a nonempty relevant-file scope')
+    for path in files:
+        validate_relative_path(path)
     result = _git(repo, "diff", "--no-ext-diff", "-U3",
                   f"{tag1_sha}..{tag2_sha}", "--", *files, check=False)
-    return result.stdout if result.returncode == 0 else ""
+    if result.returncode:
+        raise InheritanceReadError('Cannot read inter-tag diff (exit ' + str(result.returncode) + '): ' + result.stderr[:1000])
+    return result.stdout
 
 
 def extract_hunk_positions(diff_text: str) -> dict[str, list[tuple[int, int]]]:
@@ -113,7 +123,7 @@ def inherit_prompt(cve: str, fix_diff: str, tag_diff: str,
                    tag1: str, tag2: str, files: list[str]) -> str:
     return f"""Analyze whether a fix validated on {tag1} can be inherited by {tag2} for {cve}.
 
-The fix patch (validated on {tag1}, passed compilation and contract checks):
+The caller-supplied fix patch for {tag1} (validation receipts are not supplied to this analysis):
 ```diff
 {fix_diff[:15000]}
 ```
@@ -128,8 +138,11 @@ Files relevant to the fix: {', '.join(files)}
 Your task: determine if the tag-to-tag differences affect the fix's validity on {tag2}.
 
 Rules:
-- If the differences are in completely unrelated functions or sections, the fix
-  can be inherited without re-testing (INHERIT).
+- Non-overlapping line ranges alone do not establish unrelated behavior. A
+  constant, helper, caller, build flag or permission check can alter the fix.
+- Do not infer validation success from this patch or from the caller's label.
+- Recommend INHERIT only if dependency and configuration equivalence is
+  evidenced; otherwise use CONDITIONAL or RE_TEST and name the missing checks.
 - If the differences touch the same functions or data structures the fix modifies
   or depends on, full re-validation is needed (RE_TEST).
 - If the relationship is uncertain but limited in scope, recommend specific tests
@@ -151,12 +164,52 @@ def analyze_inheritance(cve: str, fix_patch_path: Path, source_root: Path,
                         tag1: str, tag2: str,
                         model: str | None = None,
                         model_provider: str | None = None,
-                        turn_timeout: float = 900) -> dict[str, Any]:
+                        turn_timeout: float = 900, *, run_root: Path | None = None,
+                        max_output_bytes: int = 256 * 1024 * 1024) -> dict[str, Any]:
+    """Analyze read-only source; keep every result/event in a unique external run.
+
+    Invalid output placement is rejected before creating any files. The default
+    is cwd/runs/inherit, as with the other CLI task roots; callers running inside
+    a source tree must explicitly choose an external root.
+    """
+    source_root = Path(source_root).resolve()
+    output_root = Path(run_root if run_root is not None else Path.cwd() / 'runs/inherit').resolve()
+    if output_root.is_relative_to(source_root):
+        raise ValueError('inheritance run root must be outside source_root')
+    output_root.mkdir(parents=True, exist_ok=True)
+    run_dir = Path(tempfile.mkdtemp(prefix='inherit-', dir=output_root)).resolve()
+    from .output_budget import create_budget, write_json
+    output_budget = create_budget(run_dir, max_output_bytes)
+    result_path, events_path = run_dir / 'inherit-result.json', run_dir / 'inherit-events.jsonl'
+    try:
+        result = _analyze_inheritance(cve, Path(fix_patch_path), source_root, repository, files,
+                                      tag1, tag2, model, model_provider, turn_timeout,
+                                      events_path=events_path)
+        result.update(result_file=str(result_path), events_file=str(events_path) if events_path.exists() else None)
+        output_budget.check()
+        write_json(result_path, result, control=True)
+        output_budget.check()
+    except Exception as exc:
+        # Preserve diagnostics without touching the input patch's directory.
+        # The API still raises; callers cannot confuse this with a verdict.
+        write_json(result_path, {'verdict': 'ERROR', 'error_type': type(exc).__name__}, control=True)
+        exc.inheritance_result_file = str(result_path)
+        raise
+    return result
+
+
+def _analyze_inheritance(cve: str, fix_patch_path: Path, source_root: Path,
+                        repository: str, files: list[str], tag1: str, tag2: str,
+                        model: str | None, model_provider: str | None,
+                        turn_timeout: float, *, events_path: Path) -> dict[str, Any]:
     """Run the full inheritance analysis pipeline.
 
     Returns the structured verdict dict.
     """
+    source_root = Path(source_root).resolve()
     repo = (source_root / repository).resolve()
+    if not repo.is_relative_to(source_root):
+        raise ValueError('repository must remain inside source_root')
     if not repo.is_dir():
         raise ValueError(f"repository not found: {repo}")
 
@@ -170,49 +223,65 @@ def analyze_inheritance(cve: str, fix_patch_path: Path, source_root: Path,
 
     # Phase 2: Compute inter-tag diff on relevant files
     tag_diff = compute_tag_diff(repo, tag1_sha, tag2_sha, files)
+    context = {'tags': {'tag1': tag1, 'tag1_sha': tag1_sha, 'tag2': tag2, 'tag2_sha': tag2_sha},
+               'scope': 'repository_revision_compatibility', 'validation_inherited': False,
+               'limitations': ['No build environment or dependency closure was compared.',
+                              'No prior validation receipt was supplied or reused.']}
 
     # Phase 3: Deterministic check
-    if not tag_diff.strip():
+    if tag1_sha == tag2_sha:
         return {
             "verdict": "INHERIT",
             "confidence": "high",
             "tag_diff_summary": f"No differences in relevant files between {tag1} and {tag2}.",
             "overlap_analysis": "Not applicable - no tag differences to analyze.",
             "tests_to_rerun": [],
-            "reasoning": f"The files touched by the fix are identical between {tag1} "
-                        f"and {tag2}. The validated fix applies and behaves the same way.",
-            "tags": {"tag1": tag1, "tag1_sha": tag1_sha, "tag2": tag2, "tag2_sha": tag2_sha},
+            "reasoning": 'Both names resolve to the same repository commit. This establishes code identity only; validation is not transferred.',
+            **context,
         }
+
+    if not tag_diff.strip():
+        return {'verdict': 'CONDITIONAL', 'confidence': 'low',
+                'tag_diff_summary': 'Selected files are identical; repository revisions differ.',
+                'overlap_analysis': 'No selected-file changes, but dependent files and build configuration may differ.',
+                'tests_to_rerun': ['target production build', 'fix-specific functional checks'],
+                'reasoning': 'Selected-file identity does not establish dependency or environment equivalence.',
+                **context}
 
     overlap = check_function_overlap(fix_diff, tag_diff)
     if not overlap["overlap"]:
         return {
-            "verdict": "INHERIT",
+            "verdict": "RE_TEST",
             "confidence": "high",
             "tag_diff_summary": f"Tag differences exist but do not overlap with the fix's "
                                 f"modified line ranges.",
             "overlap_analysis": f"Deterministic check found no line-range overlap between "
                                 f"the fix and the tag differences in: {', '.join(files)}",
-            "tests_to_rerun": [],
-            "reasoning": "The fix modifies line ranges that are distinct from the tag-to-tag "
-                        "differences. The changes are in different sections of the same files "
-                        "and are unlikely to interact.",
+            "tests_to_rerun": ['target production build', 'fix-specific functional checks'],
+            "reasoning": 'Different line ranges can share constants, helpers, callers or control flow. Non-overlap cannot authorize validation inheritance.',
             "overlap_detail": overlap["details"],
-            "tags": {"tag1": tag1, "tag1_sha": tag1_sha, "tag2": tag2, "tag2_sha": tag2_sha},
+            **context,
         }
 
     # Phase 4: Model analysis (overlap found, need semantic judgment)
     from .sdk_runtime import CodexRuntime
-    events_path = fix_patch_path.parent / "inherit-events.jsonl"
+    from .sandbox_scope import source_scope
     with CodexRuntime(events_path=events_path, model=model,
                       model_provider=model_provider, turn_timeout=turn_timeout,
-                      env=OFFLINE_GIT_ENV) as runtime:
+                      env=OFFLINE_GIT_ENV, read_scope=source_scope(fix_patch_path, [repo], tool_repositories={
+                          'tag1': {'root': str(repo), 'head': tag1_sha},
+                          'tag2': {'root': str(repo), 'head': tag2_sha}})) as runtime:
         runtime.start(str(repo), SYSTEM + "\nCross-tag inheritance analysis is read-only.")
         prompt = inherit_prompt(cve, fix_diff, tag_diff, tag1, tag2, files)
         result = runtime.run(prompt, read_only=True, output_schema=INHERIT_SCHEMA)
         output = result.get("output") or json.loads(result.get("final_response", "{}"))
 
     output["overlap_detail"] = overlap["details"]
-    output["tags"] = {"tag1": tag1, "tag1_sha": tag1_sha,
-                      "tag2": tag2, "tag2_sha": tag2_sha}
+    output.update(context)
+    if output['verdict'] == 'INHERIT':
+        output['model_recommendation'] = 'INHERIT'
+        output.update(verdict='CONDITIONAL', confidence='low')
+        output['reasoning'] += '\nController: no closed dependency/environment identity or reusable validation receipt proves inheritance.'
+        output['tests_to_rerun'] = sorted(set(output.get('tests_to_rerun', []) +
+            ['target production build', 'fix-specific functional checks']))
     return output

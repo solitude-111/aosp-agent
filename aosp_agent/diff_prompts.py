@@ -1,5 +1,7 @@
 """Diff-only contracts: complete change coverage, grounded mappings, explicit unknowns."""
 import json
+from copy import deepcopy
+from .prompts import IMPACT_SCHEMA
 
 
 def obj(properties):
@@ -29,6 +31,21 @@ UNIT = obj({'id': STRING, 'status': enum('AFFECTED', 'NOT_AFFECTED', 'ALREADY_FI
             'candidate_resolution': STRING})
 ASSESSMENT_SCHEMA = obj({'reasoning': STRING, 'limitations': array(STRING), 'units': array(UNIT),
                          'new_files': array(obj({'path': STRING, 'anchor_path': STRING, 'reason': STRING}))})
+ASSESSMENT_SCHEMA['properties']['repository_requests'] = array(obj({
+    'repository': STRING, 'unit_id': STRING, 'reason': STRING, 'evidence': array(EVIDENCE)}))
+ASSESSMENT_SCHEMA['properties']['scope_closure'] = obj({'units': array(obj({
+    'unit_id': STRING, 'security_operation': STRING, 'entrypoint_and_flow': STRING,
+    'dependencies_checked': array(STRING), 'unresolved_questions': array(STRING), 'evidence': array(EVIDENCE),
+    'proof_steps': array(obj({'role': enum('entrypoint', 'state_flow', 'security_condition', 'dependency'),
+                             'reasoning': STRING, 'evidence': array({'type': 'integer', 'minimum': 1})}))}))})
+MAPPED_IMPACT_SCHEMA = deepcopy(IMPACT_SCHEMA)
+MAPPED_IMPACT_SCHEMA['properties']['evidence']['items']['properties']['unit_id'] = STRING
+MAPPED_IMPACT_SCHEMA['properties']['evidence']['items']['required'].append('unit_id')
+PROOF_GROUP = obj({'id': STRING, 'unit_ids': array(STRING), 'primary_unit_ids': array(STRING),
+    'impact': MAPPED_IMPACT_SCHEMA, 'support_links': array(obj({
+        'unit_id': STRING, 'supports': array(STRING), 'reason': STRING,
+        'evidence': array({'type': 'integer', 'minimum': 1})}))})
+ASSESSMENT_SCHEMA['properties']['proof_groups'] = array(PROOF_GROUP)
 MIGRATION_SCHEMA = obj({'summary': STRING, 'limitations': array(STRING), 'coverage': array(obj({
     'id': STRING, 'status': enum('implemented', 'not_required', 'unresolved'), 'explanation': STRING,
     'evidence': array(obj({'path': STRING, 'line_start': LINE, 'line_end': LINE, 'excerpt': STRING}))}))})
@@ -61,9 +78,18 @@ def assessment_prompt(diff, inventory, location):
     # Keep complete evidence on disk but bound repeated retrieval hints in model context.
     # The model can read any pinned target file; truncation never means absence.
     compact = {'units': [], 'issues': location['issues'][:40], 'issues_truncated': len(location['issues']) > 40,
-               'source_history': location['source_history'], 'target_history': location['target_history'][:8]}
+               'source_history': location['source_history'], 'target_history': location['target_history'][:8],
+               'retrieval_summary': location.get('retrieval_summary', {})}
     for unit in location['units']:
         compact['units'].append({k: unit[k] for k in ('id', 'old_path', 'new_path', 'status', 'before', 'after')})
+        retrieval = unit.get('retrieval', [])
+        compact['units'][-1].update(
+            retrieval=[{**{k: row[k] for k in ('repository', 'stage', 'project_search',
+                                              'scope_complete', 'absence_proven')},
+                        'queried_scope_count': len(row.get('queried_scopes', [])),
+                        'text_anchor_count': len(row.get('text_anchors', [])),
+                        'semantic_identity': 'UNASSESSED'} for row in retrieval[:12]],
+            retrieval_records_total=len(retrieval), retrieval_records_truncated=len(retrieval) > 12)
         compact['units'][-1]['candidates'] = [
             {**{k: c[k] for k in ('workspace_path', 'score', 'signals', 'symbols')},
              'windows': [{k: w[k] for k in ('line_start', 'line_end', 'function')} for w in c['windows'][:2]]}
@@ -76,8 +102,17 @@ UNAVAILABLE entries are diagnostic scope gaps, not searchable or mappable reposi
 retry object reads against them. Their absence from candidates proves nothing about impact.
 Account for cross-repository callers and dependencies; unresolved required dependencies mean UNKNOWN.
 Partial discovery cannot establish a global NOT_AFFECTED, ALREADY_FIXED or fully validated result.
-Work READ ONLY. Use git -C <original_root> show <head>:<path> and bounded git grep/log to investigate.
-Never checkout/reset/clean/commit/stage/fetch or modify an original repository. Set GIT_NO_LAZY_FETCH=1.
+Initial retrieval starts with exact files, then nearby directories, then an admitted project only
+when earlier text hints are insufficient. DEFERRED means NOT SEARCHED, not no matches. Even a
+complete old/new diff-side text match is only a candidate hint, not semantic identity or complete
+scope. Investigate competing implementations, callers and dependencies before conclusions. Use
+aosp_source search/paths with a literal path to expand within a directory first; omit path only
+when project-wide investigation is necessary. Request other projects through grounded scope expansion.
+Only retrieval counts/stages and bounded candidates are inlined; complete scopes and text-anchor
+coordinates remain in location.json. Truncated hints never imply missing implementations.
+Work READ ONLY. Use aosp_source view/search/paths/history with pinned revisions and repository
+selectors from run metadata. The controller enforces offline reads; no native shell is available.
+Never checkout/reset/clean/commit/stage/fetch or modify an original repository.
 Do not read sibling project files, prior runs, oracles, credentials or reference patches.
 
 ''' + KNOWLEDGE + '''

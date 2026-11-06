@@ -12,11 +12,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .case import Case, validate_relative_path
+from .impact_proof import AssessmentError, CausalityChecks
+from .lifecycle import source_guard
 from .git_policy import OFFLINE_GIT_ENV, offline_git_env
 from .diagnosis import apply_diagnosis, verification_diagnosis
 from .ladder import ladder_plan, strategy_prompt
 from .patch_repair import repair_hunk
-from .patches import split_hunks
+from .patches import split_hunks, text_hunks
 from .path_mapping import version_normalized_paths as _version_normalized_paths
 from .validation_process import run_check
 from .prompts import (IMPACT_SCHEMA, POST_FIX_SCHEMA, SYSTEM, backport_prompt,
@@ -36,10 +38,6 @@ _COMMON_DIFF_TOKENS = {
     "const", "else", "false", "for", "if", "int", "new", "null", "return",
     "static", "true", "void", "while",
 }
-_GUARDED_SOURCE_SUFFIXES = {
-    ".aidl", ".c", ".cc", ".cpp", ".cxx", ".go", ".h", ".hpp",
-    ".java", ".kt", ".kts", ".m", ".mm", ".proto", ".py", ".rs",
-}
 _TEST_PATH_COMPONENTS = {
     "benchmark", "benchmarks", "fuzz", "fuzzer", "fuzzers", "sample",
     "samples", "test", "testdata", "test_data", "testing", "tests",
@@ -52,10 +50,8 @@ _DECLARED_SOURCE_IDENTIFIER_RE = re.compile(
 
 def _changed_diff_lines(patch: str, added: bool) -> list[str]:
     prefix = "+" if added else "-"
-    return [
-        line[1:].strip() for line in patch.splitlines()
-        if line.startswith(prefix) and not line.startswith((prefix * 3, "---", "+++"))
-    ]
+    return [line['text'].strip() for hunk in text_hunks(patch)
+            for line in hunk['lines'] if line['marker'] == prefix]
 
 
 def _normalized_code_line(line: str) -> str:
@@ -72,7 +68,8 @@ def _semantic_tokens(lines: list[str]) -> set[str]:
 
 
 def _context_diff_lines(patch: str) -> list[str]:
-    return [line[1:].strip() for line in patch.splitlines() if line.startswith(" ")]
+    return [line['text'].strip() for hunk in text_hunks(patch)
+            for line in hunk['lines'] if line['marker'] == ' ']
 
 
 def _strip_comments(line: str) -> str:
@@ -160,49 +157,6 @@ def _claim_mechanism_tokens(reason: str, hunk_patch: str) -> set[str]:
     }
 
 
-_PLATFORM_API_PREFIXES = (
-    "java.", "javax.", "sun.", "libcore.", "kotlin.", "kotlinx.",
-    "org.json.", "org.w3c.dom.", "org.w3c.sax.", "org.xml.", "org.ietf.",
-)
-_PLATFORM_FQCN_RE = re.compile(
-    r"(?:java|javax|sun|libcore|kotlin|kotlinx|org\.json|org\.w3c\.dom|"
-    r"org\.w3c\.sax|org\.xml|org\.ietf)\.[A-Za-z_][A-Za-z0-9_]*"
-    r"(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
-_LIBC_SYMBOLS = frozenset({
-    "memcpy", "memmove", "memset", "memcmp", "strlen", "strcpy", "strncpy",
-    "strncmp", "strcmp", "strchr", "strrchr", "strstr", "strtol", "strtoul",
-    "atoi", "atol", "snprintf", "sprintf", "printf", "fprintf", "malloc",
-    "calloc", "realloc", "free", "open", "close", "read", "write", "lseek",
-    "fopen", "fclose", "fread", "fwrite", "exit", "abort", "getenv",
-    "qsort", "bsearch",
-})
-
-
-def _is_platform_semantic_api(api: str) -> bool:
-    """True for documented standard-library semantics that live outside both
-    repositories and therefore cannot differ between donor and target.
-
-    Repository-defined behavior (anything implemented under the donor or
-    target checkouts, e.g. android.* framework classes) never qualifies;
-    it must be cited as evidence or declared as an external assumption.
-    """
-    name = (api or "").strip()
-    return bool(_PLATFORM_FQCN_RE.fullmatch(name)) or name in _LIBC_SYMBOLS
-
-
-def _is_repo_implemented_platform_api(api: str, repository_roots: set[str]) -> bool:
-    """True when a repository under analysis implements the api itself.
-
-    libcore implements the Java platform namespaces and bionic the libc
-    symbols; for those repositories the semantics live inside the audited
-    code, are citable as evidence, and may be exactly what the donor fix
-    changes — they must not be asserted from memory.
-    """
-    name = (api or "").strip()
-    return (("libcore" in repository_roots and name.startswith(_PLATFORM_API_PREFIXES))
-            or ("bionic" in repository_roots and name in _LIBC_SYMBOLS))
-
-
 def _novel_tokens(patch: str) -> set[str]:
     """Tokens the hunk introduces beyond its own removed and context lines.
 
@@ -230,12 +184,6 @@ def _rewrap_only(patch: str) -> bool:
     return bool(removed and added) and lex(removed) == lex(added)
 
 
-class AssessmentError(ValueError):
-    """The model's assessment could not be grounded in immutable Git blobs."""
-
-    kind = "ASSESSMENT_INVALID"
-
-
 class CandidateRejected(RuntimeError):
     """A candidate is retryable but must not reach independent validation."""
 
@@ -246,34 +194,18 @@ class CandidateRejected(RuntimeError):
         self.feedback = feedback or message
 
 
-PROOF_STEP_REQUIREMENTS = {
-    "authorization_boundary": (
-        "caller_controlled_input", "authority_boundary_missing",
-        "sensitive_sink", "downstream_harm",
-    ),
-    "persistent_state_pollution": (
-        "state_write", "shared_namespace", "reuse_or_inheritance",
-        "consumer_role_confusion", "downstream_harm",
-    ),
-    "resource_bound": (
-        "unbounded_input", "fix_scoped_representation", "resource_consuming_sink",
-        "equivalent_bound_absent", "downstream_harm",
-    ),
-    "generic_data_flow": ("donor_fault", "target_fault", "downstream_harm"),
-}
-
-
-class AospBackportAgent:
+class AospBackportAgent(CausalityChecks):
     """Run independent AOSP impact assessment and a guarded SDK backport."""
 
     def __init__(self, source_root: Path, run_root: Path, case: Case, model: str | None = None,
                  donor_root: Path | None = None, model_provider: str | None = None,
                  api_base_url: str | None = None, api_key_env: str | None = None, *,
                  runtime_factory: Callable | None = None, turn_timeout: float = 900,
-                 source_diff: str | None = None):
+                 source_diff: str | None = None, max_output_bytes: int = 256 * 1024 * 1024):
         if api_base_url or api_key_env:
             raise ValueError("AOSP agent requires Codex SDK; direct API arguments are unsupported")
         self.source_root, self.run_root = source_root.resolve(), run_root.resolve()
+        self._source_scope = self.source_root
         self.case, self.model = case, model
         self.input_diff = source_diff
         self.model_provider = model_provider or os.environ.get("AOSP_AGENT_MODEL_PROVIDER")
@@ -300,6 +232,7 @@ class AospBackportAgent:
                                 for artifact in check.get("artifacts", [])}
         self.run_dir, self.worktree = self.run_root / case.cve, self.run_root / case.cve / case.repository
         self._owns_run, self._source_before = False, None
+        self.max_output_bytes = max_output_bytes
         self._current_hunks: list[dict[str, Any]] = []
         self.mapping_plan, self.mapping_repository = None, None
         self.selected_hunk_ids = None
@@ -345,18 +278,19 @@ class AospBackportAgent:
             self._write_record()
 
     def _json(self, name: str, value: Any) -> None:
-        destination = self.run_dir / name
-        temporary = destination.with_name(destination.name + ".tmp")
-        temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n")
-        temporary.replace(destination)
+        from .output_budget import write_json
+        write_json(self.run_dir / name, value, control=name == 'run.json')
 
     def _source_state(self) -> dict[str, str]:
         return {"head": self._git("rev-parse", "HEAD").stdout.strip(),
                 "status": self._git("status", "--porcelain=v1", "-z", "--untracked-files=all").stdout,
                 "diff_sha256": hashlib.sha256(self._git("diff", "--binary", "HEAD").stdout.encode()).hexdigest()}
 
+    @source_guard('_source_scope')
     def prepare(self) -> Path:
         self.run_dir.mkdir(parents=True, exist_ok=False)
+        from .output_budget import create_budget
+        self.output_budget = create_budget(self.run_dir, self.max_output_bytes)
         self._owns_run = True
         dependencies: dict[str, dict[str, str]] = {}
         unsupported: list[str] = []
@@ -370,7 +304,10 @@ class AospBackportAgent:
             repository_root = (self.source_root / validate_relative_path(repository_path)).resolve()
             if not repository_root.is_dir() or not repository_root.is_relative_to(self.source_root):
                 raise ValueError(f"read-only dependency repository must exist below source_root: {repository_path}")
-            head = self._git("rev-parse", "HEAD", cwd=repository_root).stdout.strip()
+            ref = item.get('target_commit')
+            if ref is not None and (not isinstance(ref, str) or not re.fullmatch(r'(?:[0-9a-f]{40}|[0-9a-f]{64})', ref)):
+                raise ValueError('read-only dependency target_commit must be a full pinned Git commit ID')
+            head = self._git("rev-parse", '--verify', (ref or 'HEAD') + '^{commit}', cwd=repository_root).stdout.strip()
             dependencies[repository_path] = {"root": str(repository_root), "head": head}
         if unsupported:
             self.record["status"] = "FAILED"
@@ -416,6 +353,7 @@ class AospBackportAgent:
             _write_wrappers(self.run_dir)
         return self.worktree
 
+    @source_guard('_source_scope')
     def inspect(self) -> dict[str, Any]:
         if not self.worktree.is_dir():
             raise RuntimeError("prepare() must run before inspect()")
@@ -508,234 +446,10 @@ class AospBackportAgent:
                      "requested": [start, end], "grounded": [actual_start, actual_end]})
                 evidence["line_start"], evidence["line_end"] = actual_start, actual_end
         self._validate_impact_causality(assessment)
+        from .platform_evidence import receipt
+        self.record['platform_behavior_evidence'] = receipt(assessment)
         return assessment
 
-    @staticmethod
-    def _changed_hunk_lines(hunk: dict[str, Any], revision: str) -> set[int]:
-        """Return causal line numbers in a donor hunk for parent or fix.
-
-        A pure addition has no parent-side changed lines and a pure deletion has
-        no fix-side changed lines.  In those cases the hunk's adjacent context
-        is the only available anchor for the unchanged side of the fix site.
-        Context is never accepted when changed lines exist on that side.
-        """
-        changed: set[int] = set()
-        context: set[int] = set()
-        line_number = int(hunk.get("old_start", 0) if revision == "source_parent"
-                          else hunk.get("new_start", 0))
-        for line in hunk.get("patch", "").splitlines():
-            if line.startswith(("diff --git", "--- ", "+++ ", "@@")):
-                continue
-            marker = line[:1]
-            if marker == " ":
-                context.add(line_number)
-                line_number += 1
-            elif marker == "-" and revision == "source_parent":
-                changed.add(line_number)
-                line_number += 1
-            elif marker == "+" and revision == "source_fix":
-                changed.add(line_number)
-                line_number += 1
-        return changed or context
-
-    @staticmethod
-    def _is_executable_evidence(evidence: dict[str, Any]) -> bool:
-        text = evidence["excerpt"]
-        text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-        lines = []
-        for line in text.splitlines():
-            line = line.split("//", 1)[0].split("#", 1)[0].strip()
-            if line:
-                lines.append(line)
-        if not lines:
-            return False
-        non_executable_prefixes = ("package ", "import ", "include ", "from ", "@")
-        return any(not line.startswith(non_executable_prefixes) for line in lines)
-
-    def _evidence_overlaps_donor_delta(self, evidence: dict[str, Any]) -> bool:
-        if evidence["revision"] not in ("source_parent", "source_fix"):
-            return False
-        for hunk in self._current_hunks:
-            if hunk.get("path") != evidence["path"]:
-                continue
-            changed_lines = self._changed_hunk_lines(hunk, evidence["revision"])
-            if any(evidence["line_start"] <= line <= evidence["line_end"]
-                   for line in changed_lines):
-                return True
-        return False
-
-    def _validate_impact_causality(self, assessment: dict[str, Any]) -> None:
-        """Reject conclusions not tied to a fix-defined scope and proof contract."""
-        status = assessment["status"]
-        scope = assessment["scope_contract"]
-        pattern = scope["vulnerability_pattern"]
-        if scope["representation_change"] == "no_counterpart" and status == "AFFECTED":
-            raise AssessmentError("AFFECTED cannot use scope_contract.representation_change=no_counterpart")
-        if assessment["root_cause"]["category"] == "denial_of_service" and pattern != "resource_bound":
-            raise AssessmentError("denial_of_service assessments must use the resource_bound proof pattern")
-        if assessment["root_cause"]["category"] == "permission_bypass" and pattern != "authorization_boundary":
-            raise AssessmentError("permission_bypass assessments must use the authorization_boundary proof pattern")
-
-        steps = assessment["proof_steps"]
-        step_ids = [step["id"] for step in steps]
-        if len(step_ids) != len(set(step_ids)):
-            raise AssessmentError("impact proof_steps ids must be unique")
-        by_id = {step["id"]: step for step in steps}
-        required = set(PROOF_STEP_REQUIREMENTS[pattern])
-        if scope["representation_change"] == "equivalent_representation":
-            required.add("representation_equivalence")
-        missing = sorted(required - set(by_id))
-        if missing:
-            raise AssessmentError(f"impact proof_steps is missing required ids: {', '.join(missing)}")
-
-        for step in steps:
-            if step["resolved"] and not step["evidence"]:
-                raise AssessmentError(f"resolved impact proof step {step['id']} requires evidence")
-            if any(type(index) is not int or not 1 <= index <= len(assessment["evidence"])
-                   for index in step["evidence"]):
-                raise AssessmentError(f"impact proof step {step['id']} contains an invalid evidence index")
-
-        if status == "UNKNOWN":
-            unresolved = [step for step in steps if not step["resolved"]]
-            if not unresolved:
-                raise AssessmentError("UNKNOWN impact requires at least one unresolved material proof step")
-        else:
-            unresolved = [step for step in steps if not step["resolved"]]
-            if unresolved:
-                raise AssessmentError("determinate impact cannot have unresolved proof steps: "
-                                      + ", ".join(step["id"] for step in unresolved))
-
-        if status in ("NOT_AFFECTED", "ALREADY_FIXED"):
-            clearing_ids = {"counterpart_absence", "equivalent_protection"}
-            if scope["representation_change"] == "equivalent_representation":
-                clearing_ids.add("representation_out_of_scope")
-            clearing = [step for step in steps if step["id"] in clearing_ids and step["resolved"]]
-            if not clearing:
-                raise AssessmentError(f"{status} impact requires resolved counterpart_absence, "
-                                      "equivalent_protection, or representation_out_of_scope evidence")
-            if not any(assessment["evidence"][index - 1]["revision"] == "target"
-                       for step in clearing for index in step["evidence"]):
-                raise AssessmentError(f"{status} impact clearing proof must cite target evidence")
-            if status == "ALREADY_FIXED" and not any(step["id"] == "equivalent_protection" for step in clearing):
-                raise AssessmentError("ALREADY_FIXED impact requires equivalent_protection proof")
-
-        if status == "AFFECTED":
-            target_proof_ids = tuple(step_id for step_id in PROOF_STEP_REQUIREMENTS[pattern]
-                                     if step_id != "donor_fault")
-            for step_id in target_proof_ids:
-                entries = [assessment["evidence"][index - 1] for index in by_id[step_id]["evidence"]]
-                if not entries or any(entry["revision"] != "target" for entry in entries):
-                    raise AssessmentError(f"AFFECTED proof step {step_id} requires target-only evidence")
-                if not all(self._is_executable_evidence(entry) for entry in entries):
-                    raise AssessmentError(f"AFFECTED proof step {step_id} must cite executable target statements")
-            if scope["representation_change"] == "equivalent_representation":
-                entries = [assessment["evidence"][index - 1] for index in by_id["representation_equivalence"]["evidence"]]
-                if not all(self._is_executable_evidence(entry) for entry in entries):
-                    raise AssessmentError(
-                        "representation_equivalence must cite executable donor and target statements")
-                if not any(self._evidence_overlaps_donor_delta(entry) for entry in entries):
-                    raise AssessmentError(
-                        "representation_equivalence donor evidence must overlap the donor fix delta")
-                revisions = {entry["revision"] for entry in entries}
-                if not revisions & {"source_parent", "source_fix"} or "target" not in revisions:
-                    raise AssessmentError("representation_equivalence must compare donor and target evidence")
-
-        causal = assessment.get("causal_chain")
-        if status != "AFFECTED":
-            if causal is not None:
-                raise AssessmentError("causal_chain is only valid for AFFECTED assessments")
-            return
-        if not isinstance(causal, dict):
-            raise AssessmentError("AFFECTED assessment requires causal_chain")
-
-        evidence = assessment["evidence"]
-        roles = {
-            "donor_fault_evidence": "source_parent",
-            "donor_fix_evidence": "source_fix",
-            "target_fault_evidence": "target",
-            "target_harm_evidence": "target",
-        }
-        selected: dict[str, list[dict[str, Any]]] = {}
-        for field, expected_revision in roles.items():
-            indices = causal.get(field, [])
-            if (not isinstance(indices, list) or not indices
-                    or any(type(index) is not int or not 1 <= index <= len(evidence) for index in indices)):
-                raise AssessmentError(f"causal_chain {field} contains an invalid evidence index")
-            entries = [evidence[index - 1] for index in indices]
-            if any(entry["revision"] != expected_revision for entry in entries):
-                raise AssessmentError(f"causal_chain {field} requires {expected_revision} evidence")
-            selected[field] = entries
-
-        for field, revision in (("donor_fault_evidence", "source_parent"),
-                                ("donor_fix_evidence", "source_fix")):
-            grounded = False
-            for entry in selected[field]:
-                for hunk in self._current_hunks:
-                    if hunk.get("path") != entry["path"]:
-                        continue
-                    changed_lines = self._changed_hunk_lines(hunk, revision)
-                    if any(entry["line_start"] <= line <= entry["line_end"] for line in changed_lines):
-                        grounded = True
-                        break
-                if grounded:
-                    break
-            if not grounded:
-                raise AssessmentError(
-                    f"causal_chain {field} must overlap the donor fix's changed lines")
-
-        for field in ("target_fault_evidence", "target_harm_evidence"):
-            if not all(self._is_executable_evidence(entry) for entry in selected[field]):
-                raise AssessmentError(f"causal_chain {field} must cite executable target statements")
-
-        assumptions = causal.get("external_behavior_assumptions", [])
-        if assumptions:
-            raise AssessmentError(
-                "AFFECTED cannot rest on uncited repository/framework behavior: cite the "
-                "decisive behavior in evidence (documented standard-library semantics that "
-                "do not vary between donor and target belong in platform_semantics with "
-                "the relying target call site); answer UNKNOWN only when a material step "
-                "is genuinely unresolved by available evidence")
-        repository = getattr(getattr(self, "case", None), "repository", "") or ""
-        repository_roots = {repository.split("/", 1)[0]} - {""}
-        causal_anchor_indices = (set(causal.get("target_fault_evidence") or [])
-                                 | set(causal.get("target_harm_evidence") or []))
-        for item in causal.get("platform_semantics") or []:
-            api = str(item.get("api", ""))
-            if not _is_platform_semantic_api(api):
-                raise AssessmentError(
-                    f"platform_semantics entry {api!r} is not a standard-library/platform "
-                    "API; repository-defined behavior must be cited as evidence or "
-                    "declared in external_behavior_assumptions")
-            if _is_repo_implemented_platform_api(api, repository_roots):
-                raise AssessmentError(
-                    f"platform_semantics entry {api!r} is implemented by the repository "
-                    "under analysis; cite its behavior as evidence instead of asserting "
-                    "it from memory")
-            indices = item.get("relied_at_evidence") or []
-            if (not indices or any(type(index) is not int
-                                   or not 1 <= index <= len(evidence) for index in indices)):
-                raise AssessmentError(
-                    "platform_semantics relied_at_evidence must cite valid 1-based "
-                    "evidence indices")
-            if any(evidence[index - 1]["revision"] != "target" for index in indices):
-                raise AssessmentError(
-                    "platform_semantics must cite the target call site that relies on "
-                    "the documented semantics")
-            if not set(indices) <= causal_anchor_indices:
-                raise AssessmentError(
-                    "platform_semantics relied_at_evidence must anchor at the causal "
-                    "chain's target_fault/target_harm evidence, not unrelated target code")
-            if not all(self._is_executable_evidence(evidence[index - 1])
-                       for index in indices):
-                raise AssessmentError(
-                    "platform_semantics must cite an executable target call site "
-                    "(comments or declarations alone are not reliance)")
-            simple_name = api.rsplit(".", 1)[-1]
-            if not any(re.search(rf"\b{re.escape(simple_name)}\b",
-                                 evidence[index - 1]["excerpt"]) for index in indices):
-                raise AssessmentError(
-                    f"platform_semantics entry {api!r} must be cited at a target call "
-                    "site whose excerpt mentions the API")
 
     def _turn(self, runtime, prompt: str, *, read_only: bool, phase: str, schema=None) -> dict:
         result = runtime.run(prompt, read_only=read_only, output_schema=schema)
@@ -748,7 +462,7 @@ class AospBackportAgent:
         return result
 
     def _sweep_tool_usage(self) -> None:
-        """Recover tool-usage markers from sdk-events into run-dir logs.
+        """Collect controller source receipts and legacy diagnostic markers.
 
         The Codex sandbox denies the tools' direct appends to
         tool-usage.jsonl (run_dir is outside the sandboxed workspace), so
@@ -759,15 +473,30 @@ class AospBackportAgent:
         events_path = self.run_dir / "sdk-events.jsonl"
         if not events_path.is_file():
             return
-        data = events_path.read_text(errors="replace")
-        fresh = data[self._events_swept:]
-        self._events_swept = len(data)
+        with events_path.open(encoding='utf-8', errors='replace') as stream:
+            stream.seek(self._events_swept)
+            fresh = stream.read()
+            self._events_swept = stream.tell()
         marker_re = re.compile(r"^AOSP-TOOL-USAGE (\{.*\})$", re.MULTILINE)
         entries = []
         for line in fresh.splitlines():
             try:
                 event = json.loads(line)
             except ValueError:
+                continue
+            if not isinstance(event, dict):
+                continue
+            if event.get('event') == 'broker_source_usage':
+                # Only top-level receipts emitted by the controller's broker
+                # are admitted. Model text containing JSON or a usage marker
+                # is not a receipt. Keep failed receipts for diagnostics; the
+                # evidence gate still checks success, relevance and semantics.
+                if (event.get('cmd') in ('view-code', 'locate-symbol', 'hunk-history', 'show-commit')
+                        and isinstance(event.get('uid'), str)
+                        and re.fullmatch(r'[0-9a-f]{12}', event['uid'])
+                        and isinstance(event.get('args'), dict)
+                        and type(event.get('returncode')) is int):
+                    entries.append({k: v for k, v in event.items() if k not in ('event', 'sequence', 'timestamp')})
                 continue
             item = ((event.get("payload") or {}).get("item") or {}
                     if event.get("method") == "item/completed" else {})
@@ -793,15 +522,14 @@ class AospBackportAgent:
                     known.add(json.loads(line).get("uid"))
                 except ValueError:
                     continue
-        with usage_path.open("a") as stream:
-            for entry in entries:
-                if entry.get("uid") in known:
-                    continue
-                known.add(entry.get("uid"))
-                stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-                for sha in entry.get("history_shas") or []:
-                    with (self.run_dir / "history-commits.jsonl").open("a") as history:
-                        history.write(json.dumps({"sha": sha, "hunk_id": None}) + "\n")
+        from .output_budget import write_text
+        for entry in entries:
+            if entry.get("uid") in known:
+                continue
+            known.add(entry.get("uid"))
+            write_text(usage_path, json.dumps(entry, ensure_ascii=False) + '\n', append=True)
+            for sha in entry.get("history_shas") or []:
+                write_text(self.run_dir / 'history-commits.jsonl', json.dumps({'sha': sha, 'hunk_id': None}) + '\n', append=True)
 
     def mechanical_migration(self, inspection: dict[str, Any]) -> dict[str, Any]:
         """Try to land donor hunks in the migration worktree without the model.
@@ -903,8 +631,8 @@ class AospBackportAgent:
                 f"{', '.join(migration['skipped']) or 'none'}\n"
                 "- Failed to apply mechanically, with diagnosis (adapt these):\n"
                 + json.dumps(failed_summary, ensure_ascii=False, indent=1)
-                + "\n- Symbols referenced by the donor fix that are MISSING at the target "
-                  "baseline (must be adapted to target APIs or an equivalent): "
+                + "\n- Donor identifiers not found by the scoped lexical pre-scan "
+                  "(investigate other languages, renamed APIs and equivalent operations; absence is not established): "
                   f"{', '.join(missing) or 'none'}\n")
 
     def _check_hunk_results(self, response: str,
@@ -986,7 +714,7 @@ class AospBackportAgent:
                  + "\nProvide exactly one evidence-backed declaration for every donor hunk.")}
 
     def _implemented_hunk_evidence(self, hunk: dict[str, Any],
-                                   candidate_patch: str | None, *, scope=None) -> dict[str, Any]:
+                                   candidate_patch: str | None, *, scope=None, site=None) -> dict[str, Any]:
         if self.mapping_plan is not None and scope is None:
             regions = [t for t in self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id'])
                        if t['action'] == 'edit' and t['status'] == 'AFFECTED']
@@ -1022,17 +750,40 @@ class AospBackportAgent:
             target_hunks = by_path.get(target, [])
             if not target_hunks:
                 continue
+            if site is None:
+                analysis = self._target_baseline_analysis(target)
+                if analysis is not None:
+                    baseline = analysis['raw']
+                    from .hunk_sites import bind_changes, index_baseline
+                    if 'site_index' not in analysis:
+                        analysis['site_index'] = index_baseline(baseline)
+                    binding = bind_changes(hunk.get('patch', ''), baseline,
+                        start=scope['line_start'] if scope else 1,
+                        end=scope['line_end'] if scope else None, indexed=analysis['site_index'])
+                    if binding['status'] in ('AMBIGUOUS', 'OUTSIDE_MAPPING'):
+                        result['site_binding'] = binding
+                        continue
+                    if binding['status'] == 'BOUND':
+                        region = scope or {'path': target, 'line_start': 1, 'line_end': len(baseline) + 1}
+                        evidence = [self._implemented_hunk_evidence(
+                            {**hunk, 'patch': block['patch']}, candidate_patch, scope=region,
+                            site=(block['line_start'], block['line_end'])) for block in binding['blocks']]
+                        result['site_evidence'] = evidence
+                        if evidence and all(e['ok'] for e in evidence):
+                            result.update(ok=True, match=f'candidate edits every bound donor change site in {target}')
+                            return result
+                        continue
             target_lines: list[str] = []
             for target_hunk in target_hunks:
                 if scope:
                     from .hunk_scope import changed_lines_in_region
                     target_lines.extend(changed_lines_in_region(target_hunk.get('patch', ''),
-                        scope['line_start'], scope['line_end'], added=bool(donor_additions)))
+                        scope['line_start'], scope['line_end'], added=bool(donor_additions), touching=site))
                 else:
                     target_lines.extend(_changed_diff_lines(
                         target_hunk.get("patch", ""), added=bool(donor_additions)))
             target_lines = [line for line in target_lines if line]
-            if scope and expected_lines and not target_lines:
+            if scope and (expected_lines or site is not None) and not target_lines:
                 continue
             if not expected_lines:
                 result.update(ok=True, match=f"changed target hunk: {target}")
@@ -1184,6 +935,8 @@ class AospBackportAgent:
         return records
 
     def _tool_supports_hunk(self, record: dict[str, Any], hunk: dict[str, Any]) -> bool:
+        if record.get('rejected') or record.get('read_status') in ('READ_FAILED', 'PATH_ABSENT', 'NOT_FOUND_IN_SCOPE', 'NOT_AVAILABLE'):
+            return False
         command = record.get("cmd")
         arguments = record.get("args") or {}
         if command == "hunk-history":
@@ -1239,9 +992,14 @@ class AospBackportAgent:
 
     def _target_baseline_lines(self, path: str) -> list[str] | None:
         blob = self._git("show", f"{self.case.target_commit}:{path}",
-                         cwd=self.worktree, check=False)
+                         cwd=self.repo, check=False)
         if blob.returncode != 0:
-            return None
+            listing = self._git('--literal-pathspecs', 'ls-tree', '-z', self.case.target_commit, '--', path,
+                                cwd=self.repo, check=False)
+            if listing.returncode == 0 and not listing.stdout:
+                return None
+            from .lifecycle import RecoveryBlocked
+            raise RecoveryBlocked('cannot read pinned target baseline for hunk evidence: ' + path)
         return blob.stdout.splitlines()
 
     def _target_baseline_analysis(self, path: str) -> dict[str, Any] | None:
@@ -1312,11 +1070,26 @@ class AospBackportAgent:
             anchors.discard('')
             if not anchors:
                 if category == 'already_present':
+                    from .hunk_sites import matches_additions, normalized
+                    expected = _changed_diff_lines(patch, added=True)
                     for target in targets:
                         analysis = self._target_baseline_analysis(target)
-                        if analysis and additions and additions <= set(analysis['normalized']):
+                        if analysis is None:
+                            continue
+                        # With no insertion context, a line elsewhere in the
+                        # file is not the requested site. Whole-file identity
+                        # or an independently grounded mapping is required.
+                        regions = (self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id'])
+                                   if self.mapping_plan is not None else [])
+                        if any(r['path'] == target and r['action'] == 'edit'
+                               and matches_additions(analysis['raw'][r['line_start']-1:r['line_end']], expected)
+                               for r in regions):
                             return None
-                    return 'already_present is unsupported: unanchored additions are absent from mapped targets'
+                        actual = [normalized(line) for line in analysis['raw'] if line.strip()]
+                        wanted = [normalized(line) for line in expected if line.strip()]
+                        if wanted and wanted == actual:
+                            return None
+                    return 'already_present is unsupported: unanchored additions lack site-specific evidence in mapped targets'
                 return 'semantic_equivalence is unsupported: pure additions have no grounded target anchor'
 
         if category == "already_present":
@@ -1325,6 +1098,11 @@ class AospBackportAgent:
             # acceptance in implemented-hunk evidence).
             if _rewrap_only(patch):
                 return None
+            from .hunk_sites import old_chunks, sequence_sites
+            blocks = [block for chunk in old_chunks(patch) for block in chunk['blocks']]
+            groups = [{'anchors': {_normalized_code_line(_strip_comments(line)) for line in b['removed']},
+                       'added': [_normalized_code_line(_strip_comments(line)) for line in b['added']
+                                 if _strip_comments(line).strip()]} for b in blocks]
             for target in targets:
                 analysis = self._target_baseline_analysis(target)
                 if analysis is None:
@@ -1334,8 +1112,6 @@ class AospBackportAgent:
                                if line in anchors]
                 if not anchor_hits:
                     continue
-                addition_hits = [index for index, line in enumerate(normalized)
-                                 if line in additions]
                 paths = analysis["paths"]
                 for index in anchor_hits:
                     anchor_path = paths[index]
@@ -1344,12 +1120,21 @@ class AospBackportAgent:
                             return (f'already_present is false: pre-change macro remains at '
                                     f'{target}:{index + 1}; top-level definitions require site-specific evidence')
                         continue
-                    if not any(paths[hit] and paths[hit][0] == anchor_path[0]
-                               for hit in addition_hits):
+                    applicable = [g for g in groups if not g['anchors'] or normalized[index] in g['anchors']]
+                    for group in applicable:
+                        key = tuple(group['added'])
+                        cache = analysis.setdefault('addition_sites', {})
+                        if key not in cache:
+                            cache[key] = sequence_sites(normalized, group['added'])
+                        sites = cache[key]
+                        if any(paths[first] and _covers_path(paths[first], anchor_path) for first, _ in sites):
+                            continue
+                        same_function = any(paths[first] and paths[first][0] == anchor_path[0] for first, _ in sites)
+                        detail = ('in a different branch that does not cover the anchor path' if same_function
+                                  else 'only outside that function or not as a complete ordered change block')
                         return ("already_present is false: the hunk's pre-change "
                                 f"line still exists unchanged at {target}:{index + 1} "
-                                "and its added lines occur only outside that "
-                                "function; port the hunk at this site")
+                                f"and its complete added code occurs {detail}; port the hunk at this site")
             return None
 
         mechanisms = _claim_mechanism_tokens(claim.get("reason", ""), patch)
@@ -1401,6 +1186,16 @@ class AospBackportAgent:
                                         "unchanged")
         return strongest[1] if strongest else None
 
+    def model_scope(self, read_only=False):
+        writable = () if read_only else tuple(self.worktree / p for p in self.case.files)
+        if hasattr(self, '_scope_provider'):
+            return self._scope_provider(writable)
+        from .sandbox_scope import source_scope
+        repositories = [self.repo, self.donor_repo]
+        repositories.extend(Path(item['root']) for item in self.record.get('dependency_repositories', {}).values())
+        return source_scope(self.run_dir, repositories, writable=writable, extra_readable=(self.worktree,),
+                            denied=(self.source_root,))
+
     def _codex_workflow(self, inspection: dict[str, Any], verify: bool, max_attempts: int,
                         mechanical: bool = True, impact_only: bool = False) -> None:
         if self.runtime_factory is None:
@@ -1431,12 +1226,12 @@ class AospBackportAgent:
         self._current_hunks = inspection["hunks"]
         symbol_report = inspection.get("symbol_report")
         symbol_report_text = (symbol_report.get("summary", "") +
-                              "\nMissing symbols: " +
+                              "\nIdentifiers not found in the searched scope: " +
                               ", ".join(e["name"] for e in symbol_report.get("missing", []))
                               ) if symbol_report else None
         with factory(events_path=self.run_dir / "sdk-events.jsonl", model=self.model,
                      model_provider=self.model_provider, turn_timeout=self.turn_timeout,
-                     env=OFFLINE_GIT_ENV) as runtime:
+                     env=OFFLINE_GIT_ENV, read_scope=self.model_scope()) as runtime:
             self.record["thread_id"] = runtime.start(str(self.worktree), SYSTEM + context)
             # Diff 预处理：版本拷贝型 donor diff 提取安全修复 hunks +
             # 推断漏洞类别，为影响判断提供定向搜索策略
@@ -1483,9 +1278,9 @@ class AospBackportAgent:
                                       "evidence for downstream harm, every pattern-required proof step, "
                                       "representation_equivalence when applicable, no external_behavior_assumptions "
                                       "(cite decisive repository/framework behavior in evidence instead), and "
-                                      "platform_semantics entries {api, behavior, relied_at_evidence} naming "
-                                      "each documented standard-library/platform semantic the harm path relies "
-                                      "on, with the 1-based index of its target call-site evidence. Return "
+                                      "platform_semantics entries {api, behavior, relied_at_evidence, implementation_evidence} "
+                                      "with separate target call-site and actual target implementation evidence. "
+                                      "API names and prose do not verify behavior across versions. Return "
                                       "UNKNOWN only when a material step is genuinely unresolved by available "
                                       "evidence; return NOT_AFFECTED only when the donor-defined faulty data "
                                       "flow is affirmatively absent and cleared by target evidence. "
@@ -1637,15 +1432,13 @@ class AospBackportAgent:
                     continue
                 claim_feedback = None
                 if not verify:
-                    self.record.update(status="PATCH_UNVERIFIED", final_verification={"status": "NOT_REQUESTED", "commands": []}); return
+                    self.record.update(status="PATCH_UNVERIFIED", final_verification={"status": "NOT_REQUESTED", "commands": []},
+                                       post_fix_review={'status': 'NOT_REQUESTED'}); return
                 verification = self.verify()
                 self.record["final_verification"] = verification
                 self.record["attempt_verifications"][str(attempt)] = verification
                 if verification["status"] == "PASS":
-                    if not verification['sufficient_for_validated']:
-                        self.record['status'] = 'PATCH_UNVERIFIED'
-                        return
-                    self.record["status"] = "VALIDATED"
+                    self.record["status"] = 'VALIDATED' if verification['sufficient_for_validated'] else 'PATCH_UNVERIFIED'
                     if not getattr(self, 'defer_post_fix', False):
                         self.assess_post_fix(runtime, patch, context)
                     return
@@ -1664,11 +1457,16 @@ class AospBackportAgent:
         """Optional analysis may fail, but even a read-only turn must not edit."""
         before = hashlib.sha256(self._render_patch().encode()).hexdigest()
         try:
-            result = runtime.run(post_fix_prompt(self.case, patch) + context,
+            verification = self.record.get('final_verification', {})
+            evidence = {k: verification[k] for k in ('status', 'stages', 'policy', 'sufficient_for_validated') if k in verification}
+            result = runtime.run(post_fix_prompt(self.case, patch) + context +
+                                 '\nActual local verification evidence:\n' + json.dumps(evidence),
                                  read_only=True, output_schema=POST_FIX_SCHEMA)
             if result.get('status') != 'completed':
                 raise RuntimeError('post-fix assessment did not complete')
             output = result.get('output') or json.loads(result.get('final_response', '{}'))
+            from jsonschema import validate
+            validate(output, POST_FIX_SCHEMA)
             self.record['post_fix_impact'] = output
             self._json('post-fix-impact.json', output)
             self._event('post_fix_impact_assessed', overall_risk=output.get('overall_risk'))
@@ -1681,7 +1479,13 @@ class AospBackportAgent:
             if hashlib.sha256(self._render_patch().encode()).hexdigest() != before:
                 raise RuntimeError('post-fix assessment modified the candidate')
         self.record['post_fix_patch_sha256'] = before
+        self.record['post_fix_review'] = {
+            'status': 'INCOMPLETE' if self.record.get('post_fix_impact', {}).get('error') else 'COMPLETED',
+            'patch_sha256': before, 'scope': 'model_business_impact_review', 'runtime_security_proven': False}
+        from .delivery import update_delivery
+        update_delivery(self.record)
 
+    @source_guard('_source_scope')
     def run(self, *, use_codex: bool = True, verify: bool = False, max_attempts: int = 6,
             mechanical: bool = True, impact_only: bool = False) -> dict[str, Any]:
         if max_attempts < 1:
@@ -1734,6 +1538,30 @@ class AospBackportAgent:
         self._last_audit = result
         return result
 
+    def _artifact_baseline_text(self, path):
+        """Exact bounded pinned reads for optional artifact-role evidence.
+
+        Missing tree entries are absence; a failed read is never cached as one.
+        The per-controller cache is immutable target metadata, not candidate data.
+        """
+        validate_relative_path(path)
+        cache = self.__dict__.setdefault('_artifact_baseline_cache', {})
+        if path not in cache:
+            try:
+                listing = self._git('--literal-pathspecs', 'ls-tree', '-z', self.case.target_commit, '--', path).stdout
+                if not listing:
+                    cache[path] = None
+                else:
+                    if not listing.startswith(('100644 blob ', '100755 blob ')):
+                        raise ValueError('artifact metadata is not a regular blob: ' + path)
+                    ref = f'{self.case.target_commit}:{path}'
+                    if int(self._git('cat-file', '-s', ref).stdout) > 4 * 1024 * 1024:
+                        raise ValueError('artifact metadata exceeds 4 MiB: ' + path)
+                    cache[path] = self._git('show', '--no-ext-diff', '--no-textconv', ref).stdout
+            except subprocess.SubprocessError as exc:
+                raise RuntimeError('artifact metadata read failed: ' + path) from exc
+        return cache[path]
+
     def _new_file_integration_audit(self, audit: dict[str, Any],
                                     candidate_patch: str) -> dict[str, Any]:
         """Reject invented production files that are not connected to live target code.
@@ -1744,7 +1572,8 @@ class AospBackportAgent:
         is deliberately insufficient: it proved unable to distinguish dead classes
         from real backports in the new16 batch.
         """
-        result: dict[str, Any] = {"status": "PASS", "new_files": [], "rejected": []}
+        result: dict[str, Any] = {"status": "PASS", "new_files": [], "rejected": [],
+                                  'scope': 'local_source_integration', 'production_reachability_proven': False}
         try:
             candidate_hunks = split_hunks(candidate_patch)
         except ValueError as exc:
@@ -1754,6 +1583,8 @@ class AospBackportAgent:
         # misses a new source as soon as a model stages it.
         new_paths = sorted({h['new_path'] for h in candidate_hunks
                             if h.get('old_path') is None and h.get('new_path')})
+        if not new_paths:
+            return result
         source_hunks = self._current_hunks
         if not source_hunks and self.input_diff:
             source_hunks = split_hunks(self.input_diff)
@@ -1765,13 +1596,55 @@ class AospBackportAgent:
         for hunk in candidate_hunks:
             by_path.setdefault(hunk["path"], []).append(hunk)
 
+        from .artifact_roles import artifact_kind, classify, python_test_shape, donor_test_definition
+        # The assertion-script adapter binds to an actually changed preexisting
+        # implementation, not a class/function invented alongside the test.
+        changed_sources = {}
+        caller_roles = {}
+        for path in by_path:
+            candidate = self.worktree / path
+            if (path not in new_paths and Path(path).suffix == '.py' and candidate.is_file()
+                    and candidate.stat().st_size <= 4 * 1024 * 1024):
+                baseline = self._artifact_baseline_text(path)
+                if baseline is not None and not python_test_shape(baseline):
+                    changed_sources[path] = candidate.read_text()
+
         for path in new_paths:
             entry: dict[str, Any] = {"path": path, "status": "PASS"}
-            suffix = Path(path).suffix.lower()
-            if _is_test_or_fixture_path(path):
-                entry["basis"] = "test_or_fixture"
-            elif suffix not in _GUARDED_SOURCE_SUFFIXES:
-                entry["basis"] = "non_source_artifact"
+            candidate = self.worktree / path
+            text = None
+            if candidate.is_file() and candidate.stat().st_size <= 4 * 1024 * 1024:
+                try:
+                    text = candidate.read_text()
+                except UnicodeError:
+                    pass
+            if text is None:
+                role = {'role': 'unknown', 'production_repair_credit': False}
+            else:
+                role = classify(path, text, baseline_read=self._artifact_baseline_text,
+                                changed_sources=changed_sources, executable=bool(candidate.stat().st_mode & 0o111))
+            entry['classification'] = role
+            if role['role'] == 'unknown':
+                entry.update(status='FAIL', basis='unsupported_new_artifact',
+                             reason='unknown artifact type or size; no implicit non-source exemption')
+            elif role['role'] != 'source':
+                entry['basis'] = role['role']
+                # Auxiliary tests/docs/configuration cannot stand in for a
+                # production source obligation merely by carrying its tokens.
+                for source in source_hunks:
+                    if path not in self._donor_targets(source.get('path', '')):
+                        continue
+                    source_kind = artifact_kind(source.get('path', ''))
+                    source_test = False
+                    if role['role'] == 'supplementary_test':
+                        added = '\n'.join(line[1:] for line in source.get('patch', '').splitlines()
+                                          if line.startswith('+') and not line.startswith('+++'))
+                        source_test = (source.get('old_path') is None
+                                       and donor_test_definition(source['path'], added))
+                    if source_kind in ('source', 'unknown') and not source_test:
+                        entry.update(status='FAIL', basis='auxiliary_artifact_cannot_implement_source',
+                                     reason='supplementary artifact cannot satisfy production/unknown source unit ' + source['id'])
+                        break
             else:
                 entry['donor_created'] = path in donor_added_paths
                 identities = _new_source_identities(path, by_path.get(path, []))
@@ -1783,30 +1656,49 @@ class AospBackportAgent:
                     baseline = self._target_baseline_lines(target_path)
                     if baseline is None:
                         continue
+                    baseline_text = '\n'.join(baseline)
+                    if len(baseline_text.encode()) > 4 * 1024 * 1024:
+                        continue
+                    if target_path not in caller_roles:
+                        if donor_test_definition(target_path, baseline_text):
+                            caller_roles[target_path] = {'role': 'supplementary_test',
+                                'evidence': {'basis': 'baseline_test_definition'}}
+                        else:
+                            caller_roles[target_path] = classify(target_path, baseline_text,
+                                baseline_read=self._artifact_baseline_text, changed_sources={})
+                    if caller_roles[target_path]['role'] == 'supplementary_test':
+                        result.setdefault('excluded_test_callers', {})[target_path] = caller_roles[target_path]
+                        continue
                     from .integration import activation as find_activation
                     candidate = self.worktree / target_path
                     if not candidate.is_file():
                         continue
-                    activation = find_activation(target_path, '\n'.join(baseline),
-                                                 candidate.read_text(), hunks, identities)
-                    if activation:
+                    activation = find_activation(target_path, baseline_text,
+                                                 candidate.read_text(), hunks, identities,
+                                                 new_source={'path': path, 'text': (self.worktree / path).read_text()})
+                    if (activation and activation.get('binding', {}).get('status') == 'RESOLVED_LEXICALLY'
+                            and activation['binding'].get('target_source') == path):
                         break
+                    activation = None
                 if activation:
                     entry.update(basis="existing_target_integration", activation=activation)
                 else:
                     entry.update(
                         status="FAIL",
                         basis="unintegrated_new_source",
-                        reason=("target baseline lacks this source file and no baseline-existing "
-                                "target file adds a non-build reference to the new source"),
+                        reason=("no eligible locally reachable, lexically bound call in a baseline-existing function "
+                                "or enabled exact-class manifest registration connects this new source; "
+                                "dead/deferred calls, shadowed names and unsupported binding/structure do not count"),
                         identities=sorted(identities),
                     )
-                    result["rejected"].append(entry)
+            if entry['status'] == 'FAIL':
+                result['rejected'].append(entry)
             result["new_files"].append(entry)
         if result["rejected"]:
             result["status"] = "FAIL"
         return result
 
+    @source_guard('_source_scope')
     def export_patch(self, attempt: int) -> str:
         audit = self.audit_diff()
         patch = self._render_patch(audit)
@@ -1817,7 +1709,8 @@ class AospBackportAgent:
             # Preserve rejected bytes separately and invalidate stale evidence from
             # a previously exported candidate. The final patch path is not a receipt.
             rejected_path = self.run_dir / f'rejected-candidate-{attempt}.patch'
-            rejected_path.write_text(patch)
+            from .output_budget import write_text
+            write_text(rejected_path, patch)
             self.record.update(patch_file=None, patch_sha256=hashlib.sha256(patch.encode()).hexdigest(),
                                patch_replay='not_run', rejected_patch_file=str(rejected_path),
                                verification_memory={})
@@ -1831,10 +1724,13 @@ class AospBackportAgent:
                           "Do not recreate a newer-version class merely because it is allowlisted. "
                           "Locate and edit the older target implementation instead. If a new helper "
                           "is genuinely required, also connect it from a baseline-existing source, "
-                          "manifest, or registration file."),
+                          "manifest, or registration file. Names alone do not establish a test role, "
+                          "and supplementary tests/data cannot replace production source obligations. "
+                          + json.dumps(new_file_audit['rejected'], ensure_ascii=False)),
             )
-        (self.run_dir / f"candidate-{attempt}.patch").write_text(patch)
-        (self.run_dir / "backport.patch").write_text(patch)
+        from .output_budget import write_text
+        write_text(self.run_dir / f"candidate-{attempt}.patch", patch)
+        write_text(self.run_dir / "backport.patch", patch)
         check = self._check_application(patch)
         self.record.update(patch_file=str(self.run_dir / "backport.patch"),
                            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(), patch_application=check)
@@ -1900,31 +1796,45 @@ class AospBackportAgent:
             patch += addition.stdout
         return patch
 
+    @source_guard('_source_scope')
     def verify(self) -> dict[str, Any]:
+        from .output_budget import require_output_record
+        require_output_record(self.run_dir / 'run.json')
         self.audit_diff(); before = self.record.get("patch_sha256"); results = []
         checks = self.case.validation_checks or tuple(
             {"stage": "configured", "argv": list(argv), "artifacts": []}
             for argv in self.case.validation)
-        # R12 port: stages that already passed for this exact patch are not
-        # re-run; any patch change invalidates the memory (full re-run).
+        from .verification_evidence import check_identity, archive_artifacts, successful_build_receipt, validation_policy
+        # Cache completed checks, never stage names (a stage may have several
+        # commands, including commands not reached before an earlier failure).
         memory = self.record.get("verification_memory") or {}
-        passed_stages = (set(memory.get("passed_stages", []))
-                         if memory.get("patch_sha256") and memory["patch_sha256"] == before
-                         and memory.get('context') == self.record.get('verification_context')
-                         else set())
+        cached = memory.get('checks', {}) if memory.get('version') == 2 else {}
+        completed, skipped = {}, set()
+        invocation = self.record.get('validation_invocation', 0) + 1
+        self.record['validation_invocation'] = invocation
+        target = self.record.get('target_commit', self.case.target_commit)
+        base_env = _safe_env()
         for number, check_spec in enumerate(checks, 1):
+            require_output_record(self.run_dir / 'run.json')
             argv = tuple(check_spec["argv"])
             stage = check_spec.get("stage", "configured")
-            if stage in passed_stages:
-                results.append({"stage": stage, "argv": list(argv), "returncode": 0,
-                                "skipped_passed": True, "stdout": "", "stderr": "",
-                                "stdout_log": None, "stderr_log": None, "elapsed_seconds": 0.0,
-                                "artifacts": [{"path": artifact, "exists": None, "sha256": None}
-                                              for artifact in check_spec.get("artifacts", [])]})
+            identity, cacheable = check_identity(dict(check_spec, stage=stage), number,
+                cwd=self.worktree, env=base_env, patch_sha256=before, target_commit=target,
+                context=self.record.get('verification_context'), dependencies=self.record.get('dependency_repositories', {}))
+            if cacheable and identity in cached:
+                result = {**cached[identity], 'skipped_passed': True, 'elapsed_seconds': 0.0}
+                results.append(result)
+                completed[identity] = cached[identity]
+                skipped.add(stage)
                 continue
+            for artifact in check_spec.get('artifacts', []):
+                if self._git('ls-files', '--error-unmatch', '--', artifact, cwd=self.worktree, check=False).returncode == 0:
+                    raise RuntimeError('validation artifact overlaps tracked source: ' + artifact)
+            archive_artifacts(check_spec, self.worktree, self.run_dir, invocation, number)
+            nonce = f'{before}:{invocation}:{number}:{identity}'
             start = time.monotonic()
             try:
-                verification_env = _safe_env()
+                verification_env = dict(base_env)
                 for key in ('AOSP_AGENT_PATCH_BUNDLE', 'AOSP_AGENT_BUNDLE_SHA256', 'AOSP_AGENT_ARTIFACT_DIR'):
                     verification_env.pop(key, None)
                 # Explicit controller contract: neither a model nor cwd ancestry
@@ -1937,14 +1847,22 @@ class AospBackportAgent:
                     'AOSP_AGENT_WORKTREE': str(self.worktree),
                     'AOSP_AGENT_RUN_DIR': str(self.run_dir),
                     'AOSP_AGENT_PYTHON': sys.executable,
+                    'AOSP_AGENT_VALIDATION_ID': nonce,
                 })
                 stdout, stderr, code = run_check(list(argv), self.worktree, verification_env)
             except subprocess.TimeoutExpired as exc:
                 stdout, stderr, code = _decoded(exc.stdout), "validation timed out after 1800 seconds", 124
             except OSError as exc:
                 stdout, stderr, code = "", str(exc), 127
-            stem = f"validation-{self.record.get('attempt', 0)}-{number}"
-            (self.run_dir / (stem + ".stdout")).write_text(stdout); (self.run_dir / (stem + ".stderr")).write_text(stderr)
+            build_receipt_verified = (stage == 'android_module_build' and code == 0 and successful_build_receipt(
+                    self.run_dir, nonce=nonce, patch_sha256=before, target_commit=target, target_repo=self.repo))
+            if stage == 'android_module_build' and code == 0 and not build_receipt_verified:
+                code = 125
+                stderr += '\nmissing fresh successful build/apply/restore receipt for this exact candidate'
+            stem = f"validation-{self.record.get('attempt', 0)}-{invocation}-{number}"
+            from .output_budget import write_text
+            write_text(self.run_dir / (stem + ".stdout"), stdout)
+            write_text(self.run_dir / (stem + ".stderr"), stderr)
             artifacts = []
             for artifact in check_spec.get("artifacts", []):
                 path = self.worktree / artifact
@@ -1956,7 +1874,11 @@ class AospBackportAgent:
                     stderr = (stderr + "\nmissing expected artifact: " + artifact).strip()
             results.append({"stage": stage, "argv": list(argv), "returncode": code, "stdout": stdout[-10000:], "stderr": stderr[-10000:],
                             "stdout_log": stem + ".stdout", "stderr_log": stem + ".stderr",
-                            "elapsed_seconds": round(time.monotonic() - start, 3), "artifacts": artifacts})
+                            "elapsed_seconds": round(time.monotonic() - start, 3), "artifacts": artifacts,
+                            "check_id": identity, "validation_id": nonce,
+                            "covers": [self.case.repository], 'build_receipt_verified': build_receipt_verified})
+            if not code and cacheable:
+                completed[identity] = results[-1]
             if code: break
         self.audit_diff()
         if before is not None:
@@ -1966,24 +1888,30 @@ class AospBackportAgent:
         status = "NOT_CONFIGURED" if not results else ("PASS" if all(x["returncode"] == 0 for x in results) else "FAIL")
         stages = {stage: ("PASS" if all(item["returncode"] == 0 for item in results if item["stage"] == stage)
                           else "FAIL") for stage in {item["stage"] for item in results}}
-        self.record["verification_memory"] = {"patch_sha256": before,
+        complete_stages = {stage for stage in stages if stages[stage] == 'PASS' and
+                           sum(c.get('stage', 'configured') == stage for c in checks) ==
+                           sum(c['stage'] == stage for c in results)}
+        self.record["verification_memory"] = {"version": 2, "checks": completed, "patch_sha256": before,
                                               "context": self.record.get('verification_context'),
-                                              "passed_stages": sorted(
-                                                  stage for stage, outcome in stages.items()
-                                                  if outcome == "PASS")}
-        result = {"commands": results, "stages": stages, "status": status,
+                                              "passed_stages": sorted(complete_stages)}
+        policy = validation_policy(results, [self.case.repository], expected_checks=len(checks))
+        result = {"commands": results, "stages": stages, "status": status, 'policy': policy,
                   "scope": "configured_commands_only",
-                  "sufficient_for_validated": status == 'PASS' and any(
-                      stage != 'source_contract' for stage in stages),
+                  "sufficient_for_validated": policy['satisfied'],
                   "runtime_security_proven": False,
                   "patch_sha256": self.record.get("patch_sha256"),
-                  "skipped_stages": sorted(passed_stages & set(stages))}
+                  "skipped_stages": sorted(skipped)}
         for layer in ("source_extracted_jvm", "android_module_build", "android_runtime"):
             if layer in stages:
                 self.record[layer] = "pass" if stages[layer] == "PASS" else "fail"
         self._json("verification.json", result); self._event("verification", **result); return result
 
-    def _write_record(self) -> None: self._json("run.json", self.record)
+    def _write_record(self) -> None:
+        from .delivery import update_delivery
+        update_delivery(self.record)
+        if hasattr(self, 'output_budget'):
+            self.record['output_budget'] = self.output_budget.data()
+        self._json("run.json", self.record)
 
 
 def _decoded(value: str | bytes | None) -> str: return value.decode(errors="replace") if isinstance(value, bytes) else (value or "")

@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 
 from .agent_tools import _write_wrappers
+from .lifecycle import operation_lease, RecoveryBlocked
 
 
 def run_backends(controller, assessment, *, verify, max_attempts, impact_only, mechanical):
@@ -39,10 +40,15 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
         peers = controller._candidate_hashes(except_key=key)
         try:
             result = child.run(verify=verify, max_attempts=max_attempts,
-                               mechanical=mechanical, impact_only=impact_only)
+                               mechanical=mechanical, impact_only=impact_only,
+                               _source_lease=operation_lease(controller))
         except Exception as exc:
             # Ordinary exhausted backend failures are local to this repository.
             # Unsafe source/plan/workspace mutations still stop the whole task.
+            if isinstance(exc, RecoveryBlocked):
+                child.record['status'] = 'BLOCKED'
+                child._write_record()
+                raise
             controller._audit_peers(key, peers)
             statuses[key] = 'FAILED'
             controller.record.setdefault('repository_errors', {})[key] = {
@@ -50,6 +56,13 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
             continue
         controller._audit_peers(key, peers)
         statuses[key] = result['status']
+        if result['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED'):
+            # Mapping already established edit obligations. A backend cannot
+            # silently replace that conclusion with an unreviewed exclusion.
+            controller.record.setdefault('backend_conflicts', {})[key] = {
+                'mapping_status': 'AFFECTED', 'backend_status': result['status'],
+                'evidence_record': str(child.run_dir / 'run.json')}
+            statuses[key] = 'INCONCLUSIVE'
         if result.get('patch_file'):
             patches[key] = {'file': result['patch_file'], 'sha256': result['patch_sha256'],
                             'target': child.case.target_commit, 'replay': result['patch_replay']}
@@ -87,6 +100,9 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
     else:
         status = 'PATCH_UNVERIFIED'
     controller.record['status'] = status
+    if controller.record.get('backend_conflicts'):
+        controller.record.update(mapping_impact_decision=assessment['status'], impact_decision='UNKNOWN',
+                                 replan_required='BACKEND_MAPPING_CONFLICT')
     for layer in ('source_contract', 'source_extracted_jvm', 'android_module_build', 'android_runtime'):
         values = [v.get('stages', {}).get(layer) for v in verification.values()]
         controller.record[layer] = ('FAIL' if 'FAIL' in values else

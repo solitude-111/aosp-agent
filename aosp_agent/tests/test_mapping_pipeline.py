@@ -1,3 +1,5 @@
+# Executor regression fixtures explicitly select the legacy exhaustive adapter.
+# Default project-first entrypoints are covered by test_runtime_entrypoints.py.
 from dataclasses import asdict, replace
 import json
 import copy
@@ -38,7 +40,7 @@ class MappingPipelineTest(unittest.TestCase):
             supplied = replace(fx.case(), files=('SECRET_ANSWER_PATH.py',),
                                validation=(('MUST_NOT_EXECUTE_DATASET_ANSWER',),))
             agent = from_case(supplied, fx.source_root, fx.run_root,
-                              model='patch-model', mapping_model='mapping-model')
+                              model='patch-model', mapping_model='mapping-model', exhaustive_discovery=True)
             mapping, backend, options = self.wire(agent, fx)
             result = agent.run(verify=True)
             self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
@@ -51,7 +53,8 @@ class MappingPipelineTest(unittest.TestCase):
             prompts = '\n'.join(c['prompt'] for c in mapping.calls + backend.calls)
             self.assertNotIn('SECRET_ANSWER_PATH', prompts)
             self.assertNotIn('MUST_NOT_EXECUTE_DATASET_ANSWER', prompts)
-            self.assertEqual([o['model'] for o in options], ['mapping-model', 'patch-model'])
+            self.assertEqual([o['model'] for o in options], ['mapping-model', 'patch-model', 'patch-model'])
+            self.assertEqual(result['post_fix_review']['status'], 'COMPLETED')
             stored = json.loads((child.run_dir / 'runtime-case.json').read_text())
             self.assertEqual(stored['files'], ['counter.py'])
             self.assertEqual(git(fx.repo, 'status', '--porcelain'), '')
@@ -59,10 +62,10 @@ class MappingPipelineTest(unittest.TestCase):
     def test_explicit_functional_check_and_existing_causal_gate_both_run(self):
         with GitFixture() as fx:
             agent = from_case(fx.case(), fx.source_root, fx.run_root,
-                              validation={'repo': [[sys.executable, '-B', 'verify_contract.py']]})
+                              validation={'repo': [[sys.executable, '-B', 'verify_contract.py']]}, exhaustive_discovery=True)
             mapping, backend, _ = self.wire(agent, fx)
             result = agent.run(verify=True)
-            self.assertEqual(result['status'], 'VALIDATED')
+            self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
             self.assertEqual(len(mapping.calls), 1)
             self.assertEqual([c['read_only'] for c in backend.calls], [True, False, True])
             self.assertIn('causal_chain', agent.children['repo'].record['assessment'])
@@ -78,7 +81,7 @@ class MappingPipelineTest(unittest.TestCase):
             git(fx.repo, 'checkout', '--detach', '-q', fx.target)
             supplied = replace(fx.case(), source_commit=donor, source_parent=parent,
                                files=('modern.py',))
-            agent = from_case(supplied, fx.source_root, fx.run_root)
+            agent = from_case(supplied, fx.source_root, fx.run_root, exhaustive_discovery=True)
             impact = fx.assessment()
             for entry in impact['evidence']:
                 if entry['revision'].startswith('source_'):
@@ -93,7 +96,7 @@ class MappingPipelineTest(unittest.TestCase):
 
     def test_mapping_cannot_bypass_run_causal_assessment(self):
         with GitFixture() as fx:
-            agent = from_case(fx.case(), fx.source_root, fx.run_root)
+            agent = from_case(fx.case(), fx.source_root, fx.run_root, exhaustive_discovery=True)
             bad_impact = fx.assessment()
             bad_impact['causal_chain']['external_behavior_assumptions'] = ['unverified behavior']
             _, backend, _ = self.wire(agent, fx, impact=bad_impact)
@@ -105,7 +108,7 @@ class MappingPipelineTest(unittest.TestCase):
 
     def test_writer_cannot_modify_controller_plans(self):
         with GitFixture() as fx:
-            agent = from_case(fx.case(), fx.source_root, fx.run_root)
+            agent = from_case(fx.case(), fx.source_root, fx.run_root, exhaustive_discovery=True)
             def edit(worktree):
                 write_counter(FIXED)(worktree)
                 (agent.run_dir / 'mapping-plan.json').write_text('{}')
@@ -120,14 +123,14 @@ class MappingPipelineTest(unittest.TestCase):
             case = Case.from_dict(raw)
             self.assertEqual(case.files, ())
             agent = from_case(case, fx.source_root, fx.run_root,
-                              runtime_factory=lambda **kw: self.fail('model must not start'))
+                              runtime_factory=lambda **kw: self.fail('model must not start'), exhaustive_discovery=True)
             result = agent.run(inspect_only=True)
             self.assertEqual(result['status'], 'DISCOVERED')
             self.assertFalse(agent.workspace.exists())
 
     def test_plan_returns_copies_and_records_fixed_revisions(self):
         with GitFixture() as fx:
-            agent = from_case(fx.case(), fx.source_root, fx.run_root)
+            agent = from_case(fx.case(), fx.source_root, fx.run_root, exhaustive_discovery=True)
             assessment = agent.ground(diff_fixtures.DiffWorkflowTest().assessment(agent))
             plan = MappingPlan.create(assessment, agent.repos, agent.units, agent.donor)
             assessment['writable_paths'].append('repo/injected.py')
@@ -147,7 +150,7 @@ class MappingPipelineTest(unittest.TestCase):
                 git(second, 'add', '.')
                 git(second, 'commit', '-qm', 'independent target')
                 validation = {key: [[sys.executable, '-B', 'verify_contract.py']] for key in ('repo', 'repo2')}
-                agent = from_case(fx.case(), fx.source_root, fx.run_root, validation=validation)
+                agent = from_case(fx.case(), fx.source_root, fx.run_root, validation=validation, exhaustive_discovery=True)
                 raw = diff_fixtures.DiffWorkflowTest().assessment(agent)
                 target = copy.deepcopy(raw['units'][0]['targets'][0])
                 target['path'] = 'repo2/counter.py'
@@ -166,7 +169,7 @@ class MappingPipelineTest(unittest.TestCase):
                     return mapping if path.name == 'sdk-assessment.jsonl' else backends[path.parent.name]
                 agent.factory = factory
                 result = agent.run(verify=True, max_attempts=1)
-                self.assertEqual(result['repository_statuses']['repo2'], 'VALIDATED')
+                self.assertEqual(result['repository_statuses']['repo2'], 'PATCH_UNVERIFIED')
                 self.assertEqual(result['status'], 'FAILED' if first_fails else 'PATCH_UNVERIFIED')
                 if not first_fails:
                     self.assertEqual(result['combined_verification'], 'NOT_CONFIGURED')

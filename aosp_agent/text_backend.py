@@ -7,6 +7,7 @@ from urllib.parse import quote
 from .diff_prompts import MIGRATION_SCHEMA, migration_prompt
 from .engine import AssessmentError, CandidateRejected
 from .prompts import SYSTEM
+from .lifecycle import operation_lease
 
 
 def repository_assessment(controller, assessment, key):
@@ -60,7 +61,7 @@ def migrate_repository(controller, assessment, key, *, verify, max_attempts, fee
                 except AssessmentError as exc:
                     error = str(exc)
                 try:
-                    patch = child.export_patch(attempt)
+                    patch = child.export_patch(attempt, _source_lease=operation_lease(controller))
                 except CandidateRejected as exc:
                     patch, error, blocked = '', str(exc), 'NEW_FILE_INTEGRATION'
                 if not patch.strip():
@@ -73,7 +74,7 @@ def migrate_repository(controller, assessment, key, *, verify, max_attempts, fee
                     if not ledger['ok']:
                         error = ledger['feedback']
                 verification = ({'status': 'NOT_RUN', 'blocked_by': blocked} if error else
-                                child.verify() if verify else {'status': 'NOT_REQUESTED'})
+                                child.verify(_source_lease=operation_lease(controller)) if verify else {'status': 'NOT_REQUESTED'})
                 controller._audit_peers(key, peers)
                 status = ('MIGRATION_INCOMPLETE' if error else 'VALIDATION_FAILED' if verification['status'] == 'FAIL'
                           else 'VALIDATED' if verification.get('sufficient_for_validated') else 'PATCH_UNVERIFIED')
@@ -90,9 +91,14 @@ def migrate_repository(controller, assessment, key, *, verify, max_attempts, fee
     except Exception as exc:
         # Source/plan/scope violations remain fatal. Ordinary runtime exhaustion
         # is local and must not prevent later independent repositories running.
-        controller._audit_peers(key, peers)
         child.record.update(status='FAILED', error={'type': type(exc).__name__,
             'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))})
+        from .lifecycle import RecoveryBlocked
+        if isinstance(exc, RecoveryBlocked):
+            child.record['status'] = 'BLOCKED'
+            child._write_record()
+            raise
+        controller._audit_peers(key, peers)
         child._write_record()
 
 

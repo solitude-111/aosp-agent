@@ -19,7 +19,7 @@ from pathlib import Path
 
 from .case import validate_relative_path
 from .git_policy import offline_git_env
-from .patches import split_hunks
+from .patches import split_hunks, text_hunks
 from .path_mapping import version_normalized_paths
 
 STOP = set('if else return void int long bool boolean public private protected static final class new null true false const char unsigned signed struct sizeof for while switch case break try catch throw throws def self this import package include override String Object value get set'.split())
@@ -28,8 +28,15 @@ SOURCE_SUFFIXES = {'.java', '.kt', '.c', '.cc', '.cpp', '.h', '.hpp', '.rs', '.p
 
 
 def local_git(repo: Path, *args: str, check: bool = True, timeout: int = 45):
+    from .retrieval import ACTIVE_BUDGET
+    budget = ACTIVE_BUDGET.get()
+    if budget is not None:
+        timeout = budget.command_timeout(timeout)
     env = offline_git_env(dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
-    return subprocess.run(['git', '-c', 'protocol.allow=never', '-c', 'core.fsmonitor=false',
+    from .tool_io import ACTIVE_TOOL_IO
+    io = ACTIVE_TOOL_IO.get()
+    run = io.run if io is not None else subprocess.run
+    return run(['git', '-c', 'protocol.allow=never', '-c', 'core.fsmonitor=false',
                            '-c', 'core.hooksPath=/dev/null', '-c', 'core.quotePath=false', *args],
                           cwd=repo, env=env, capture_output=True, text=True, errors='replace',
                           check=check, timeout=timeout)
@@ -95,16 +102,25 @@ class Repository:
     files: dict[str, str]  # path -> mode; blobs read only on demand
     read_events: object = field(default=None, repr=False, compare=False)
 
+    @property
+    def tracked_count(self):
+        from .retrieval import LazyTree
+        return (len(self.files.entries) if self.files.complete else None) if isinstance(self.files, LazyTree) else len(self.files)
+
+    def object_query(self, *args, stage, check=True):
+        from .retrieval import LazyTree
+        if isinstance(self.files, LazyTree):
+            return self.files.query(*args, stage=stage, check=check)
+        return read_git(self.root, *args, stage=stage, check=check, progress=self.read_events)
+
     def read(self, path: str) -> str:
         validate_relative_path(path)
         if self.files.get(path) not in ('100644', '100755'):
             raise ValueError(f'not a regular tracked file: {self.key}/{path}')
-        size = int(read_git(self.root, 'cat-file', '-s', f'{self.head}:{path}',
-                            stage='blob_size', progress=self.read_events).stdout)
+        size = int(self.object_query('cat-file', '-s', f'{self.head}:{path}', stage='blob_size').stdout)
         if size > 32 * 1024 * 1024:
             raise ValueError(f'blob exceeds 32 MiB retrieval limit: {path}')
-        return read_git(self.root, 'show', '--no-ext-diff', '--no-textconv', f'{self.head}:{path}',
-                        stage='blob_read', progress=self.read_events).stdout
+        return self.object_query('show', '--no-ext-diff', '--no-textconv', f'{self.head}:{path}', stage='blob_read').stdout
 
     def state(self, *, timeout=45) -> dict:
         def read(stage, *args):
@@ -183,7 +199,8 @@ def repository_issue(key, stage, exc, root=None):
 
 
 def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None,
-                 issues=None, progress=None, roots=None, timeout=None, read_events=None) -> list[Repository]:
+                 issues=None, progress=None, roots=None, timeout=None, read_events=None,
+                 lazy=False, cache=None) -> list[Repository]:
     """Read bounded inventories. Opt-in tolerant callers must retain every issue.
 
     An explicit pinned repository remains mandatory, even in tolerant mode.
@@ -207,6 +224,10 @@ def repositories(root: Path, max_directories: int = 20000, *, pinned_heads=None,
         try:
             head = read_git(path, 'rev-parse', '--verify', ref + '^{commit}', timeout=timeout,
                             stage=stage, progress=event_sink).stdout.strip()
+            if lazy:
+                from .retrieval import LazyTree
+                result.append(Repository(key, path, head, LazyTree(path, head, cache, event_sink), event_sink))
+                continue
             stage = 'read_tree'
             entries = read_git(path, 'ls-tree', '-r', '-z', head, timeout=timeout,
                                stage=stage, progress=event_sink).stdout.split('\0')
@@ -247,18 +268,12 @@ def diff_units(diff: str) -> list[dict]:
             if unit[key]:
                 validate_relative_path(unit[key])
         before, after = {}, {}
-        old = new = None
-        for line in unit['patch'].splitlines():
-            match = re.match(r'^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@', line)
-            if match:
-                old, new = map(int, match.groups())
-            elif old is not None and line.startswith((' ', '-', '+')):
-                if line[0] in ' -':
-                    before[old] = line[1:]
-                    old += 1
-                if line[0] in ' +':
-                    after[new] = line[1:]
-                    new += 1
+        for hunk in text_hunks(unit['patch']) if unit['supported'] else ():
+            for line in hunk['lines']:
+                if line['old_line'] is not None:
+                    before[line['old_line']] = line['text']
+                if line['new_line'] is not None:
+                    after[line['new_line']] = line['text']
         unit['before'], unit['after'] = before, after
     return units
 
@@ -342,6 +357,21 @@ class Locator:
         self.search_failures = {}
         self.read_failures = {}
         self.issues = []
+        self.anchor_indexes = {}
+        self.examined = {}
+        self.scan_truncated = set()
+
+    def admit_candidate(self, repo, path, unit):
+        key = (repo.key, unit['id'])
+        seen = self.examined.setdefault(key, set())
+        if path not in seen and len(seen) >= self.scan_limit:
+            if key not in self.scan_truncated:
+                self.scan_truncated.add(key)
+                self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'candidate_scan',
+                                    'status': 'TRUNCATED', 'scanned': len(seen)})
+            return False
+        seen.add(path)
+        return True
 
     def read(self, repo: Repository, path: str) -> str:
         key = (repo.key, path)
@@ -355,6 +385,76 @@ class Locator:
                 raise
         return self.cache[key]
 
+    def text_anchor(self, repo, path, parts):
+        """Find complete diff-side text as a retrieval hint, never an identity proof."""
+        from .hunk_sites import index_baseline, normalized
+        key = (repo.key, path)
+        if key not in self.anchor_indexes:
+            self.anchor_indexes[key] = index_baseline(self.read(repo, path).splitlines())
+        target, occurrences = self.anchor_indexes[key]
+        anchors = []
+        for part in parts:
+            found = None
+            for side in ('old_line', 'new_line'):
+                wanted = [normalized(row['text']) for row in part['lines'] if row[side] is not None]
+                informative = tokens('\n'.join(wanted))
+                if not informative or (sum(bool(s) for s in wanted) < 2 and len(informative) < 2):
+                    continue
+                anchor = min((i for i, line in enumerate(wanted) if line),
+                             key=lambda i: len(occurrences.get(wanted[i], ())))
+                positions = [hit - anchor for hit in occurrences.get(wanted[anchor], ())
+                             if hit >= anchor and target[hit - anchor:hit - anchor + len(wanted)] == wanted]
+                if positions:
+                    found = {'side': side, 'line_start': positions[0] + 1,
+                             'line_end': positions[0] + len(wanted), 'matching_regions': len(positions)}
+                    break
+            if found is None:
+                return []
+            anchors.append(found)
+        return anchors
+
+    def anchored_candidates(self, repo, scores, parts, unit):
+        if not parts:
+            return []
+        anchors = []
+        for path in sorted(scores, key=lambda p: (-scores[p], p))[:self.scan_limit]:
+            if not self.admit_candidate(repo, path, unit):
+                continue
+            try:
+                sites = self.text_anchor(repo, path, parts)
+                if sites:
+                    anchors.append({'path': path, 'regions': sites, 'semantic_identity': 'UNASSESSED'})
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.issues.append({'unit': unit['id'], 'path': f'{repo.key}/{path}',
+                                    'stage': 'read', 'error': str(exc)[-1000:]})
+        return anchors
+
+    def identifier_candidates(self, repo, query, scope, unit, add, search_log):
+        failure_key = (repo.key, scope)
+        try:
+            if failure_key in self.search_failures:
+                raise ValueError(self.search_failures[failure_key])
+            for term in query:
+                search_key = (repo.key, scope, term)
+                if search_key not in self.search_cache:
+                    pathspec = ('-e', term, repo.head, '--') + ((':(literal)' + scope,) if scope else ())
+                    res = repo.object_query('grep', '--no-textconv', '-I', '-l', '-z', '-F', '-w',
+                                           *pathspec, check=False, stage='identifier_search')
+                    if res.returncode not in (0, 1):
+                        raise ValueError(res.stderr[-1000:])
+                    self.search_cache[search_key] = [p.removeprefix(repo.head + ':') for p in res.stdout.split('\0') if p]
+                hits = self.search_cache[search_key]
+                search_log.append({'repository': repo.key, 'query': term, 'path_scope': scope or '.',
+                                   'matching_files': len(hits), 'status': 'MATCHES' if hits else 'NO_MATCH',
+                                   'absence_proven': False})
+                weight = 6 / (1 + math.log1p(len(hits)))
+                for path in hits:
+                    add(path, weight, 'identifier:' + term)
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            self.search_failures[failure_key] = str(exc)[-1200:]
+            self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'identifier_search',
+                                'path_scope': scope or '.', 'error': str(exc)[-1200:]})
+
     def locate(self, progress=None) -> dict:
         output = []
         for unit in self.units:
@@ -366,7 +466,8 @@ class Locator:
             title_terms = tokens(re.sub(r'^@@.*?@@', '', unit['header']))
             query = sorted(terms, key=lambda t: (t not in title_terms, -len(t), t))[:12]
             candidates = []
-            search_log = []
+            search_log, retrieval = [], []
+            parts = text_hunks(unit['patch']) if unit['supported'] else []
             for repo in self.repos:
                 scores: Counter = Counter()
                 reasons = {}
@@ -374,47 +475,69 @@ class Locator:
                     if repo.files.get(path) in ('100644', '100755'):
                         scores[path] += score
                         reasons.setdefault(path, []).append(reason)
-                for path in repo.files:
-                    if path in paths or f'{repo.key}/{path}' in paths:
-                        add(path, 8, 'exact_path')
-                    elif path in normalized_paths or f'{repo.key}/{path}' in normalized_paths:
-                        add(path, 7, 'version_normalized_path')
-                    elif Path(path).name in names:
-                        add(path, 5, 'basename')
-                    elif any(p.endswith('/' + path) or path.endswith('/' + p) for p in paths):
-                        add(path, 4, 'path_suffix')
-                if query and unit['supported']:
-                    try:
-                        if repo.key in self.search_failures:
-                            raise ValueError(self.search_failures[repo.key])
-                        # Preserve evidence from rare stable APIs/fields even if the file and
-                        # enclosing function both changed names. A single OR grep followed by
-                        # alphabetical truncation loses those hits in large AOSP repositories.
-                        for term in query:
-                            search_key = (repo.key, term)
-                            if search_key not in self.search_cache:
-                                res = read_git(repo.root, 'grep', '--no-textconv', '-I', '-l', '-z', '-F', '-w',
-                                               '-e', term, repo.head, '--', check=False,
-                                               stage='identifier_search', progress=repo.read_events)
-                                if res.returncode not in (0, 1):
-                                    raise ValueError(res.stderr[-1000:])
-                                self.search_cache[search_key] = [p.removeprefix(repo.head + ':') for p in res.stdout.split('\0') if p]
-                            hits = self.search_cache[search_key]
-                            search_log.append({'repository': repo.key, 'query': term, 'matching_files': len(hits),
-                                               'status': 'MATCHES' if hits else 'NO_MATCH'})
-                            weight = 6 / (1 + math.log1p(len(hits)))
-                            for path in hits:
-                                add(path, weight, 'identifier:' + term)
-                    except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                        self.search_failures[repo.key] = str(exc)[-1200:]
-                        self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'identifier_search',
-                                            'error': str(exc)[-1200:]})
+                from .retrieval import LazyTree
+                lazy = isinstance(repo.files, LazyTree)
+                direct = paths | normalized_paths
+                direct |= {p[len(repo.key) + 1:] for p in direct if p.startswith(repo.key + '/')}
+                for path in sorted(direct):
+                    add(path, 8 if path in paths else 7, 'exact_path' if path in paths else 'version_normalized_path')
+                anchors = self.anchored_candidates(repo, scores, parts, unit)
+                stage, scopes = 'DIRECT_FILES', sorted(scores)
+                def path_hints(entries):
+                    for path in entries:
+                        if path in paths or f'{repo.key}/{path}' in paths:
+                            add(path, 8, 'exact_path')
+                        elif path in normalized_paths or f'{repo.key}/{path}' in normalized_paths:
+                            add(path, 7, 'version_normalized_path')
+                        elif Path(path).name in names:
+                            add(path, 5, 'basename')
+                        elif any(p.endswith('/' + path) or path.endswith('/' + p) for p in paths):
+                            add(path, 4, 'path_suffix')
+                # A same-name file with unrelated content is insufficient. Look
+                # nearby, then across the admitted project when text hints fail.
+                # Even a full-side match defers searches; it proves no semantics.
+                if not anchors and parts:
+                    directories = sorted({Path(p).parent.as_posix() for p in direct
+                                          if Path(p).parent.as_posix() != '.'},
+                                         key=lambda p: (-len(Path(p).parts), p))[:4]
+                    for directory in directories:
+                        try:
+                            entries = (repo.files.paths_under(directory) if lazy else
+                                       [p for p in repo.files if p.startswith(directory + '/')])
+                            if not entries:
+                                continue
+                            stage = 'NEARBY_DIRECTORIES'; scopes.append(directory + '/')
+                            path_hints(entries)
+                            anchors = self.anchored_candidates(repo, scores, parts, unit)
+                            if not anchors:
+                                self.identifier_candidates(repo, query[:3], directory, unit, add, search_log)
+                                anchors = self.anchored_candidates(repo, scores, parts, unit)
+                            if anchors:
+                                break
+                        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                            self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'read_tree',
+                                                'path_scope': directory, 'error': str(exc)[-1000:]})
+                if not anchors and parts:
+                    stage = 'PROJECT_PATHS'; scopes.append('.')
+                    path_hints(() if lazy and scores else repo.files)
+                    anchors = self.anchored_candidates(repo, scores, parts, unit)
+                    if not anchors:
+                        stage = 'ADMITTED_PROJECT'
+                        # Separate stable terms preserve rare hits; a single OR
+                        # query with alphabetical truncation would lose them.
+                        self.identifier_candidates(repo, query, '', unit, add, search_log)
+                retrieval.append({'repository': repo.key, 'stage': stage, 'queried_scopes': scopes,
+                                  'text_anchors': anchors, 'project_search': 'PERFORMED' if stage == 'ADMITTED_PROJECT' else 'DEFERRED',
+                                  'scope_complete': False, 'absence_proven': False,
+                                  'limitation': 'Initial retrieval only; investigate callers, competing implementations and dependencies.'})
                 # Prefer path hints, then rare identifier-bearing filenames. Never call a truncated scan exhaustive.
                 ranked = sorted(scores, key=lambda p: (-scores[p], -len(tokens(p) & terms), p))
                 if len(ranked) > self.scan_limit:
                     self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'candidate_scan',
                                         'status': 'TRUNCATED', 'total': len(ranked), 'scanned': self.scan_limit})
                 for path in ranked[:self.scan_limit]:
+                    if not self.admit_candidate(repo, path, unit):
+                        continue
                     try:
                         content = self.read(repo, path)
                         cache_key = (repo.key, path)
@@ -436,13 +559,16 @@ class Locator:
                       'AMBIGUOUS_CANDIDATES' if len(kept) > 1 and kept[0]['score'] - kept[1]['score'] < 3
                       else 'CANDIDATES')
             output.append({'id': unit['id'], 'old_path': unit['old_path'], 'new_path': unit['new_path'],
-                           'kind': unit['kind'], 'status': status, 'searches': search_log,
+                           'kind': unit['kind'], 'status': status, 'searches': search_log, 'retrieval': retrieval,
                            'candidate_count': len(candidates), 'candidates_truncated': len(candidates) > len(kept),
                            'candidates': kept, 'before': unit['before'], 'after': unit['after']})
             if progress:
                 progress({'completed_units': len(output), 'total_units': len(self.units),
                           'last_unit': unit['id'], 'issues': len(self.issues)})
-        return {'schema_version': 1, 'units': output, 'issues': self.issues,
+        return {'schema_version': 2, 'units': output, 'issues': self.issues,
+                'retrieval_summary': {'strategy': 'direct_files_then_directories_then_admitted_project',
+                    'deferred_project_searches': sum(r['project_search'] == 'DEFERRED' for u in output for r in u['retrieval']),
+                    'scope_complete': False, 'absence_proven': False},
                 'impact': 'UNASSESSED', 'function_parser': 'python_ast_or_c_family_lexical_hints',
                 'limits': {'files_per_repo_per_unit': self.scan_limit, 'candidates_per_unit': self.candidate_limit},
                 'warning': 'Candidate ranking is retrieval only. Missing or truncated search is not evidence of absence.'}

@@ -143,7 +143,25 @@ def _parse_file(lines: list[str], file_index: int) -> list[dict[str, Any]]:
     return result
 
 
-def _consume_hunk(lines: list[str], index: int) -> tuple[dict[str, Any], int]:
+def text_hunks(patch: str) -> list[dict[str, Any]]:
+    """Read counted text hunks with old/new and original patch coordinates.
+
+    Accept a validated file patch or an internal hunk fragment. File metadata,
+    mail trailers and no-newline markers never become source lines. Full input
+    structure and unsupported formats are still checked by ``split_hunks`` at
+    admission; this helper does not authorize paths or waive file operations.
+    """
+    lines, result, index = patch.splitlines(keepends=True), [], 0
+    while index < len(lines):
+        if lines[index].startswith('@@ '):
+            hunk, index = _consume_hunk(lines, index, include_lines=True)
+            result.append(hunk)
+        else:
+            index += 1
+    return result
+
+
+def _consume_hunk(lines: list[str], index: int, *, include_lines=False) -> tuple[dict[str, Any], int]:
     start = index
     match = _HUNK.fullmatch(lines[index])
     if match is None:
@@ -154,6 +172,7 @@ def _consume_hunk(lines: list[str], index: int) -> tuple[dict[str, Any], int]:
     index += 1
     previous_was_content = False
     additions = removals = context = 0
+    source_lines = []
     while old_left or new_left:
         if index >= len(lines):
             raise ValueError(f"truncated hunk at line {start + 1}")
@@ -165,6 +184,12 @@ def _consume_hunk(lines: list[str], index: int) -> tuple[dict[str, Any], int]:
             index += 1
             continue
         prefix = line[:1]
+        if include_lines and prefix in (' ', '-', '+'):
+            source_lines.append({
+                'marker': prefix, 'text': line[1:].rstrip('\r\n'), 'patch_line': index + 1,
+                'old_line': old_start + old_count - old_left if prefix in (' ', '-') else None,
+                'new_line': new_start + new_count - new_left if prefix in (' ', '+') else None,
+            })
         if prefix == " ":
             old_left -= 1
             new_left -= 1
@@ -188,7 +213,8 @@ def _consume_hunk(lines: list[str], index: int) -> tuple[dict[str, Any], int]:
     return {"header": lines[start].rstrip("\r\n"), "body": "".join(lines[start:index]),
             "old_start": old_start, "old_count": old_count,
             "new_start": new_start, "new_count": new_count,
-            "added_lines": additions, "removed_lines": removals, "context_lines": context}, index
+            "added_lines": additions, "removed_lines": removals, "context_lines": context,
+            **({'lines': source_lines} if include_lines else {})}, index
 
 
 def _paths(metadata: list[str]) -> tuple[str | None, str | None]:

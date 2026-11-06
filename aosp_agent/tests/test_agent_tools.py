@@ -3,6 +3,9 @@ import json
 import os
 import subprocess
 import unittest
+import contextlib
+import io
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 
@@ -116,6 +119,33 @@ class AgentToolsTest(unittest.TestCase):
             code = self.run_tool(prepared, "locate-symbol", "--repo", "target", "--ref", target,
                                  "--symbol", "normalize_counts")
             self.assertEqual(code, 0)
+
+    def test_language_limited_lookup_reports_scope_instead_of_absence(self):
+        with PreparedRun() as prepared:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                code = self.run_tool(prepared, 'locate-symbol', '--repo', 'target',
+                    '--ref', prepared.record['target_commit'], '--symbol', 'normalize_count', '--language', 'native')
+            self.assertEqual(code, 0)
+            self.assertIn('NOT_FOUND_IN_SCOPE', output.getvalue())
+            self.assertNotIn('does not exist', output.getvalue())
+            entry = prepared.usage_lines()[-1]
+            self.assertEqual(entry['read_status'], 'NOT_FOUND_IN_SCOPE')
+            self.assertIn('*.cpp', entry['search_scope']['pathspecs'])
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.run_tool(prepared, 'locate-symbol', '--repo', 'target',
+                    '--ref', prepared.record['target_commit'], '--symbol', 'normalize_count'), 0)
+            self.assertEqual(prepared.usage_lines()[-1]['read_status'], 'FOUND')
+
+    def test_symbol_read_failure_has_nonzero_exit_and_explicit_status(self):
+        with PreparedRun() as prepared:
+            output = io.StringIO()
+            with patch('aosp_agent.symbols.local_git', side_effect=subprocess.TimeoutExpired('git', 1)), contextlib.redirect_stdout(output):
+                code = self.run_tool(prepared, 'locate-symbol', '--repo', 'target',
+                    '--ref', prepared.record['target_commit'], '--symbol', 'normalize_count')
+            self.assertEqual(code, 3)
+            self.assertIn('READ_FAILED', output.getvalue())
+            self.assertEqual(prepared.usage_lines()[-1]['read_status'], 'READ_FAILED')
 
     def test_hunk_history_and_show_commit_chain(self):
         with ThreeCommitRun() as prepared:

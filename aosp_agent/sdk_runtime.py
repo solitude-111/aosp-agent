@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import threading
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -99,7 +100,8 @@ class CodexRuntime:
     otherwise it is the final response text. When structured output is requested
     and the reply fails JSON parsing or schema validation, exactly one
     corrective re-ask is issued (same sandbox mode) before INVALID_OUTPUT is
-    raised — a malformed reply is a transport defect, not a spent attempt.
+    raised. Correction does not spend a migration attempt, but it does spend
+    a model turn and shares the original call's deadline.
     Errors never become success results.
     Timeout closes the runtime; construct a new instance for a later attempt.
     Environment overrides are passed to the SDK, never written to disk or logged.
@@ -111,10 +113,12 @@ class CodexRuntime:
     Pass them explicitly only to override the config for one run.
     """
 
+    accounts_model_calls = True
+
     def __init__(self, events_path: Path, model: str | None = None,
                  model_provider: str | None = None, turn_timeout: float = 900,
                  codex_path: str | None = None, env: dict[str, str] | None = None,
-                 reasoning_effort: str | None = None):
+                 reasoning_effort: str | None = None, read_scope=None):
         if turn_timeout <= 0:
             raise ValueError("turn_timeout must be positive")
         self.events_path = Path(events_path).resolve()
@@ -123,6 +127,7 @@ class CodexRuntime:
         self.turn_timeout = float(turn_timeout)
         self.codex_path = codex_path
         self.reasoning_effort = reasoning_effort
+        self.read_scope = read_scope
         self.env = dict(env or {})
         self._loop = None
         self._codex = None
@@ -131,6 +136,11 @@ class CodexRuntime:
         self._cwd = None
         self._closed = False
         self._event_count = 0
+        self._log_lock = threading.RLock()
+        self._broker = None
+        from .output_budget import find_budget
+        self._output_budget = find_budget(self.events_path)
+        self._output_error = None
         self._deepseek_schema_compat = (
             (self.model_provider or "").lower() == "deepseek"
             or (self.model or "").lower().startswith("deepseek-")
@@ -156,9 +166,22 @@ class CodexRuntime:
                 kind="SDK_MISSING") from exc
         self._sandbox = Sandbox
         self._approval = ApprovalMode.deny_all
+        overrides = ()
+        if self.read_scope is not None:
+            from .sandbox_scope import require_profile_protocol
+            require_profile_protocol(self.codex_path)
+            overrides = self.read_scope.config_overrides()
         self._loop = asyncio.new_event_loop()
         self._codex = AsyncCodex(CodexConfig(codex_bin=self.codex_path, env=self.env or None,
-                                           client_name="aosp_backport_agent"))
+                                           client_name="aosp_backport_agent", config_overrides=overrides))
+        if self.read_scope is not None:
+            self._broker = self._make_broker()
+            if self._broker is not None:
+                sync = getattr(getattr(self._codex, '_client', None), '_sync', None)
+                if sync is None or not hasattr(sync, '_approval_handler'):
+                    self.close()
+                    raise CodexRuntimeError('SDK lacks the controller tool callback', kind='MODEL_SCOPE_UNAVAILABLE')
+                sync._approval_handler = self._broker.handle
         self._log("runtime_start", model=self.model, model_provider=self.model_provider,
                   sdk_version=importlib.metadata.version("openai-codex"),
                   codex_bin=self.codex_path or "sdk-pinned", turn_timeout=self.turn_timeout)
@@ -170,6 +193,12 @@ class CodexRuntime:
             raise
         return self
 
+    def _make_broker(self):
+        from .tool_broker import ToolBroker
+        # Investigation supplies its shared budget per turn. Migration retains
+        # bounded I/O across this runtime and each turn keeps its own deadline.
+        return ToolBroker(self.read_scope, self._log, seconds=self.turn_timeout * 48)
+
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
@@ -180,6 +209,8 @@ class CodexRuntime:
         self._cwd = Path(cwd).resolve()
         if not self._cwd.is_dir():
             raise ValueError("cwd must be an existing directory")
+        if self._broker is not None:
+            instructions += self._broker.instructions()
         kwargs = dict(cwd=str(self._cwd), base_instructions=instructions,
                       sandbox=self._sandbox.read_only, approval_mode=self._approval,
                       ephemeral=True)
@@ -187,10 +218,20 @@ class CodexRuntime:
             kwargs["model"] = self.model
         if self.model_provider:
             kwargs["model_provider"] = self.model_provider
-        self._thread = self._call(self._codex.thread_start(**kwargs),
-                                  timeout=min(30, self.turn_timeout))
+        if self.read_scope is None:
+            self._thread = self._call(self._codex.thread_start(**kwargs), timeout=min(30, self.turn_timeout))
+        else:
+            from .sandbox_scope import start_scoped_thread
+            self._thread = self._call(start_scoped_thread(self._codex, self.read_scope,
+                cwd=self._cwd, instructions=instructions, model=self.model, model_provider=self.model_provider,
+                dynamic_tools=self._broker.tools if self._broker is not None else None),
+                timeout=min(30, self.turn_timeout))
+            self._log('model_scope', scope=self.read_scope.data(),
+                      read_profile=self.read_scope.profile(True), edit_profile=self.read_scope.profile(False))
         self._log("thread_started", thread_id=self._thread.id, cwd=str(self._cwd),
-                  sandbox="read_only", approval_mode="deny_all")
+                  sandbox="read_only", approval_mode="deny_all",
+                  permissions=self.read_scope.profile(True) if self.read_scope else None)
+        self._require_open()
         return self._thread.id
 
     def run(self, prompt: str, read_only: bool = True,
@@ -213,6 +254,7 @@ class CodexRuntime:
         started = time.monotonic()
         self._log("turn_requested", thread_id=self._thread.id, prompt=prompt,
                   sandbox="read_only" if read_only else "workspace_write",
+                  permissions=self.read_scope.profile(read_only) if self.read_scope else None,
                   output_schema=wire_schema)
         if self._deepseek_schema_compat and output_schema is not None:
             self._log("deepseek_schema_compat", original_required=output_schema.get("required", []),
@@ -223,8 +265,8 @@ class CodexRuntime:
         if failure is not None:
             # One corrective re-ask: a malformed structured reply is a
             # transport-level defect (e.g. a closing-brace slip), not a
-            # reasoned answer, so it must not consume the caller's retry
-            # budget or kill the run. Second failure is terminal.
+            # reasoned answer. It shares the call deadline and total model
+            # budget; it does not reset either. Second failure is terminal.
             self._log("output_retry", thread_id=self._thread.id, error=failure)
             correction = ("Your previous reply failed machine parsing/validation:\n"
                           + failure
@@ -232,7 +274,7 @@ class CodexRuntime:
                             "JSON schema exactly: one JSON object only, valid syntax, no Markdown "
                             "fences, no commentary, no trailing characters.")
             result = self._call(self._consume(correction, read_only, wire_schema),
-                                timeout=self.turn_timeout)
+                                timeout=max(0, self.turn_timeout - (time.monotonic() - started)))
             output, failure = self._validated_output(result, output_schema, validator)
             if failure is not None:
                 error = CodexRuntimeError("Codex output does not satisfy the requested JSON schema: "
@@ -243,6 +285,7 @@ class CodexRuntime:
         result.update(output=output, elapsed_seconds=round(time.monotonic() - started, 3),
                       events_path=str(self.events_path))
         self._log("turn_result", **result)
+        self._require_open()
         return result
 
     def _validated_output(self, result: dict[str, Any], output_schema, validator):
@@ -314,27 +357,79 @@ class CodexRuntime:
 
 
     async def _consume(self, prompt: str, read_only: bool, output_schema) -> dict[str, Any]:
+        self._output_guard()
+        from .retrieval import ACTIVE_BUDGET, ACTIVE_MODEL_BUDGET
+        limit = ACTIVE_MODEL_BUDGET.get()
+        if limit is not None:
+            limit.claim()
         turn_options: dict[str, Any] = {}
         if self.model:
             turn_options["model"] = self.model
         if self.reasoning_effort:
             turn_options["effort"] = self.reasoning_effort
-        self._handle = await self._thread.turn(
-            prompt, cwd=str(self._cwd), approval_mode=self._approval,
-            sandbox=self._sandbox.read_only if read_only else self._sandbox.workspace_write,
-            output_schema=output_schema, **turn_options)
+        if self._broker is not None:
+            self._broker.begin(self._thread.id, self._cwd, read_only, self.turn_timeout, ACTIVE_BUDGET.get())
+        try:
+            if self.read_scope is None:
+                self._handle = await self._thread.turn(
+                    prompt, cwd=str(self._cwd), approval_mode=self._approval,
+                    sandbox=self._sandbox.read_only if read_only else self._sandbox.workspace_write,
+                    output_schema=output_schema, **turn_options)
+            else:
+                from .sandbox_scope import scoped_turn
+                self._handle = await scoped_turn(self._codex, self._thread, self.read_scope, prompt,
+                    cwd=self._cwd, read_only=read_only, output_schema=output_schema, **turn_options)
+            if self._broker is not None:
+                self._broker.bind_turn(self._handle.id)
+        except BaseException:
+            if self._broker is not None: self._broker.end()
+            raise
         self._log("turn_started", thread_id=self._thread.id, turn_id=self._handle.id)
         items, usage, completed = [], None, None
-        async for notification in self._handle.stream():
-            payload = _plain(notification.payload)
-            method = notification.method
-            self._log("sdk_notification", method=method, payload=payload)
-            if method == "item/completed":
-                items.append(payload["item"])
-            elif method == "thread/tokenUsage/updated":
-                usage = payload.get("token_usage", payload.get("tokenUsage"))
-            elif method == "turn/completed":
-                completed = payload["turn"]
+        counted_tools = set()
+        try:
+            self._output_guard()
+            async for notification in self._handle.stream():
+                payload = _plain(notification.payload)
+                method = notification.method
+                self._log("sdk_notification", method=method, payload=payload)
+                self._output_guard()
+                if self._broker is not None and self._broker.failure is not None:
+                    raise self._broker.failure
+                if method == 'item/started':
+                    item = payload.get('item', {})
+                    budget = ACTIVE_BUDGET.get()
+                    if self._broker is not None and item.get('type') in ('commandExecution', 'mcpToolCall', 'webSearch', 'fileChange'):
+                        raise CodexRuntimeError('unexpected native tool bypassed controller broker', kind='NATIVE_TOOL_BYPASS')
+                    if self._broker is None and budget is not None and item.get('type') in ('commandExecution', 'mcpToolCall', 'dynamicToolCall', 'webSearch', 'fileChange'):
+                        identity = item.get('id')
+                        if identity is None or identity not in counted_tools:
+                            budget.command_timeout(self.turn_timeout)
+                            counted_tools.add(identity)
+                if method == "item/completed":
+                    items.append(payload["item"])
+                elif method == "thread/tokenUsage/updated":
+                    usage = payload.get("token_usage", payload.get("tokenUsage"))
+                elif method == "turn/completed":
+                    completed = payload["turn"]
+        finally:
+            if self._broker is not None:
+                try:
+                    self._broker.end()
+                except Exception as exc:
+                    raise CodexRuntimeError('Controller tool callback cleanup unverified', kind='BACKGROUND_CLEANUP_FAILED') from exc
+            if self.read_scope is not None:
+                # A read-only policy on the *next* turn cannot revoke write
+                # permissions from old exec sessions. Drain registered terminal
+                # processes before the controller inspects/exports this result,
+                # including malformed replies, stream errors and cancellation.
+                from .sandbox_scope import clean_background_terminals
+                try:
+                    await asyncio.wait_for(clean_background_terminals(self._codex, self._thread), 5)
+                    self._log('background_terminals_cleaned', thread_id=self._thread.id)
+                except Exception as exc:
+                    raise CodexRuntimeError('Cannot confirm background terminal cleanup',
+                                            kind='BACKGROUND_CLEANUP_FAILED') from exc
         handle_id = self._handle.id
         self._handle = None
         if completed is None:
@@ -352,18 +447,46 @@ class CodexRuntime:
         return result
 
     def _call(self, coroutine, *, timeout: float):
+        from .retrieval import ACTIVE_BUDGET, BudgetExceeded
+        from .output_budget import OutputBudgetUnavailable
         try:
+            try:
+                self._output_guard()
+            except BaseException:
+                coroutine.close()
+                raise
+            budget = ACTIVE_BUDGET.get()
+            if budget is not None:
+                try:
+                    timeout = min(timeout, budget.remaining())
+                except BudgetExceeded:
+                    coroutine.close()
+                    raise
             return self._loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
+        except OutputBudgetUnavailable:
+            self.close()
+            raise
+        except BudgetExceeded as exc:
+            self._log('runtime_error', kind='BUDGET_EXHAUSTED', message=str(exc))
+            self.close()
+            raise
         except asyncio.TimeoutError as exc:
             self._log("runtime_error", kind="TIMEOUT", message=f"Operation exceeded {timeout} seconds")
             self.close()
+            if budget is not None:
+                try:
+                    budget.remaining()
+                except BudgetExceeded as exhausted:
+                    raise exhausted from exc
             raise CodexRuntimeError(f"Codex operation exceeded {timeout} seconds", kind="TIMEOUT") from exc
         except CodexRuntimeError as exc:
             self._log("runtime_error", kind=exc.kind, message=str(exc), details=exc.details)
+            if exc.kind in ('BACKGROUND_CLEANUP_FAILED', 'NATIVE_TOOL_BYPASS'):
+                self.close()
             raise
         except Exception as exc:
             message = self._redact(str(exc))
-            kind = _error_kind(message)
+            kind = getattr(exc, 'kind', None) or _error_kind(message)
             self._log("runtime_error", kind=kind, message=message, error_type=type(exc).__name__)
             raise CodexRuntimeError(message, kind=kind) from exc
 
@@ -371,6 +494,15 @@ class CodexRuntime:
         if self._closed:
             return
         self._closed = True
+        broker_error = None
+        if self._broker is not None:
+            self._broker.cancelled.set()
+            try:
+                self._broker.end()
+            except Exception as exc:
+                broker_error = exc
+        client = getattr(self._codex, '_client', None)
+        process = getattr(getattr(client, '_sync', None), '_proc', None)
         if self._loop is not None:
             try:
                 if self._handle is not None:
@@ -384,12 +516,32 @@ class CodexRuntime:
             except Exception as exc:
                 self._log("close_error", message=str(exc))
             finally:
+                # SDK 0.154 terminates/drains its child but leaves the two read
+                # pipe objects open. Close them only after confirmed child exit.
+                if process is not None and process.poll() is not None:
+                    for stream in (process.stdout, process.stderr):
+                        if stream is not None:
+                            stream.close()
                 self._loop.close()
                 self._log("runtime_closed")
+        if broker_error is not None:
+            raise CodexRuntimeError('Controller callback cleanup unverified', kind='BACKGROUND_CLEANUP_FAILED') from broker_error
 
     def _require_open(self):
         if self._closed or self._loop is None or self._codex is None:
             raise RuntimeError("Use CodexRuntime inside a with statement")
+        from .output_budget import OutputBudgetUnavailable
+        try:
+            self._output_guard()
+        except OutputBudgetUnavailable:
+            self.close()
+            raise
+
+    def _output_guard(self):
+        if self._output_error is not None:
+            raise self._output_error
+        if self._output_budget is not None:
+            self._output_budget.check()
 
     def _redact(self, text: str) -> str:
         for secret in self._secrets:
@@ -399,14 +551,28 @@ class CodexRuntime:
         return text
 
     def _log(self, event: str, **data) -> None:
-        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._log_lock:
+            self._append_log(event, **data)
+
+    def _append_log(self, event: str, **data) -> None:
+        # Exhaustion must not throw out of cleanup callbacks or mask a
+        # restoration error. Main-thread gates stop further model work.
+        if self._output_error is not None:
+            return
         self._event_count += 1
         entry = dict(sequence=self._event_count, timestamp=datetime.now(timezone.utc).isoformat(),
                      event=event, **data)
         encoded = self._redact(json.dumps(_plain(entry), ensure_ascii=False))
-        fd = os.open(self.events_path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
-        with os.fdopen(fd, "a", encoding="utf-8") as stream:
-            stream.write(encoded + "\n")
+        from .output_budget import write_text, OutputBudgetUnavailable
+        try:
+            write_text(self.events_path, encoded + '\n', append=True, budget=self._output_budget)
+        except (OutputBudgetUnavailable, OSError) as exc:
+            if isinstance(exc, OSError):
+                exc = OutputBudgetUnavailable('runtime event output is unavailable')
+            self._output_error = exc
+            if self._broker is not None:
+                self._broker.failure = exc
+                self._broker.cancelled.set()
 
 
 def _repair_json_tail(text: str) -> str | None:

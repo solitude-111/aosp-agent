@@ -21,7 +21,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -45,11 +48,22 @@ DEEPEN_HINT = ("NOT_AVAILABLE: donor history does not cover the target..source_p
 
 def _git(repo_args: list[str], *args: str, cwd: Path | None = None,
          check: bool = True) -> subprocess.CompletedProcess:
+    from .retrieval import ACTIVE_BUDGET
+    budget = ACTIVE_BUDGET.get()
+    timeout = budget.command_timeout(120) if budget is not None else 120
     env = {**OFFLINE_GIT_ENV, "PATH": "/usr/bin:/bin",
-           "HOME": str(Path.home())}
-    return subprocess.run(["git", "-c", "protocol.allow=never", "-c", "core.hooksPath=/dev/null",
+           "HOME": str(Path.home()), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
+    if sys.platform == 'darwin' and os.environ.get('AOSP_AGENT_GIT_LIBRARY_PATH'):
+        env['DYLD_LIBRARY_PATH'] = os.environ['AOSP_AGENT_GIT_LIBRARY_PATH']
+    git_binary = os.environ.get('AOSP_AGENT_GIT_BIN') or shutil.which('git')
+    if not git_binary:
+        raise ToolError('Git executable is unavailable')
+    from .tool_io import ACTIVE_TOOL_IO
+    io = ACTIVE_TOOL_IO.get()
+    run = io.run if io is not None else subprocess.run
+    return run([git_binary, "-c", "protocol.allow=never", "-c", "core.hooksPath=/dev/null",
                            *repo_args, *args], cwd=cwd, text=True, capture_output=True,
-                          check=check, env=env, timeout=120)
+                          check=check, env=env, timeout=timeout)
 
 
 class ToolError(Exception):
@@ -58,17 +72,36 @@ class ToolError(Exception):
         self.code = code
 
 
+def _optional_log(path, text):
+    """Legacy readonly wrappers report markers when sandbox forbids logs.
+
+    Only a permission denial permits this fallback. Exhaustion, corruption and
+    other storage failures must still stop work; the controller captures the
+    stdout marker under its own output budget.
+    """
+    from .output_budget import write_text, OutputBudgetUnavailable
+    try:
+        write_text(path, text, append=True)
+    except (OSError, OutputBudgetUnavailable) as exc:
+        cause = exc.__cause__ if isinstance(exc, OutputBudgetUnavailable) else exc
+        if not isinstance(cause, PermissionError):
+            raise
+
+
 class RunContext:
-    def __init__(self, run_dir: Path):
+    def __init__(self, run_dir: Path, *, record=None, inspection=None, output_sink=None):
         self.run_dir = run_dir.resolve()
         record_path = self.run_dir / "run.json"
         inspection_path = self.run_dir / "inspection.json"
-        if not record_path.is_file() or not inspection_path.is_file():
+        if (record is None and not record_path.is_file()) or (inspection is None and not inspection_path.is_file()):
             raise ToolError(f"run directory is not prepared: {self.run_dir}")
-        self.record = json.loads(record_path.read_text())
-        self.inspection = json.loads(inspection_path.read_text())
-        self.worktree = Path(self.record["worktree"])
+        self.record = json.loads(record_path.read_text()) if record is None else record
+        self.inspection = json.loads(inspection_path.read_text()) if inspection is None else inspection
+        self.output_sink = output_sink
+        self.worktree = Path(self.record['worktree']) if self.record.get('worktree') else None
+        self.target_repositories = self.record.get('tool_target_repositories', {})
         self.donor_git = self.record.get("donor_git")
+        self.source_repositories = self.record.get('tool_source_repositories', {})
         self.allowed_refs = {self.record[name] for name in
                              ("target_commit", "source_parent", "source_commit")
                              if self.record.get(name)}
@@ -89,16 +122,27 @@ class RunContext:
     def record_history_shas(self, shas: list[str], hunk_id: str) -> None:
         # Best-effort (sandbox may deny); the usage marker carries the SHAs
         # for the controller's post-turn sweep.
-        try:
-            path = self.run_dir / "history-commits.jsonl"
-            with path.open("a") as stream:
-                for sha in shas:
-                    stream.write(json.dumps({"sha": sha, "hunk_id": hunk_id}) + "\n")
-        except OSError:
-            pass
+        path = self.run_dir / "history-commits.jsonl"
+        _optional_log(path, ''.join(json.dumps({"sha": sha, "hunk_id": hunk_id}) + "\n" for sha in shas))
 
     def repo_selection(self, repo: str) -> tuple[list[str], Path | None]:
+        if repo.startswith('donor:'):
+            entry = self.source_repositories.get(repo.split(':', 1)[1])
+            if entry is None:
+                raise ToolError('unknown source step: ' + repo)
+            return ['--git-dir', entry['donor_git']], None
+        if repo.startswith('target:'):
+            key = repo.split(':', 1)[1]
+            entry = self.target_repositories.get(key)
+            if entry is None:
+                raise ToolError('unknown target repository: ' + key)
+            root = Path(entry['root'])
+            if not root.is_dir():
+                raise ToolError('target repository unavailable: ' + key)
+            return [], root
         if repo == "target":
+            if self.worktree is None:
+                raise ToolError('ambiguous target; use target:<repository-key>')
             if not self.worktree.is_dir():
                 raise ToolError("target worktree is missing")
             return [], self.worktree
@@ -115,9 +159,53 @@ class RunContext:
             if not root.is_dir():
                 raise ToolError(f"read-only dependency repository is missing: {key}")
             return [], root
-        raise ToolError("--repo must be target, donor, or dependency:<repository-path>")
+        raise ToolError("--repo must be target:<repository-key>, target, donor, or dependency:<repository-path>")
+
+    def bind_history_target(self, key=None):
+        """History ranges must belong to the explicitly selected target project."""
+        if key is None:
+            if self.target_repositories and len(self.target_repositories) > 1:
+                raise ToolError('multi-repository history requires --target-repo <repository-key>')
+            return
+        entry = self.target_repositories.get(key)
+        if entry is None:
+            raise ToolError('unknown history target repository: ' + key)
+        self.worktree = Path(entry['root'])
+        self.record['target_commit'] = entry['head']
+        self.allowed_refs.add(entry['head'])
+
+    def bind_source(self, source_id=None, hunk_id=None):
+        if not self.source_repositories:
+            return
+        if hunk_id in self.hunks:
+            expected = self.hunks[hunk_id].get('source_id')
+            if source_id and source_id != expected:
+                raise ToolError('source step does not own the requested hunk')
+            source_id = expected
+        entry = self.source_repositories.get(source_id)
+        if entry is None:
+            raise ToolError('multi-source history requires --source-step or a source-owned hunk ID')
+        self.donor_git = entry['donor_git']
+        self.record.update({k: entry[k] for k in ('source_commit', 'source_parent', 'donor_git')})
+        self.allowed_refs.update((entry['source_commit'], entry['source_parent']))
 
     def check_ref(self, ref: str, repo: str = "target") -> str:
+        if repo.startswith('donor:'):
+            entry = self.source_repositories.get(repo.split(':', 1)[1])
+            if entry is None or ref not in (entry['source_commit'], entry['source_parent']):
+                raise ToolError('ref is not pinned for source step ' + repo)
+            return ref
+        if repo.startswith('target:'):
+            entry = self.target_repositories.get(repo.split(':', 1)[1])
+            if entry is None or ref != entry['head']:
+                raise ToolError('ref is not the pinned commit for ' + repo)
+            return ref
+        if repo == 'target' and self.target_repositories:
+            if len(self.target_repositories) != 1:
+                raise ToolError('ambiguous target; use target:<repository-key>')
+            if ref != next(iter(self.target_repositories.values()))['head']:
+                raise ToolError('ref is not the pinned target commit')
+            return ref
         if repo.startswith("dependency:"):
             key = repo.split(":", 1)[1]
             dependency = self.dependency_repositories.get(key)
@@ -184,7 +272,8 @@ def _truncate_tail(text: str, limit: int) -> str:
 
 def _finish(ctx: RunContext, cmd: str, args, output: str, code: int = 0,
             extra: dict | None = None) -> int:
-    sys.stdout.write(output if output.endswith("\n") or not output else output + "\n")
+    if ctx.output_sink is None:
+        sys.stdout.write(output if output.endswith("\n") or not output else output + "\n")
     entry = {"time": time.time(), "cmd": cmd, "uid": uuid.uuid4().hex[:12],
              "args": {key: str(value) for key, value in args._get_kwargs()
                       if value is not None and key != "run_dir"},
@@ -195,12 +284,11 @@ def _finish(ctx: RunContext, cmd: str, args, output: str, code: int = 0,
     # (run_dir lies outside the sandboxed workspace); the stdout marker below
     # is always emitted and the controller sweeps it from sdk-events into
     # tool-usage.jsonl after the turn, so no invocation goes unlogged.
-    try:
-        with (ctx.run_dir / "tool-usage.jsonl").open("a") as stream:
-            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-    except OSError:
-        pass
-    sys.stdout.write(USAGE_MARKER + json.dumps(entry, ensure_ascii=False) + "\n")
+    if ctx.output_sink is None:
+        _optional_log(ctx.run_dir / "tool-usage.jsonl", json.dumps(entry, ensure_ascii=False) + "\n")
+        sys.stdout.write(USAGE_MARKER + json.dumps(entry, ensure_ascii=False) + "\n")
+    else:
+        ctx.output_sink(output, entry)
     return code
 
 
@@ -210,26 +298,36 @@ def cmd_locate_symbol(ctx: RunContext, args) -> int:
     if not validate_symbol:
         raise ToolError("--symbol must be a plain identifier")
     repo_args, cwd = ctx.repo_selection(args.repo)
-    located = symbols.locate_in_revision(repo_args, ref, args.symbol, cwd=cwd)
-    if located.get("error"):
-        output = (f"locate-symbol failed at {args.repo} {ref}:\n{located['error']}\n"
-                  "Check that the revision exists in that repository.")
-        return _finish(ctx, "locate-symbol", args, output, code=0)
+    languages = getattr(args, 'language', None)
+    pathspecs = (tuple(dict.fromkeys(p for lang in languages for p in symbols.LANGUAGE_PATHSPECS[lang]))
+                 if languages else symbols.DEFAULT_PATHSPECS)
+    located = symbols.locate_in_revision(repo_args, ref, args.symbol, cwd=cwd, pathspecs=pathspecs)
+    scope = 'Search scope: ' + ', '.join(pathspecs) + '; lexical identifiers at the pinned revision.\n'
+    if located['status'] == 'READ_FAILED':
+        output = (f"READ_FAILED at {args.repo} {ref}:\n{located['error']}\n" + scope +
+                  "Symbol and operation existence remain unknown.")
+        return _finish(ctx, "locate-symbol", args, output, code=3,
+                       extra={'read_status': 'READ_FAILED', 'search_scope': located['scope']})
     if located["found"]:
         output = (f"Symbol {args.symbol} at {args.repo}/{ref}:\n"
                   + "\n".join(located["matches"][:20])
                   + "\nUse view-code to read any of these locations before editing.\n")
     else:
-        candidates = symbols._harvest_candidates(repo_args, ref, args.symbol, cwd=cwd)
+        try:
+            candidates = symbols._harvest_candidates(repo_args, ref, args.symbol, cwd=cwd, pathspecs=pathspecs)
+        except (OSError, subprocess.SubprocessError):
+            candidates = []  # Optional spelling hints do not change the primary lookup.
         nearest = symbols.nearest_symbols(args.symbol, candidates)
-        output = (f"The symbol {args.symbol} does not exist at {args.repo}/{ref}.\n")
+        output = (f"NOT_FOUND_IN_SCOPE: {args.symbol} at {args.repo}/{ref}.\n"
+                  "This is not proof that the symbol or equivalent operation is absent.\n")
         if nearest:
             output += ("Nearest existing names (check carefully whether one is the "
                        f"renamed counterpart): {', '.join(nearest)}.\n")
         else:
             output += "No similarly named symbol was found nearby.\n"
         output += "If the code was renamed or moved, use hunk-history to trace it.\n"
-    return _finish(ctx, "locate-symbol", args, output)
+    return _finish(ctx, "locate-symbol", args, output + scope,
+                   extra={'read_status': located['status'], 'search_scope': located['scope']})
 
 
 def cmd_view_code(ctx: RunContext, args) -> int:
@@ -241,11 +339,25 @@ def cmd_view_code(ctx: RunContext, args) -> int:
     if args.start < 1 or args.end < args.start:
         raise ToolError("--start/--end must describe a 1-based ascending range")
     repo_args, cwd = ctx.repo_selection(args.repo)
-    blob = _git(repo_args, "show", f"{ref}:{path}", cwd=cwd, check=False)
+    try:
+        blob = _git(repo_args, "show", f"{ref}:{path}", cwd=cwd, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return _finish(ctx, 'view-code', args, 'READ_FAILED: ' + type(exc).__name__
+                       + '; file existence and affectedness remain unknown.', 3,
+                       extra={'read_status': 'READ_FAILED'})
     if blob.returncode != 0:
-        output = (f"This file doesn't exist in this commit ({args.repo}/{ref}:{path}).\n"
-                  "Consider whether the hunk needs porting, or locate the moved file first.\n")
-        return _finish(ctx, "view-code", args, output)
+        try:
+            tree = _git(repo_args, 'ls-tree', '-z', ref, '--', path, cwd=cwd, check=False)
+        except (OSError, subprocess.SubprocessError):
+            tree = None
+        if tree is not None and tree.returncode == 0 and not tree.stdout:
+            return _finish(ctx, 'view-code', args,
+                f'PATH_ABSENT: {args.repo}/{ref}:{path}. The pinned tree has no such path.\n'
+                'This does not establish absence of the operation; inspect moved/equivalent implementations.',
+                extra={'read_status': 'PATH_ABSENT'})
+        return _finish(ctx, 'view-code', args,
+            'READ_FAILED: Git could not read the requested object. File existence and affectedness remain unknown.\n'
+            + blob.stderr[-1000:], 3, extra={'read_status': 'READ_FAILED'})
     lines = blob.stdout.split("\n")
     start, end = args.start, args.end
     notes = []
@@ -409,16 +521,36 @@ def _locate_block_in_commit(show_text: str, context_lines: list[str]):
 
 def _write_wrappers(run_dir: Path) -> None:
     """Generate the four thin wrapper scripts for model turns (P2.2)."""
-    python = Path(sys.executable)
-    project_root = Path(__file__).resolve().parent.parent
+    # These read tools depend only on the standard library. Use the actual
+    # interpreter executable, avoiding virtualenv launcher symlinks that can
+    # traverse unreadable aliases under a restricted filesystem profile.
+    python = Path(sys.executable).resolve()
+    git_binary = shutil.which('git')
+    if not git_binary:
+        raise ToolError('Git executable is unavailable')
+    git_binary = Path(git_binary).resolve()
+    from .sandbox_scope import git_library_path
+    library_env = shlex.quote('AOSP_AGENT_GIT_LIBRARY_PATH=' + git_library_path(git_binary))
+    # Copy only agent Python modules into this run's readable surface. Importing
+    # a package from an otherwise denied project parent can fail, while granting
+    # that parent would expose datasets, sibling runs and local documents.
+    project_root = run_dir / 'tool-runtime'
+    package = project_root / 'aosp_agent'
+    package.mkdir(parents=True, exist_ok=True)
+    for source in Path(__file__).resolve().parent.glob('*.py'):
+        from .output_budget import write_bytes
+        write_bytes(package / source.name, source.read_bytes())
     bin_dir = run_dir / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
     for command in ("locate-symbol", "view-code", "hunk-history", "show-commit"):
         script = (f"#!/usr/bin/env bash\n"
-                  f"exec env PYTHONPATH={project_root} {python} -m aosp_agent.agent_tools "
-                  f"--run-dir {run_dir.resolve()} {command} \"$@\"\n")
+                  f"exec env {shlex.quote('PYTHONPATH=' + str(project_root))} "
+                  f"{shlex.quote('AOSP_AGENT_GIT_BIN=' + str(git_binary))} {library_env} "
+                  f"{shlex.quote(str(python))} -m aosp_agent.agent_tools "
+                  f"--run-dir {shlex.quote(str(run_dir.resolve()))} {command} \"$@\"\n")
         path = bin_dir / command
-        path.write_text(script)
+        from .output_budget import write_text
+        write_text(path, script)
         path.chmod(0o755)
 
 
@@ -431,6 +563,8 @@ def main(argv: list[str] | None = None) -> int:
     locate.add_argument("--repo", required=True)
     locate.add_argument("--ref", required=True)
     locate.add_argument("--symbol", required=True)
+    locate.add_argument('--language', choices=sorted(symbols.LANGUAGE_PATHSPECS), action='append',
+                        help='Limit the searched source languages (repeatable); omitted searches all supported source extensions')
     view = sub.add_parser("view-code")
     view.add_argument("--repo", required=True)
     view.add_argument("--ref", required=True)
@@ -439,31 +573,34 @@ def main(argv: list[str] | None = None) -> int:
     view.add_argument("--end", type=int, required=True)
     history = sub.add_parser("hunk-history")
     history.add_argument("--hunk-id", required=True)
+    history.add_argument('--target-repo')
     show = sub.add_parser("show-commit")
     show.add_argument("--sha", required=True)
     show.add_argument("--hunk-id")
+    show.add_argument('--target-repo')
+    show.add_argument('--source-step')
     args = parser.parse_args(argv)
     ctx = None
     try:
         ctx = RunContext(args.run_dir)
+        if args.cmd in ('hunk-history', 'show-commit'):
+            ctx.bind_history_target(args.target_repo)
+            ctx.bind_source(getattr(args, 'source_step', None), getattr(args, 'hunk_id', None))
         handler = {"locate-symbol": cmd_locate_symbol, "view-code": cmd_view_code,
                    "hunk-history": cmd_hunk_history, "show-commit": cmd_show_commit}[args.cmd]
         return handler(ctx, args)
-    except ToolError as exc:
+    except (ToolError, OSError, subprocess.SubprocessError) as exc:
+        code = getattr(exc, 'code', 3)
         print(f"error: {exc}", file=sys.stderr)
         if ctx is not None:
             entry = {"time": time.time(), "cmd": args.cmd, "uid": uuid.uuid4().hex[:12],
                      "args": {key: str(value) for key, value in args._get_kwargs()
                               if value is not None and key != "run_dir"},
-                     "returncode": exc.code, "bytes_out": 0,
+                     "returncode": code, "bytes_out": 0,
                      "rejected": str(exc)[:200]}
-            try:
-                with (ctx.run_dir / "tool-usage.jsonl").open("a") as stream:
-                    stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            except OSError:
-                pass
+            _optional_log(ctx.run_dir / "tool-usage.jsonl", json.dumps(entry, ensure_ascii=False) + "\n")
             print(USAGE_MARKER + json.dumps(entry, ensure_ascii=False))
-        return exc.code
+        return code
 
 
 if __name__ == "__main__":

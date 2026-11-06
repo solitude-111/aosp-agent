@@ -1,107 +1,37 @@
 """Conservative Android.bp source ownership from pinned target blobs.
 
-Supports literal modules, globs and filegroup references. Dynamic expressions,
+Supports bounded static variables/expressions, modules, globs and filegroup references. Unknown expressions,
 conditional source lists, ambiguous names and source-bearing defaults remain
 explicitly unresolved; this is not a replacement for the Soong evaluator.
 """
-import json
 from pathlib import PurePosixPath
 import re
-import subprocess
 
-TOKEN = re.compile(r'\s+|//[^\n]*|/\*[\s\S]*?\*/|"(?:\\.|[^"\\])*"|[A-Za-z_][\w.]*|\d+|[{}\[\]:,]|\S')
+from .blueprint_literals import parse_metadata
+from .blueprint_glob import glob_matches
+from .build_metadata import load_metadata
+
 BUILDABLE = {'java_library', 'java_library_static', 'java_library_host', 'java_test', 'java_test_host',
              'android_library', 'android_app', 'android_test', 'cc_library', 'cc_library_static',
              'cc_library_shared', 'cc_binary', 'cc_test', 'rust_library', 'rust_binary'}
+TEST_MODULES = {'java_test', 'java_test_host', 'android_test', 'cc_test'}
 CONDITIONAL = {'arch', 'target', 'product_variables', 'soong_config_variables'}
 
 
 def parse_modules(text, path):
-    tokens = [m[0] for m in TOKEN.finditer(text)
-              if not m[0].isspace() and not m[0].startswith(('//', '/*'))]
-    modules, issues = [], []
-    def value(i):
-        token = tokens[i]
-        if token.startswith('"'):
-            return json.loads(token), i + 1
-        if token in ('true', 'false'):
-            return token == 'true', i + 1
-        if token in ('[', '{'):
-            obj, end = ([] if token == '[' else {}), (']' if token == '[' else '}')
-            i += 1
-            while tokens[i] != end:
-                if isinstance(obj, dict):
-                    key = tokens[i]
-                    if tokens[i + 1] != ':' or key in obj:
-                        raise ValueError('invalid or duplicate property')
-                    item, i = value(i + 2)
-                    obj[key] = item
-                else:
-                    item, i = value(i)
-                    obj.append(item)
-                if tokens[i] == ',':
-                    i += 1
-                elif tokens[i] != end:
-                    raise ValueError('dynamic expression')
-            return obj, i + 1
-        # Literals such as numeric SDK levels are harmless properties.
-        if token.isdigit():
-            return int(token), i + 1
-        raise ValueError('non-literal expression')
-    i = 0
-    while i + 1 < len(tokens):
-        if not re.fullmatch(r'[A-Za-z_]\w*', tokens[i]) or tokens[i + 1] != '{':
-            i += 1
-            continue
-        kind, start = tokens[i], i + 1
-        depth, end = 0, start
-        while end < len(tokens):
-            depth += (tokens[end] == '{') - (tokens[end] == '}')
-            end += 1
-            if depth == 0:
-                break
-        try:
-            properties, parsed_end = value(start)
-            if parsed_end != end or not isinstance(properties.get('name'), str):
-                raise ValueError('missing literal name')
-            modules.append({'kind': kind, 'path': path, 'properties': properties,
-                            'name': properties['name']})
-        except (ValueError, IndexError) as exc:
-            issues.append({'path': path, 'kind': kind, 'reason': str(exc)})
-        i = end
+    modules, issues, _ = parse_metadata(text, path)
     return modules, issues
 
 
-def glob_matches(pattern, path):
-    if pattern.startswith('/') or '..' in PurePosixPath(pattern).parts:
-        return False
-    parts, index = [], 0
-    while index < len(pattern):
-        if pattern[index:index + 3] == '**/':
-            parts.append('(?:.*/)?'); index += 3
-        elif pattern[index:index + 2] == '**':
-            parts.append('.*'); index += 2
-        elif pattern[index] == '*':
-            parts.append('[^/]*'); index += 1
-        elif pattern[index] == '?':
-            parts.append('[^/]'); index += 1
-        else:
-            parts.append(re.escape(pattern[index])); index += 1
-    return re.fullmatch(''.join(parts), path) is not None
-
-
 def discover_build(repo, paths, limit=2000):
-    modules, issues = [], []
-    bp_files = sorted(p for p in repo.files if PurePosixPath(p).name == 'Android.bp')
-    if len(bp_files) > limit:
+    # The cold index includes sibling consumers. Subsequent calls at the same
+    # pinned revision reuse parsed facts without traversing or reading the tree.
+    metadata = load_metadata(repo, limit)
+    if metadata['limit_exceeded']:
         return {'status': 'UNRESOLVED', 'modules': [], 'uncovered': sorted(paths),
                 'issues': [{'reason': 'build file scan limit exceeded'}]}
-    for bp in bp_files:
-        try:
-            found, errors = parse_modules(repo.read(bp), bp)
-            modules.extend(found); issues.extend(errors)
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            issues.append({'path': bp, 'reason': str(exc)})
+    modules, issues = metadata['modules'], list(metadata['issues'])
+    metadata_inputs = metadata['metadata_inputs']
     by_name = {}
     for module in modules:
         by_name.setdefault(module['name'], []).append(module)
@@ -142,18 +72,73 @@ def discover_build(repo, paths, limit=2000):
             else:
                 found |= inside and glob_matches(source, relative)
         return found
-    targets, covered = [], set()
+    def could_consume(module, path, seen=frozenset()):
+        """Only prune a consumer when literal metadata proves no source edge.
+
+        Look through every conditional branch and defaults; this does not
+        evaluate the product configuration. Unknown references remain possible.
+        Exclusions are ignored here, making this an over-approximation.
+        """
+        identity = (module['path'], module['name'])
+        if identity in seen:
+            return True
+        directory = str(PurePosixPath(module['path']).parent)
+        relative = path if directory == '.' else path.removeprefix(directory + '/')
+        inside = directory == '.' or relative != path
+        pending = [module['properties']]
+        while pending:
+            props = pending.pop()
+            if not isinstance(props, dict):
+                continue
+            pending.extend(v for v in props.values() if isinstance(v, dict))
+            for field in ('srcs', 'defaults'):
+                values = props.get(field, [])
+                if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+                    return True
+                for value in values:
+                    if field == 'defaults' or value.startswith(':'):
+                        reference = value if field == 'defaults' else value[1:]
+                        candidates = by_name.get(reference, [])
+                        if len(candidates) != 1 or could_consume(candidates[0], path, seen | {identity}):
+                            return True
+                    elif glob_matches(value, relative) and inside:
+                        return True
+        return False
+
+    targets, covered, production_covered = [], set(), set()
+    # Opaque source-bearing modules/read failures may hide a consumer. Do not
+    # turn a successful test or a second simple consumer into complete coverage.
+    unresolved = [dict(issue) for issue in issues if 'kind' not in issue
+                  or issue['kind'] in BUILDABLE | {'filegroup'} or issue['kind'].endswith('_defaults')
+                  or issue.get('source_bearing')]
     for module in modules:
-        if module['kind'] not in BUILDABLE or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', module['name']):
+        if module['kind'] == 'filegroup' or module['kind'].endswith('_defaults'):
             continue
         try:
+            if not any(could_consume(module, path) for path in paths):
+                continue
+            if module['kind'] not in BUILDABLE or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', module['name']):
+                raise ValueError('unsupported consumer kind or module name: ' + module['kind'])
             matched = [path for path in paths if owns(module, path, set())]
             if matched:
                 targets.append({'name': module['name'], 'build_file': module['path'],
-                                'kind': module['kind'], 'sources': sorted(matched)})
+                                'kind': module['kind'], 'sources': sorted(matched),
+                                'role': 'test' if module['kind'] in TEST_MODULES else 'production'})
                 covered.update(matched)
+                if module['kind'] not in TEST_MODULES:
+                    production_covered.update(matched)
         except ValueError as exc:
-            issues.append({'path': module['path'], 'module': module['name'], 'reason': str(exc)})
-    return {'status': 'RESOLVED' if paths and covered == set(paths) else 'UNRESOLVED',
+            issue = {'path': module['path'], 'module': module['name'], 'reason': str(exc)}
+            issues.append(issue)
+            if module['kind'] not in TEST_MODULES:
+                unresolved.append(issue)
+    return {'status': 'RESOLVED' if paths and production_covered == set(paths) and not unresolved else 'UNRESOLVED',
             'modules': targets, 'uncovered': sorted(set(paths) - covered), 'issues': issues,
-            'scope': 'literal_source_ownership_not_product_reachability'}
+            'production_uncovered': sorted(set(paths) - production_covered),
+            'unresolved_consumers': unresolved,
+            'retrieval_scope': 'project_build_files',
+            'scope': 'static_source_ownership_not_product_reachability',
+            'metadata_inputs': metadata_inputs,
+            'metadata_index': metadata.get('index'),
+            'expression_policy': 'bounded_blueprint_static_values_v1',
+            'glob_policy': 'blueprint_posix_bounded_v1'}
