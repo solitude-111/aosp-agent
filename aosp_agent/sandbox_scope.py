@@ -78,6 +78,9 @@ class ModelScope:
         # These overrides belong only to this SDK subprocess. Do not change
         # the operator's config/auth files or silently inherit connected tools.
         settings = {
+            # A custom profile table requires an explicit default even before
+            # thread/start selects its profile. Never inherit a broader default.
+            'default_permissions': self.profile(True),
             'mcp_servers': {}, 'web_search': 'disabled', 'project_doc_max_bytes': 0,
             'shell_environment_policy.inherit': 'none',
             'shell_environment_policy.set': SHELL_ENV,

@@ -155,6 +155,9 @@ class ToolBrokerTest(unittest.TestCase):
     def test_actual_sdk_typed_reads_edits_and_no_native_execution(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw).resolve(); file = root / 'candidate'; file.write_text('original')
+            # The SDK subprocess must work without an operator's pre-existing
+            # default_permissions setting masking an incomplete scoped config.
+            sdk_home = root / 'sdk-home'; sdk_home.mkdir()
             marker = root / 'native-marker'
             calls = [
                 ('aosp_read_file', {'path': 'candidate', 'start': 1, 'end': 2}),
@@ -166,7 +169,8 @@ class ToolBrokerTest(unittest.TestCase):
                 class Scope(ModelScope):
                     def config_overrides(self): return super().config_overrides() + provider.overrides()
                 with CodexRuntime(root / 'events.jsonl', model='gpt-5.1-codex', model_provider='scope_probe',
-                                  turn_timeout=20, read_scope=Scope((root,), (file, marker))) as runtime:
+                                  turn_timeout=20, read_scope=Scope((root,), (file, marker)),
+                                  env={'CODEX_HOME': str(sdk_home)}) as runtime:
                     runtime.start(root, 'Harmless controller tools test.')
                     for read_only in (True, False, True, False):
                         runtime.run('Execute the requested test tool.', read_only=read_only)
