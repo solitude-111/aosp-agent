@@ -3,6 +3,7 @@ import unittest
 
 from aosp_agent.diff_engine import DiffBackportAgent
 from aosp_agent.engine import AssessmentError
+from aosp_agent.mapping_plan import MappingEvidenceError
 from aosp_agent.scope_evidence import check_scope
 from engine_fixtures import GitFixture, BASELINE, FIXED
 from test_diff_workflow import diff
@@ -69,6 +70,22 @@ class ScopeEvidenceTest(unittest.TestCase):
             assessment['scope_closure']['units'][0]['proof_steps'][2]['evidence'] = [2]
             with self.assertRaisesRegex(AssessmentError, 'mapped target evidence'):
                 check_scope(agent, assessment, required=True)
+
+    def test_scope_repair_reports_missing_sides_and_unmapped_references_together(self):
+        with GitFixture() as fx:
+            agent, assessment = self.setup_scope(fx)
+            row = assessment['scope_closure']['units'][0]
+            row['evidence'] = [e for e in row['evidence'] if e['origin'] != 'patch_after']
+            row['evidence'][0].update(path='repo/check_lower.py', line_end=1,
+                                      excerpt='from counter import normalize_count')
+            row['proof_steps'][2]['evidence'] = [2]
+            with self.assertRaises(MappingEvidenceError) as raised:
+                check_scope(agent, assessment, required=True)
+            issues = raised.exception.errors
+            prefix = '/scope_closure/units/0'
+            self.assertTrue(any(e['path'] == prefix + '/evidence' and 'missing: patch_after' in e['error'] for e in issues))
+            self.assertTrue(any(e['path'] == prefix + '/evidence/0' and 'repo/check_lower.py:1-1' in e['error'] for e in issues))
+            self.assertTrue(any(e['path'] == prefix + '/proof_steps/2/evidence' and 'mapped target evidence' in e['error'] for e in issues))
 
     def test_open_question_blocks_final_scope(self):
         with GitFixture() as fx:
