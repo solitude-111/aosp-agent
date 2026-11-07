@@ -37,7 +37,8 @@ class DiffBackportAgent:
                  auto_validation=True, build_runner=None, mapping_model=None,
                  task_id=None, pinned_heads=None, joint_validation=None, repository_keys=None,
                  lazy_reads=False, object_cache=None, assessment_context='', source_sequence=None,
-                 require_scope_closure=False, read_denied_roots=(), max_output_bytes=256 * 1024 * 1024):
+                 require_scope_closure=False, read_denied_roots=(), max_output_bytes=256 * 1024 * 1024,
+                 exclusion_corrections=None):
         self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -62,6 +63,8 @@ class DiffBackportAgent:
         self.inventory_issues = []
         self.lazy_reads, self.object_cache = lazy_reads, object_cache
         self.assessment_context, self.source_sequence = assessment_context, source_sequence
+        from .exclusion_review import ExclusionCorrections
+        self.exclusion_corrections = exclusion_corrections if exclusion_corrections is not None else ExclusionCorrections()
         self.require_scope_closure = require_scope_closure
         self.read_denied_roots = tuple(read_denied_roots)
         self._model_read_roots = None
@@ -517,7 +520,8 @@ class DiffBackportAgent:
                 return self.record
             with self._runtime('assessment') as runtime:
                 from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
-                from .exclusion_review import ExclusionReviewError, review_exclusions, unresolved_exclusions
+                from .exclusion_review import (ExclusionReviewError, ExclusionReviewUnresolved,
+                                               review_exclusions, unresolved_exclusions)
                 from .mapped_impact import ImpactProofError, PROOF_CONTEXT, check_impact_proofs
                 require_causality = self.require_scope_closure or self.donor['status'] == 'VERIFIED_SEQUENCE'
                 runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
@@ -551,6 +555,9 @@ class DiffBackportAgent:
                     except AssessmentError as exc:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))
                         self._save()
+                        if isinstance(exc, ExclusionReviewUnresolved):
+                            assessment = unresolved_exclusions(self, assessment, str(exc))
+                            break
                         if attempt == max_attempts:
                             if isinstance(exc, ImpactProofError):
                                 self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN',

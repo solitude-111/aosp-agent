@@ -122,6 +122,8 @@ class ProjectFirstAgent:
                        'rounds': [], 'runtime_security_proven': False, 'model_execution': 'not_run'}
         self.budget = read_budget or ReadBudget(investigation_seconds, max_git_operations)
         self.factory = ModelTurnLimit(runtime_factory, max_model_turns)
+        from .exclusion_review import ExclusionCorrections
+        self.exclusion_corrections = ExclusionCorrections()
         self.model, self.mapping_model, self.provider = model, mapping_model or model, model_provider
         self.timeout, self.max_projects, self.max_rounds = turn_timeout, max_projects, max_rounds
         self.catalog, self.target_revision, self.pinned_heads = catalog, target_revision, pinned_heads
@@ -328,6 +330,7 @@ class ProjectFirstAgent:
                         read_denied_roots=[self.target_root / p.key for p in self.catalog.projects.values()
                                            if p.key not in keys and any(p.key.startswith(k + '/') for k in keys)],
                         source_sequence=self.source_sequence, _source_lease=_source_lease,
+                        exclusion_corrections=self.exclusion_corrections,
                         **self.donor_options, **self.options)
                     self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
                     result = controller.run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,

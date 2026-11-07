@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 import unittest
 
+from aosp_agent.assessment_repair import digest
 from aosp_agent.diff_engine import DiffBackportAgent
 from aosp_agent.engine import AssessmentError
 from aosp_agent.exclusion_review import ground_review, review_prompt
@@ -69,7 +70,6 @@ class ExclusionReviewTest(unittest.TestCase):
         }], 'limitations': ['Synthetic source fixture only.']}
 
     def wire(self, agent, mapping_replies, review_replies):
-        from aosp_agent.assessment_repair import digest
         replies = [mapping_replies[0]]
         for previous, current in zip(mapping_replies, mapping_replies[1:]):
             replies.append({'base_sha256': digest(previous), 'replacements': [
@@ -125,16 +125,16 @@ class ExclusionReviewTest(unittest.TestCase):
                 stored = json.loads((agent.run_dir / 'exclusion-review-1.json').read_text())
                 self.assertEqual(stored['units'][0]['verdict'], 'CONFIRMED_ABSENT')
 
-    def test_unresolved_proof_does_not_become_a_negative_after_attempts_exhaust(self):
+    def test_unknown_review_stops_without_another_mapping_attempt(self):
         with GitFixture() as fx:
             agent = self.agent(fx)
             proposal = self.proposal(agent)
-            mapping, reviewer, _ = self.wire(agent, [proposal, proposal], [self.review(agent), self.review(agent)])
+            mapping, reviewer, _ = self.wire(agent, [proposal], [self.review(agent)])
             result = agent.run(max_attempts=2)
             self.assertEqual(result['status'], 'INCONCLUSIVE')
-            self.assertEqual(len(mapping.calls), 2)
-            self.assertEqual(len(reviewer.calls), 2)
-            self.assertEqual(len(result['exclusion_reviews']), 2)
+            self.assertEqual(len(mapping.calls), 1)
+            self.assertEqual(len(reviewer.calls), 1)
+            self.assertEqual(len(result['exclusion_reviews']), 1)
             self.assertFalse(agent.children)
 
     def test_declared_equivalent_representation_cannot_confirm_feature_absence(self):
@@ -181,11 +181,43 @@ class ExclusionReviewTest(unittest.TestCase):
             agent = self.agent(fx)
             review = self.review(agent, 'CONFIRMED_ABSENT')
             review['units'][0]['evidence'][1]['excerpt'] = 'return missing_oracle_answer'
-            self.wire(agent, [self.proposal(agent)], [review])
-            result = agent.run(max_attempts=1)
+            retry = {'base_sha256': digest(review), 'replacements': []}
+            mapping, reviewer, _ = self.wire(agent, [self.proposal(agent)], [review, retry, retry])
+            result = agent.run(max_attempts=3)
             self.assertEqual(result['status'], 'INCONCLUSIVE')
+            self.assertEqual(len(mapping.calls), 1)
+            self.assertEqual(len(reviewer.calls), 3)
+            self.assertEqual(len(result['exclusion_reviews'][0]['corrections']), 2)
             self.assertIn('excerpt mismatches', result['exclusion_reviews'][0]['error'])
             self.assertTrue((agent.run_dir / 'exclusion-review-1.json').exists())
+
+    def test_one_local_correction_grounds_target_and_donor_evidence_before_remapping(self):
+        with GitFixture() as fx:
+            agent = self.agent(fx)
+            valid = self.review(agent, 'COUNTERPART_POSSIBLE')
+            evidence = valid['units'][0]['evidence']
+            raw = copy.deepcopy(valid)
+            raw['units'][0]['evidence'][0]['path'] = 'counter.py'
+            raw['units'][0]['evidence'][1]['excerpt'] = 'wrong quote'
+            raw['units'][0]['evidence'][2]['path'] = 'repo/' + evidence[2]['path']
+            correction = {'base_sha256': digest(raw), 'replacements': [
+                {'path': f'/units/0/evidence/{i}', 'value_json': json.dumps(evidence[i])}
+                for i in range(3)]}
+            mapping, reviewer, options = self.wire(agent,
+                [self.proposal(agent), workflow.DiffWorkflowTest().assessment(agent)],
+                [raw, correction])
+            result = agent.run(max_attempts=2, impact_only=True)
+            self.assertEqual(result['status'], 'AFFECTED')
+            self.assertEqual(len(options), 2)  # One assessment and one reviewer session.
+            self.assertEqual(len(reviewer.calls), 2)
+            self.assertTrue(reviewer.calls[1]['read_only'])
+            for i in range(3):
+                self.assertIn(f'/units/0/evidence/{i}', reviewer.calls[1]['prompt'])
+            self.assertIn('old-operation counterparts', mapping.calls[1]['prompt'])
+            entry = result['exclusion_reviews'][0]
+            self.assertEqual(entry['status'], 'REMAP_REQUIRED')
+            self.assertEqual(len(entry['corrections']), 1)
+            self.assertEqual(json.loads((agent.run_dir / entry['file']).read_text()), valid)
 
     def test_review_must_cover_every_excluded_unit(self):
         with GitFixture() as fx:

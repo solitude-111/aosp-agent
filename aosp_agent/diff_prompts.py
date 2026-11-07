@@ -158,7 +158,10 @@ Return the JSON schema. For EACH change-unit id exactly once:
    NOT_AFFECTED with feature_absent needs at least two target excerpts including the relevant entry point.
    Feature-absence proposals receive a separate read-only challenge before acceptance. Prove why the
    faulty operation is absent/unreachable in the OLD implementation; naming missing modern APIs is
-   insufficient. Equivalent existing protection is ALREADY_FIXED; uncertain equivalence is UNKNOWN.
+   insufficient. For equivalent protection, trace the same relevant object/state through its update,
+   the check of that state, and the sensitive operation. A check of another object or stale state
+   does not establish protection. Assess configuration-only changes separately from production
+   operations. Equivalent existing protection is ALREADY_FIXED; uncertain equivalence is UNKNOWN.
    UNKNOWN blocks the entire migration. It is valid to report uncertainty rather than invent a mapping.
 5. Include required existing tests/build/API dependencies among targets. If a new file is necessary,
    declare new_files with a related existing anchor_path and rationale. Only the resulting reviewed

@@ -18,7 +18,7 @@ def digest(raw):
     return hashlib.sha256(json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def apply_repair(raw, repair):
+def apply_repair(raw, repair, *, schema=ASSESSMENT_RESPONSE_SCHEMA):
     """Atomic replacement of existing fields (or optional top-level sections).
 
     No files, commands or controller-derived fields are addressable. Even a
@@ -33,7 +33,7 @@ def apply_repair(raw, repair):
         if not path.startswith('/') or re.search(r'~(?![01])', path):
             raise AssessmentError('invalid assessment correction JSON pointer: ' + path)
         parts = [p.replace('~1', '/').replace('~0', '~') for p in path[1:].split('/')]
-        if parts[0] not in ASSESSMENT_RESPONSE_SCHEMA['properties']:
+        if parts[0] not in schema['properties']:
             raise AssessmentError('correction cannot set controller-derived or unknown fields: ' + path)
         if any(parts[:len(old)] == old or old[:len(parts)] == parts for old in paths):
             raise AssessmentError('overlapping assessment corrections: ' + path)
@@ -61,7 +61,7 @@ def apply_repair(raw, repair):
                 raise ValueError('replacement path does not exist')
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise AssessmentError(f'invalid assessment correction at {path}: {exc}') from exc
-    _shape(candidate, ASSESSMENT_RESPONSE_SCHEMA)
+    _shape(candidate, schema)
     return candidate
 
 
