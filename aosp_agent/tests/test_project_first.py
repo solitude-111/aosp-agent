@@ -49,20 +49,24 @@ class ProjectFirstTest(unittest.TestCase):
                 self.assertEqual(result['rounds'], [])
                 self.assertEqual(len(runtime.calls), min(model_limit, 2))
 
-    def test_replanning_correction_accounts_for_already_admitted_projects(self):
+    def test_replanning_correction_keeps_admitted_projects_without_another_router(self):
         with GitFixture() as fx:
             catalog = self.catalog(fx, peer=True)
             unresolved = self.assessment()
             unresolved['scope_closure']['units'][0]['unresolved_questions'] = ['Check the counter operation again']
-            runtime = QueueRuntime([(self.plan(), None), (unresolved, None),
-                (self.plan(['peer']), None), (self.plan(), None), (self.assessment(), None)])
+            runtime = QueueRuntime([(self.plan(), None), (unresolved, None), (self.assessment(), None)])
             agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=catalog,
-                runtime_factory=runtime.factory, auto_validation=False, max_projects=1)
-            result = agent.run(impact_only=True, max_attempts=2)
+                runtime_factory=runtime.factory, auto_validation=False, max_projects=2)
+            with patch.object(agent, '_plan', wraps=agent._plan) as route:
+                result = agent.run(impact_only=True, max_attempts=2)
             self.assertEqual(result['status'], 'AFFECTED', result)
             self.assertEqual(set(catalog.pins), {'repo'})
-            self.assertEqual(result['routing_rejections'][0]['round'], 2)
-            self.assertEqual(len(runtime.calls), 5)
+            self.assertEqual(route.call_count, 1)
+            self.assertEqual(len(runtime.calls), 3)
+            self.assertIn('Check the counter operation again', runtime.calls[2]['prompt'])
+            self.assertEqual([r['projects'] for r in result['rounds']], [['repo'], ['repo']])
+            plan = json.loads((agent.run_dir / 'routing-plan-2.json').read_text())
+            self.assertEqual(plan['retained_projects'], ['repo'])
 
     def catalog(self, fx, peer=False):
         projects = [Project('repo', 'platform/repo', fx.target)]
@@ -188,14 +192,15 @@ class ProjectFirstTest(unittest.TestCase):
 
     def test_replanning_uses_new_round_records_and_workspaces(self):
         with GitFixture() as fx:
-            runtime = QueueRuntime([(self.plan(), None), (self.plan(), None)])
+            runtime = QueueRuntime([(self.plan(), None)])
             agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
                                       runtime_factory=runtime.factory)
-            seen = []
+            seen, contexts = [], []
             class Executor:
                 def __init__(self, patch, target, run_root, **options):
                     self.run_dir = Path(run_root) / options['task_id']; self.run_dir.mkdir(parents=True)
                     seen.append(self.run_dir)
+                    contexts.append(options['assessment_context'])
                 def run(self, **kwargs):
                     return ({'status': 'INCONCLUSIVE', 'impact_decision': 'UNKNOWN',
                              'replan_required': 'BACKEND_MAPPING_CONFLICT'} if len(seen) == 1 else
@@ -204,4 +209,5 @@ class ProjectFirstTest(unittest.TestCase):
                 result = agent.run(impact_only=True)
             self.assertEqual(result['status'], 'AFFECTED')
             self.assertNotEqual(seen[0], seen[1])
-            self.assertIn('BACKEND_MAPPING_CONFLICT', runtime.calls[1]['prompt'])
+            self.assertIn('BACKEND_MAPPING_CONFLICT', contexts[1])
+            self.assertEqual(len(runtime.calls), 1)

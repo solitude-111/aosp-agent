@@ -24,13 +24,21 @@ class ObjectCache:
         self.observed_bytes = 0
         self.initialized = False
         self.unavailable = None
+        self.transient_retries = 0
 
     def data(self):
         return dict(hits=self.hits, misses=self.misses, evicted=self.evicted, bypassed=self.bypassed,
                     max_bytes=self.max_bytes, max_entry_bytes=self.max_entry_bytes,
                     max_entries=self.max_entries, observed_serialized_bytes=self.observed_bytes,
                     quota_adopted=self.initialized, unavailable=self.unavailable,
+                    transient_retries=self.transient_retries,
                     scope='managed_cache_entries_and_in_progress_serialized_write')
+
+    def retry_transient(self):
+        """Retry a timed-out cache once at a caller-controlled round boundary."""
+        if self.unavailable == 'TimeoutError':
+            self.unavailable = None
+            self.transient_retries += 1
 
     @contextmanager
     def _locked(self):

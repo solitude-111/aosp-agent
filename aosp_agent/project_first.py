@@ -294,12 +294,16 @@ class ProjectFirstAgent:
                 feedback = None
                 for number in range(1, self.max_rounds + 1):
                     self.budget.remaining()
+                    if number > 1:
+                        self.cache.retry_transient()
                     pins = {k: self.catalog.pin(k)['head'] for k in keys}
                     self.record.update(status='INVESTIGATING', selected_projects=keys, pinned_targets=dict(self.catalog.pins))
                     self._save()
                     context = ('\nProject-first investigation. Do not read unloaded projects directly. '
                                'Request needed projects using repository_requests [{repository, unit_id, reason, evidence}]. '
                                'Each request must cite exact loaded target or supplied patch evidence. '
+                               'A failed proof or a mapping correction does not itself justify expanding the project set. '
+                               'State the missing cross-project dependency and cite its source before requesting admission. '
                                'No requests means you must provide scope_closure.units covering every unit: '
                                'unit_id, security_operation, entrypoint_and_flow, dependencies_checked (loaded project keys), '
                                'unresolved_questions, evidence, proof_steps. proof_steps must cover entrypoint, state_flow, '
@@ -348,8 +352,13 @@ class ProjectFirstAgent:
                         keys = expanded
                     elif result.get('replan_required') or result['status'] in ('MIGRATION_INCOMPLETE', 'VALIDATION_FAILED'):
                         if number < self.max_rounds:
-                            selected, plan = self._plan(number + 1, feedback, max_attempts=max_attempts)
-                            keys = list(dict.fromkeys(keys + selected)); self._check_keys(keys)
+                            # Proof/mapping corrections retain admitted projects.
+                            # Expansion is handled above only after check_scope
+                            # has grounded an explicit repository request.
+                            plan = {'summary': 'Reassess admitted projects using prior-round feedback',
+                                    'retained_projects': list(keys),
+                                    'reason': result.get('replan_required') or result['status']}
+                            _write(self.run_dir / f'routing-plan-{number + 1}.json', plan)
                     else:
                         return self._finish(result)
                     self.record['status'] = 'REPLANNING'; self._save()

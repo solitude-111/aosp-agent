@@ -95,6 +95,27 @@ class CacheStorageTest(unittest.TestCase):
             self.assertEqual(cache.data()['unavailable'], 'TimeoutError')
             self.assertFalse(cache.data()['quota_adopted'])
 
+    def test_round_boundary_retries_timeout_and_reuses_checked_entries(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cache = ObjectCache(Path(raw) / 'cache')
+            self.query(cache, 'saved', 'original')
+            with patch.object(cache, '_locked', side_effect=TimeoutError('busy cache')):
+                self.assertEqual(self.query(cache, 'saved', 'fresh').stdout, 'fresh')
+            self.assertEqual(self.query(cache, 'saved', 'bypass').stdout, 'bypass')
+            cache.retry_transient()
+            self.assertEqual(self.query(cache, 'saved', 'unexpected reread').stdout, 'original')
+            self.assertEqual(cache.transient_retries, 1)
+            self.assertIsNone(cache.unavailable)
+
+    def test_round_boundary_does_not_retry_storage_or_safety_failures(self):
+        with tempfile.TemporaryDirectory() as raw:
+            cache = ObjectCache(Path(raw) / 'cache')
+            for error in ('PermissionError', 'OSError'):
+                cache.unavailable = error
+                cache.retry_transient()
+                self.assertEqual(cache.unavailable, error)
+            self.assertEqual(cache.transient_retries, 0)
+
     def test_concurrent_processes_share_capacity_including_temporary_writes(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw) / 'cache'
