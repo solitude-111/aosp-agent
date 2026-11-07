@@ -637,7 +637,8 @@ class AospBackportAgent(CausalityChecks):
 
     def _check_hunk_results(self, response: str,
                             changed_files: list[str],
-                            candidate_patch: str | None = None) -> dict[str, Any]:
+                            candidate_patch: str | None = None, *,
+                            review_mapped=False) -> dict[str, Any]:
         """Require a complete, non-contradictory donor-hunk ledger."""
         claims = [{"id": match.group(1), "status": match.group(2), "reason": match.group(3)}
                   for match in _HUNK_RESULT_RE.finditer(response or "")]
@@ -678,9 +679,6 @@ class AospBackportAgent(CausalityChecks):
                 target_evidence = self._implemented_hunk_evidence(
                     hunks[claim["id"]], candidate_patch)
                 claim["target_evidence"] = target_evidence
-                if target_evidence["required"] and not target_evidence["ok"]:
-                    contradictions.append(
-                        f"{claim['id']}: {target_evidence['error']}")
 
         by_path: dict[str, list[str]] = {}
         for claim in claims:
@@ -705,6 +703,21 @@ class AospBackportAgent(CausalityChecks):
             contradictions.append("missing HUNK-RESULT declarations: " + ", ".join(missing))
         if duplicates:
             contradictions.append("duplicate HUNK-RESULT declarations: " + ", ".join(duplicates))
+        if review_mapped and not contradictions and self.mapping_plan:
+            from .mapped_coverage import review_regions
+            review_regions(self, claims, candidate_patch)
+        for claim in claims:
+            evidence = claim.get('target_evidence')
+            if not evidence or not evidence['required'] or evidence['ok']:
+                continue
+            failed = [row for row in evidence.get('regions', []) if not row['ok'] and 'mapping' in row]
+            if failed:
+                for row in failed:
+                    target = row['mapping']
+                    contradictions.append(f"{claim['id']}: {target['path']}:{target['line_start']}-"
+                                          f"{target['line_end']} ({target['symbol']}): {row['error']}")
+            else:
+                contradictions.append(f"{claim['id']}: {evidence['error']}")
         ok = not contradictions
         return {"ok": ok, "claims": claims, "contradictions": contradictions,
                 "coverage": coverage, "missing_declaration": False,
@@ -1322,6 +1335,16 @@ class AospBackportAgent(CausalityChecks):
                                          for h in inspection["hunks"]])
                            + f"\nThe controller will run {len(self.case.validation)} independent configured checks "
                            "after your edits. Their implementation is not part of the model input.")
+            if self.mapping_plan:
+                regions = [t for t in self.mapping_plan.targets(self.mapping_repository)
+                           if t['status'] == 'AFFECTED' and t['action'] == 'edit']
+                base_prompt += ("\nPinned edit obligations (one per region):\n"
+                                + json.dumps(regions, ensure_ascii=False)
+                                + "\nImplement each obligation with executable edits in its mapped region. "
+                                  "For an unchanged Java method, only a closed set of directly guarded "
+                                  "callers can establish coverage. Check for alternate callers before relying on a guard. "
+                                  "Explain the target-specific change and guarded call paths in the HUNK-RESULT.\n")
+
             self.record["attempts"] = []
             self.record.setdefault("attempt_verifications", {})
             diagnosis_json: dict[str, Any] | None = None
@@ -1414,7 +1437,7 @@ class AospBackportAgent(CausalityChecks):
                     continue
                 claims = self._check_hunk_results(
                     result.get("final_response", ""),
-                    self._last_audit["changed_files"], patch)
+                    self._last_audit["changed_files"], patch, review_mapped=True)
                 self.record["hunk_results"] = claims["claims"]
                 if not claims["ok"]:
                     # P1.6 / r2 revision 6: contradicted or missing declarations
