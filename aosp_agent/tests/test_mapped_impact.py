@@ -9,23 +9,29 @@ from aosp_agent.mapped_impact import ImpactProofError, check_impact_proofs
 from aosp_agent.mapping_plan import _shape
 from aosp_agent.diff_prompts import ASSESSMENT_SCHEMA
 from aosp_agent.project_first import ProjectFirstAgent
-from engine_fixtures import GitFixture, BASELINE, PARTIAL, FIXED, CHECK_LOWER
+from engine_fixtures import GitFixture, BASELINE, PARTIAL, FIXED, CHECK_LOWER, git
 from test_diff_workflow import diff, QueueRuntime
 from mapped_impact_fixtures import proof_groups_for
 import test_project_first as routing
 
 
 class MappedImpactTest(unittest.TestCase):
-    def setup_proofs(self, fx, *, support=False):
+    def setup_proofs(self, fx, *, support=False, flag_cleanup=False):
         content = diff('counter.py', BASELINE, PARTIAL)
         content += (diff('check_lower.py', CHECK_LOWER, CHECK_LOWER + 'assert normalize_count(5) == 5\n') if support
                     else diff('counter.py', PARTIAL, FIXED))
+        if flag_cleanup:
+            before = 'int normalizeCount(int count) {\n    if (Flags.capCount() && count > 10) {\n        return 10;\n    }\n    return count;\n}\n'
+            declaration = 'flag {\n    name: "cap_count"\n    namespace: "counter"\n    metadata {\n        purpose: PURPOSE_BUGFIX\n    }\n}\n'
+            context = 'package: "counter"\ncontainer: "system"\n'
+            content = (diff('Counter.java', before, before.replace('Flags.capCount() && ', ''))
+                       + diff('counter.aconfig', context + declaration, context))
         controller = DiffBackportAgent(content.encode(), fx.repo, fx.run_root,
                                        repository_keys=['repo'], lazy_reads=True)
         rows = []
         for number, unit in enumerate(controller.units, 1):
             unit['id'] = f's{number:03}:' + unit['id']
-            unit['source_id'] = f's{number:03}'
+            unit['source_id'] = 's001' if flag_cleanup else f's{number:03}'
             is_test = support and number == 2
             target = CHECK_LOWER if is_test else BASELINE
             target_path = 'repo/check_lower.py' if is_test else 'repo/counter.py'
@@ -42,6 +48,13 @@ class MappedImpactTest(unittest.TestCase):
                     'reason': 'Counter operation or its direct imported regression.'}]})
         assessment = {'units': rows, 'new_files': [], 'reasoning': 'Both source steps remain explicit.', 'limitations': []}
         assessment['proof_groups'] = proof_groups_for(assessment)
+        if flag_cleanup:
+            self.merge_groups(assessment, support=True)
+            support_link = assessment['proof_groups'][0]['support_links'][0]
+            support_link.update(target_disposition='no_target_edit',
+                                reason='The removed flag guarded the primary repair and the target has no consumer.')
+            support_link['evidence'].append(2)
+            assessment['units'][1]['targets'][0]['action'] = 'read_dependency'
         # The mapper must use the namespaced units as well.
         controller.mapper.units = controller.units
         return controller, assessment
@@ -84,6 +97,29 @@ class MappedImpactTest(unittest.TestCase):
             _shape(assessment, ASSESSMENT_SCHEMA)
             result = check_impact_proofs(controller, controller.ground(assessment), required=True)
             self.assertEqual(result['groups'][0]['support_units'], [controller.units[1]['id']])
+
+    def test_flag_cleanup_stays_in_affected_group_without_edit_obligation(self):
+        with GitFixture() as fx:
+            controller, assessment = self.setup_proofs(fx, flag_cleanup=True)
+            grounded = controller.ground(assessment)
+            result = check_impact_proofs(controller, grounded, required=True)
+            self.assertEqual(grounded['status'], 'AFFECTED')
+            self.assertEqual(grounded['writable_paths'], ['repo/counter.py'])
+            self.assertEqual(result['groups'][0]['no_target_edit_support'], [
+                {'unit_id': controller.units[1]['id'], 'flag': 'cap_count', 'repositories_checked': ['repo']}])
+
+    def test_flag_cleanup_cannot_skip_a_live_consumer_or_unlinked_source(self):
+        for mode, expected in (('live', 'still references'), ('unlinked', 'cite the linked removal')):
+            with self.subTest(mode=mode), GitFixture() as fx:
+                if mode == 'live':
+                    (fx.repo / 'Counter.java').write_text('boolean active = Flags.capCount();\n')
+                    git(fx.repo, 'add', 'Counter.java')
+                    git(fx.repo, 'commit', '-qm', 'retain the flag consumer')
+                controller, assessment = self.setup_proofs(fx, flag_cleanup=True)
+                if mode == 'unlinked':
+                    assessment['proof_groups'][0]['support_links'][0]['evidence'].remove(2)
+                with self.assertRaisesRegex(ImpactProofError, expected):
+                    check_impact_proofs(controller, controller.ground(assessment), required=True)
 
     def test_missing_duplicate_or_uncovered_units_are_rejected(self):
         for mode in ('missing', 'duplicate', 'empty'):

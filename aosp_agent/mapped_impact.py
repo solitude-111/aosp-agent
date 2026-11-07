@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 
 from .discovery import Repository
+from .flag_cleanup import check_flag_cleanup
 from .impact_proof import AssessmentError, CausalityChecks, PROOF_STEP_REQUIREMENTS
 from .mapping_plan import _excerpt
 from .prompts import parse_impact_response
@@ -40,8 +41,17 @@ Other units are explicit support_links to primary units, with a reason and
 1-based impact.evidence indices citing the support unit's available donor sides,
 its target behavior and the target behavior of every supported primary unit.
 This represents prerequisites, helper integration, tests and configuration,
-not permission to discard difficult changes. A group cannot consist only of
-support units. Every mapped target region and each available source side must
+not permission to discard difficult changes. For a deletion-only .aconfig flag
+declaration with no target declaration or consumer, put it in the same AFFECTED
+group as the production guard removal, as a support unit with read_dependency
+targets on the old production path. Set that link's target_disposition to
+no_target_edit. Cite the removed flag name, both available donor sides, the removed
+Flags accessor guard in the primary donor hunk, and the pinned target flow showing
+the linked repair accounts for the old behavior. Explain why any old equivalent
+configuration or consumer requires no edit. The controller checks flag identifiers
+in admitted projects. Keep the primary edit mappings and the full causal proof.
+If this evidence is incomplete, use UNKNOWN or request the missing dependency.
+A group cannot consist only of support units. Every mapped target region and each available source side must
 be cited by the proof steps, causal chain or support links, not unused padding.
 Choose scope_contract.vulnerability_pattern from the donor fault: authorization_boundary
 for missing authority checks, persistent_state_pollution for state reused by the wrong
@@ -173,7 +183,8 @@ def _check(controller, assessment, required):
         for item in chain.get('platform_semantics', []):
             used.update(item['relied_at_evidence'])
             used.update(item['implementation_evidence'])
-        for link in support:
+        no_edit_support = []
+        for link_index, link in enumerate(support):
             linked = set(link['supports'])
             if not linked or not linked <= primaries or len(linked) != len(link['supports']):
                 raise ImpactProofError('support units must link directly to unique primary units in the same group')
@@ -189,6 +200,16 @@ def _check(controller, assessment, required):
             own = {e['revision'] for e in entries if e['unit_id'] == link['unit_id']}
             if not available <= own:
                 raise ImpactProofError('support link must retain its own available donor sides')
+            if link.get('target_disposition') == 'no_target_edit':
+                if proof['status'] != 'AFFECTED' or any(
+                        t['action'] != 'read_dependency' for t in mapped[source['id']]['targets']):
+                    raise ImpactProofError('no_target_edit requires read-only support in an AFFECTED group')
+                try:
+                    no_edit_support.append(check_flag_cleanup(
+                        controller, source, [units[u] for u in sorted(linked)], entries))
+                except AssessmentError as exc:
+                    raise ImpactProofError(f'/proof_groups/{group_index}/support_links/'
+                                           f'{link_index}: {exc}') from exc
             used.update(indices)
 
         if proof['status'] != 'UNKNOWN':
@@ -213,5 +234,7 @@ def _check(controller, assessment, required):
         receipts.append({'id': group['id'], 'unit_ids': group['unit_ids'], 'primary_unit_ids': group['primary_unit_ids'],
             'status': proof['status'], 'support_units': [s['unit_id'] for s in support],
             'platform_behavior_evidence': receipt(proof)})
+        if no_edit_support:
+            receipts[-1]['no_target_edit_support'] = no_edit_support
     return {'status': 'GROUNDED_CAUSAL_PROOFS', 'contract': 'shared_run_impact_rules', 'groups': receipts,
             'runtime_security_proven': False, 'limitation': 'Grounded model proof obligations; not formal semantic proof.'}

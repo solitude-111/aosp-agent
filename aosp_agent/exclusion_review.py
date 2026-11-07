@@ -295,4 +295,7 @@ def unresolved_exclusions(controller, assessment, reason):
             unit['reasoning'] += '\nFeature-absence review did not establish exclusion.'
     result['limitations'].append('Feature-absence review unresolved; see stored review/rejection records.')
     controller.record['exclusion_review_blocked_by'] = reason
-    return controller.ground({k: result[k] for k in ('reasoning', 'limitations', 'units', 'new_files')})
+    response = {k: result[k] for k in ('reasoning', 'limitations', 'units', 'new_files')}
+    if 'proof_groups' in result:
+        response['proof_groups'] = [g for g in result['proof_groups'] if g['impact']['status'] == 'AFFECTED']
+    return controller.ground(response)

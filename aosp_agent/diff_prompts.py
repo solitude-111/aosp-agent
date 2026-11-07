@@ -45,6 +45,7 @@ PROOF_GROUP = obj({'id': STRING, 'unit_ids': array(STRING), 'primary_unit_ids': 
     'impact': MAPPED_IMPACT_SCHEMA, 'support_links': array(obj({
         'unit_id': STRING, 'supports': array(STRING), 'reason': STRING,
         'evidence': array({'type': 'integer', 'minimum': 1})}))})
+PROOF_GROUP['properties']['support_links']['items']['properties']['target_disposition'] = enum('no_target_edit')
 ASSESSMENT_SCHEMA['properties']['proof_groups'] = array(PROOF_GROUP)
 
 # Preserve the materialized format for the checks and downstream consumers.
@@ -161,7 +162,9 @@ Return the JSON schema. For EACH change-unit id exactly once:
    insufficient. For equivalent protection, trace the same relevant object/state through its update,
    the check of that state, and the sensitive operation. A check of another object or stale state
    does not establish protection. Assess configuration-only changes separately from production
-   operations. Equivalent existing protection is ALREADY_FIXED; uncertain equivalence is UNKNOWN.
+   operations. A deleted upstream flag declaration may be an AFFECTED support unit with read_dependency
+   mappings only if the causal group proves why no target edit is needed. Equivalent existing protection
+   is ALREADY_FIXED; uncertain equivalence is UNKNOWN.
    UNKNOWN blocks the entire migration. It is valid to report uncertainty rather than invent a mapping.
 5. Include required existing tests/build/API dependencies among targets. If a new file is necessary,
    declare new_files with a related existing anchor_path and rationale. Only the resulting reviewed
@@ -185,7 +188,8 @@ return unresolved coverage and explain the missing mapping; do not edit outside 
 The controller will generate patches and independently replay them on fresh target worktrees. Runtime
 validation is determined only by the controller's fixed checks; do not claim test PASS.
 Return structured coverage for EVERY unit id in the supplied assessment. For affected units mark implemented only with
-exact current candidate excerpts covering its invariant; all others use not_required with explanation.
+exact current candidate excerpts covering its invariant when the unit has edit mappings. Units with a
+grounded no_target_edit support link and other units without edit obligations use not_required with explanation.
 Coverage is your source review, not independent proof of security. Never claim Android build/device
 success from this source-only phase.
 

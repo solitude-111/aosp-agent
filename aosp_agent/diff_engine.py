@@ -412,15 +412,15 @@ class DiffBackportAgent:
             unit = units[coverage['id']]
             if coverage['status'] == 'unresolved':
                 raise AssessmentError(f'unresolved migration unit: {unit["id"]}: {coverage["explanation"]}')
-            if unit['status'] != 'AFFECTED':
+            required = [t for t in unit['targets'] if t['action'] == 'edit']
+            if unit['status'] != 'AFFECTED' or not required:
                 if coverage['status'] != 'not_required':
-                    raise AssessmentError('unaffected/fixed unit must be marked not_required')
+                    raise AssessmentError('unit without edit obligations must be marked not_required')
                 continue
             if coverage['status'] != 'implemented' or not coverage['evidence']:
                 raise AssessmentError('affected unit requires implemented coverage with candidate evidence')
             related = {t['path'] for t in unit['targets']}
             related.update(a['path'] for a in assessment['new_files'] if a['anchor_path'] in related)
-            required = [t for t in unit['targets'] if t['action'] == 'edit']
             covered = set()
             for e in coverage['evidence']:
                 if e['path'] not in related or e['path'] not in assessment['writable_paths']:

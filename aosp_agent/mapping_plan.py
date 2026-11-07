@@ -185,9 +185,12 @@ class MappingPlanner:
                 raise AssessmentError('AFFECTED/UNKNOWN cannot claim an absence basis')
         affected = {t['path'] for u in raw['units'] if u['status'] == 'AFFECTED'
                     for t in u['targets'] if t['action'] == 'edit'}
+        no_target_edit = {link['unit_id'] for group in raw.get('proof_groups', [])
+                          for link in group['support_links'] if link.get('target_disposition') == 'no_target_edit'}
         for item in raw['units']:
             if item['status'] == 'AFFECTED' and not any(t['action'] == 'edit' for t in item['targets']):
-                raise AssessmentError('affected unit requires at least one explicit edit mapping')
+                if item['id'] not in no_target_edit or not item['targets']:
+                    raise AssessmentError('affected unit requires an explicit edit mapping or a read-only support link')
         new_paths = set()
         for addition in raw['new_files']:
             repo, relative = self._owner(addition['path'])
