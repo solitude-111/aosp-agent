@@ -28,14 +28,15 @@ DONOR = diff('ModernCounter.java', 'void newer() {\n    consumeNew();\n}\n',
 
 
 class MappedCoverageTest(unittest.TestCase):
-    def check(self, before, after, review):
+    def check(self, before, after, review, *, symbol='sink', bounds=None, relationship='same_function'):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / PATH).write_text(after)
             first = before.splitlines().index('    private void sink() {') + 1
+            start, end = bounds or (first, first + 2)
             unit = {'id': 'f001-h001', 'status': 'AFFECTED', 'invariant': 'Policy must guard consumption.',
-                    'targets': [{'path': 'repo/' + PATH, 'symbol': 'sink', 'line_start': first, 'line_end': first + 2,
-                                 'action': 'edit', 'reason': 'Enforce the policy before consumption.'}]}
+                    'targets': [{'path': 'repo/' + PATH, 'symbol': symbol, 'line_start': start, 'line_end': end,
+                                 'action': 'edit', 'relationship': relationship, 'reason': 'Enforce the policy before consumption.'}]}
             hunk = split_hunks(DONOR)[0]
             candidate = diff(PATH, before, after)
             runtime = QueueRuntime([] if review is None else [(review, None)])
@@ -91,6 +92,34 @@ class MappedCoverageTest(unittest.TestCase):
         self.assertFalse(ledger['ok'])
         self.assertIn('without a newly added preceding exit guard', ledger['feedback'])
         self.assertFalse(calls)
+
+    def test_saved_cross_method_mapping_only_credits_the_named_method(self):
+        after = BASELINE.replace('        consume();', GUARD + '        consume();')
+        ledger, calls = self.check(BASELINE, after, self.verdict(after), bounds=(3, 7))
+        self.assertTrue(ledger['ok'], ledger['feedback'])
+        self.assertIn('"effective_range": [6, 7]', calls[0]['prompt'])
+
+    def test_state_field_requires_set_guard_and_clear(self):
+        after = (BASELINE.replace('    boolean legacyPolicy;', '    boolean deferred;\n    boolean legacyPolicy;')
+                 .replace('        sink();', '        this.deferred = true;\n        sink();')
+                 .replace('        consume();', '        if (this.deferred) return;\n        consume();')
+                 .replace('    void consume() {}', '    void consume() { this.deferred = false; }'))
+        review = {'regions': [{'id': 'f001-h001:1', 'verdict': 'COVERED',
+                               'reason': 'The bound state is set, guarded and cleared.',
+                               'candidate_lines': [2], 'state_evidence': [1, 2, 3]}]}
+        options = {'symbol': 'Counter.deferred', 'bounds': (2, 2), 'relationship': 'data_or_configuration'}
+        ledger, calls = self.check(BASELINE, after, review, **options)
+        self.assertTrue(ledger['ok'], ledger['feedback'])
+        self.assertIn('field_lifecycle', calls[0]['prompt'])
+        no_clear = after.replace('    void consume() { this.deferred = false; }', '    void consume() {}')
+        ledger, calls = self.check(BASELINE, no_clear, None, **options)
+        self.assertFalse(ledger['ok'])
+        self.assertIn('missing changed, bound evidence: clear', ledger['feedback'])
+        self.assertFalse(calls)
+        review['regions'][0]['state_evidence'] = [1, 2]
+        ledger, _ = self.check(BASELINE, after, review, **options)
+        self.assertFalse(ledger['ok'])
+        self.assertIn('ungrounded candidate lines', ledger['feedback'])
 
     def test_review_cannot_cite_unchanged_candidate_line(self):
         after = BASELINE.replace('        consume();', GUARD + '        consume();')

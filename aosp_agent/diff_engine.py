@@ -38,7 +38,7 @@ class DiffBackportAgent:
                  task_id=None, pinned_heads=None, joint_validation=None, repository_keys=None,
                  lazy_reads=False, object_cache=None, assessment_context='', source_sequence=None,
                  require_scope_closure=False, read_denied_roots=(), max_output_bytes=256 * 1024 * 1024,
-                 exclusion_corrections=None):
+                 exclusion_corrections=None, assessment_seed=None):
         self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -66,6 +66,7 @@ class DiffBackportAgent:
         from .exclusion_review import ExclusionCorrections
         self.exclusion_corrections = exclusion_corrections if exclusion_corrections is not None else ExclusionCorrections()
         self.require_scope_closure = require_scope_closure
+        self.assessment_seed, self.replan_assessment = assessment_seed, None
         self.read_denied_roots = tuple(read_denied_roots)
         self._model_read_roots = None
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZING',
@@ -528,12 +529,21 @@ class DiffBackportAgent:
                 prompt = (assessment_prompt(self.diff, inventory, location) + self._donor_tools_context()
                           + review_prompt(review) + self.assessment_context
                           + (PROOF_CONTEXT if require_causality else ''))
-                raw = None
+                raw = self.assessment_seed
+                if raw is not None:
+                    prompt = (repair_prompt(raw, 'Use the previous coverage_blockers below. Keep already grounded '
+                                            'evidence and fix only the affected mappings and dependent proof references.')
+                              + '\nAccepted assessment from the previous round:\n' + json.dumps(raw, ensure_ascii=False)
+                              + self.assessment_context + self._donor_tools_context()
+                              + (PROOF_CONTEXT if require_causality else ''))
+                    self.record['assessment_reused_for_coverage_replan'] = True
+                    self._save()
                 for attempt in range(1, max_attempts + 1):
-                    response = self._turn(runtime, prompt, ASSESSMENT_RESPONSE_SCHEMA if attempt == 1 else REPAIR_SCHEMA,
+                    initial = attempt == 1 and self.assessment_seed is None
+                    response = self._turn(runtime, prompt, ASSESSMENT_RESPONSE_SCHEMA if initial else REPAIR_SCHEMA,
                                           read_only=True)
                     try:
-                        if attempt == 1:
+                        if initial:
                             raw = response
                         else:
                             _write(self.run_dir / f'assessment-repair-{attempt}.json', response)
@@ -551,6 +561,7 @@ class DiffBackportAgent:
                             return self.record
                         self.record['causal_evidence'] = check_impact_proofs(self, assessment, require_causality)
                         review_exclusions(self, assessment, inventory, attempt)
+                        self.replan_assessment = raw
                         break
                     except AssessmentError as exc:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))

@@ -1,16 +1,15 @@
 """Candidate-side proof for Java mappings whose donor spelling does not survive."""
-from bisect import bisect_right
 from collections import Counter
 import hashlib
 import json
 import re
 
-from .activation_binding import parse_source
 from .activation_flow import branches, literal_truth, ts_key, txt, walk
 from .diff_prompts import LINE, STRING, array, enum, obj
 from .engine import AssessmentError
 from .git_policy import OFFLINE_GIT_ENV
 from .hunk_scope import change_blocks
+from .java_regions import JavaSource, TYPES, mapped_name, method_name, owner as _owner
 from .mapping_plan import _shape
 from .patches import split_hunks
 
@@ -19,34 +18,10 @@ REVIEW_SCHEMA = obj({'regions': array(obj({
     'id': STRING, 'verdict': enum('COVERED', 'UNRESOLVED'), 'reason': STRING,
     'candidate_lines': array(LINE),
 }))})
+REVIEW_SCHEMA['properties']['regions']['items']['properties']['state_evidence'] = array(LINE)
 MAX_CONTEXT = 48 * 1024
 STATEMENTS = {'if_statement', 'return_statement', 'throw_statement',
               'expression_statement', 'local_variable_declaration'}
-TYPES = {'class_body', 'interface_body', 'enum_body', 'record_declaration'}
-
-
-class JavaSource:
-    def __init__(self, path, text):
-        _, self.tree = parse_source(path, text)
-        # Use UTF-8 byte offsets. Point objects in the pinned parser binding
-        # can crash on large Java trees on the Linux runtime.
-        self.line_starts = [0, *(match.end() for match in re.finditer(b'\n', text.encode()))]
-
-    def first(self, node):
-        return bisect_right(self.line_starts, node.start_byte)
-
-    def last(self, node):
-        return bisect_right(self.line_starts, node.end_byte - 1)
-
-    def snippet(self, node):
-        return {'first_line': self.first(node), 'last_line': self.last(node), 'excerpt': txt(node)}
-
-
-def _owner(node, kinds):
-    cursor = node.parent
-    while cursor is not None and cursor.type not in kinds:
-        cursor = cursor.parent
-    return cursor
 
 
 def _direct_sites(source, method, blocks, region):
@@ -144,6 +119,34 @@ def _parse_path(agent, path, hunks):
     return before, after, blocks
 
 
+def _method_evidence(before, after, blocks, region):
+    start, end = region['line_start'], region['line_end']
+    methods = before.overlapping_methods(start, end)
+    named = [m for m in methods if method_name(m) == mapped_name(region['symbol'])]
+    if len(methods) == 1 and before.first(methods[0]) <= start <= end <= before.last(methods[0]):
+        old = methods[0]
+    elif len(named) == 1:
+        # Older saved plans can span siblings. Credit only the named
+        # declaration's intersection with the pinned mapping.
+        old = named[0]
+        region = {**region, 'line_start': max(start, before.first(old)),
+                  'line_end': min(end, before.last(old))}
+    else:
+        return None, 'map each Java method separately with its pinned declaration and range'
+    identity = ts_key(old)
+    matches = [m for m in after.methods if ts_key(m) == identity]
+    if len(matches) != 1:
+        return None, 'candidate has no uniquely corresponding Java method'
+    new = matches[0]
+    detail = {'baseline': before.snippet(old), 'candidate': after.snippet(new),
+              'effective_range': [region['line_start'], region['line_end']]}
+    direct = _direct_sites(after, new, blocks, region)
+    if direct:
+        return {**detail, 'kind': 'direct_edit', 'added_executable_lines': direct}, None
+    calls, error = _guarded_callers(before, after, old, new, blocks)
+    return (None, error) if error else ({**detail, 'kind': 'guarded_callers', 'call_edges': calls}, None)
+
+
 def collect_regions(agent, claims, candidate_patch):
     """Return structurally grounded review inputs and update precise ledger blockers."""
     plan = agent.mapping_plan
@@ -168,29 +171,21 @@ def collect_regions(agent, claims, candidate_patch):
             if cache[path] is None:
                 continue
             before, after, blocks = cache[path]
-            originals = [method for method in walk(before.tree.root_node) if method.type == 'method_declaration'
-                         and before.first(method) <= region['line_start'] <= region['line_end'] <= before.last(method)]
-            if len(originals) != 1:
-                continue
-            old = originals[0]
-            identity = ts_key(old)
-            methods = [m for m in walk(after.tree.root_node)
-                       if m.type == 'method_declaration' and ts_key(m) == identity]
-            if len(methods) != 1:
-                continue
-            new = methods[0]
-            direct = _direct_sites(after, new, blocks, region)
-            if direct:
-                detail = {'kind': 'direct_edit', 'added_executable_lines': direct}
-            else:
-                calls, error = _guarded_callers(before, after, old, new, blocks)
-                if error:
-                    row['error'] = error
-                    continue
-                detail = {'kind': 'guarded_callers', 'call_edges': calls}
             request = {'id': f"{claim['id']}:{index}", 'mapping': region,
-                       'invariant': units[claim['id']]['invariant'], 'donor_patch': donors[claim['id']]['patch'],
-                       'baseline': before.snippet(old), 'candidate': after.snippet(new), **detail}
+                       'invariant': units[claim['id']]['invariant'], 'donor_patch': donors[claim['id']]['patch']}
+            if region.get('relationship') == 'data_or_configuration':
+                from .java_field_coverage import field_evidence
+                for related in {m['path'] for m in mappings}:
+                    if related not in cache:
+                        cache[related] = _parse_path(agent, related, [h for h in hunks if h['path'] == related])
+                detail, error = field_evidence(region, cache[path], {
+                    p: cache[p] for p in sorted({m['path'] for m in mappings}) if cache[p] is not None})
+            else:
+                detail, error = _method_evidence(before, after, blocks, region)
+            if error:
+                row['error'] = error
+                continue
+            request.update(detail)
             if len(requests) >= 8 or len(json.dumps(request, ensure_ascii=False).encode()) > MAX_CONTEXT:
                 row['error'] = 'mapped coverage proof exceeds its bounded source window'
                 continue
@@ -219,6 +214,11 @@ def _review(agent, requests, candidate_patch):
 For direct_edit, confirm the changed executable code implements that region's part of the invariant.
 For guarded_callers, confirm each listed guard blocks the relevant operation for the same object and
 state at the right time, and ordinary behavior remains possible. A guard or change alone is insufficient.
+For field_lifecycle, verify the same object is updated, used by the guard, and cleared after the
+required state or transition. Inspect all shown uses, including alternate release paths. For COVERED,
+candidate_lines must cite the declaration first_line, and state_evidence must cite 1-based state_uses
+indices for the set, guard_read, and clear roles on the same bound receiver. Missing ordering, identity,
+or release proof is UNRESOLVED.
 If behavior depends on an omitted implementation, path, release condition or unproven ordering, use
 UNRESOLVED. Explain the actual obligation in reason. For COVERED, candidate_lines must include
 a listed added_executable_lines entry for direct_edit, or the first_line of every guard for
@@ -245,6 +245,14 @@ Controller evidence:\n''' + payload, read_only=True, output_schema=REVIEW_SCHEMA
         if request['kind'] == 'direct_edit':
             allowed = set(request['added_executable_lines'])
             valid = bool(cited) and cited <= allowed
+        elif request['kind'] == 'field_lifecycle':
+            from .java_field_coverage import ROLES, receiver_key
+            uses = request['state_uses']
+            indices = row.get('state_evidence', [])
+            valid = (cited == {request['candidate']['first_line']}
+                     and all(1 <= i <= len(uses) for i in indices)
+                     and {uses[i - 1]['role'] for i in indices} == ROLES
+                     and len({receiver_key(uses[i - 1]) for i in indices}) == 1)
         else:
             required = {edge['guard']['first_line'] for edge in request['call_edges']}
             valid = cited == required

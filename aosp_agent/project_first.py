@@ -293,7 +293,7 @@ class ProjectFirstAgent:
                     plan = {'summary': 'Metadata-only inspection hints; no model or semantic conclusion', 'projects': keys}
                 else:
                     keys, plan = self._plan(1, max_attempts=max_attempts)
-                feedback = None
+                feedback, assessment_seed = None, None
                 for number in range(1, self.max_rounds + 1):
                     self.budget.remaining()
                     if number > 1:
@@ -330,7 +330,7 @@ class ProjectFirstAgent:
                         read_denied_roots=[self.target_root / p.key for p in self.catalog.projects.values()
                                            if p.key not in keys and any(p.key.startswith(k + '/') for k in keys)],
                         source_sequence=self.source_sequence, _source_lease=_source_lease,
-                        exclusion_corrections=self.exclusion_corrections,
+                        exclusion_corrections=self.exclusion_corrections, assessment_seed=assessment_seed,
                         **self.donor_options, **self.options)
                     self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
                     result = controller.run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
@@ -345,7 +345,12 @@ class ProjectFirstAgent:
                         return self._finish(result)
                     requests = result.get('scope_requests') or []
                     feedback = {k: result[k] for k in ('status', 'replan_required', 'scope_evidence', 'backend_conflicts',
-                                'causal_evidence', 'coverage_error', 'repository_errors', 'verification', 'joint_verification') if k in result}
+                                'causal_evidence', 'coverage_error', 'coverage_blockers', 'repository_errors',
+                                'verification', 'joint_verification') if k in result}
+                    assessment_seed = None
+                    if (not requests and result.get('coverage_blockers') and controller.replan_assessment is not None
+                            and len(json.dumps(controller.replan_assessment, ensure_ascii=False).encode()) <= 128 * 1024):
+                        assessment_seed = controller.replan_assessment
                     if requests:
                         expanded = list(dict.fromkeys(keys + [r['repository'] for r in requests]))
                         self._check_keys(expanded)
@@ -397,7 +402,7 @@ class ProjectFirstAgent:
         for key in ('status', 'impact_decision', 'patches', 'verification', 'joint_verification',
                     'repository_statuses', 'android_module_build', 'patch_replay', 'source_guard', 'error',
                     'analysis_scope', 'inventory_status', 'completion_blocked_by', 'causal_evidence', 'model_read_boundary',
-                    'retrieval_summary', 'discovery_status',
+                    'retrieval_summary', 'discovery_status', 'coverage_blockers',
                     'post_fix_review', 'post_fix_impact', 'candidate_bundle_sha256'):
             if key in result:
                 self.record[key] = result[key]

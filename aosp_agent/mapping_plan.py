@@ -88,7 +88,7 @@ class MappingPlanner:
             raise AssessmentError(str(exc)) from exc
         return repo, relative
 
-    def _check_target(self, item, target, read):
+    def _check_target(self, item, target, read, java_sources):
         lines = read(target["path"])
         start, end = target['line_start'], target['line_end']
         if start < 1 or end < start or end > len(lines):
@@ -100,6 +100,18 @@ class MappingPlanner:
             if (not re.fullmatch(r'[A-Za-z_$][\w$]*', symbol)
                     or not re.search(r'\b' + re.escape(symbol) + r'\s*\(', '\n'.join(lines[start - 1:end]))):
                 raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
+            if target['action'] == 'edit' and target['path'].endswith('.java'):
+                from .java_regions import JavaSource, method_name
+                path = target['path']
+                if path not in java_sources:
+                    source = JavaSource(path, '\n'.join(lines))
+                    java_sources[path] = None if source.tree.root_node.has_error else source
+                source = java_sources[path]
+                methods = source.overlapping_methods(start, end) if source else []
+                if len(methods) > 1:
+                    ranges = ', '.join(f'{method_name(m)}:{source.first(m)}-{source.last(m)}' for m in methods[:8])
+                    raise AssessmentError('Java edit mapping crosses method boundaries. Map each needed '
+                                          'method separately with its own evidence. Pinned declarations: ' + ranges)
         if not any(e['origin'] == 'target' and e['path'] == target['path']
                    and start <= e['line_start'] <= e['line_end'] <= end for e in item['evidence']):
             raise AssessmentError(f'target mapping lacks an excerpt within its range: {target["path"]}')
@@ -125,7 +137,7 @@ class MappingPlanner:
                 raise AssessmentError('source evidence mismatches supplied diff')
 
     def _check_all_evidence(self, raw, expected):
-        cache, errors = {}, []
+        cache, java_sources, errors = {}, {}, []
         def read(path):
             if path not in cache:
                 repo, relative = self._owner(path)
@@ -140,7 +152,7 @@ class MappingPlanner:
                     raise MappingEvidenceError(errors) from exc
         for i, item in enumerate(raw['units']):
             for j, target in enumerate(item['targets']):
-                check(f'/units/{i}/targets/{j}', lambda: self._check_target(item, target, read))
+                check(f'/units/{i}/targets/{j}', lambda: self._check_target(item, target, read, java_sources))
             for j, evidence in enumerate(item['evidence']):
                 check(f'/units/{i}/evidence/{j}',
                       lambda: self._check_evidence(expected[item['id']], item, evidence, read))

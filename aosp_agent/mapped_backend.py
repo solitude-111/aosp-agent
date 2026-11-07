@@ -67,6 +67,17 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
             patches[key] = {'file': result['patch_file'], 'sha256': result['patch_sha256'],
                             'target': child.case.target_commit, 'replay': result['patch_replay']}
         verification[key] = result.get('final_verification', {'status': 'NOT_RUN'})
+        if verification[key].get('blocked_by') == 'HUNK_LEDGER':
+            for claim in result.get('hunk_results', []):
+                for region in claim.get('target_evidence', {}).get('regions', []):
+                    mapping = region.get('mapping')
+                    if region['ok'] or not mapping:
+                        continue
+                    blockers = controller.record.setdefault('coverage_blockers', [])
+                    if len(blockers) < 16:
+                        blockers.append({'unit_id': claim['id'], 'path': f"{key}/{mapping['path']}",
+                            'line_start': mapping['line_start'], 'line_end': mapping['line_end'],
+                            'symbol': mapping['symbol'], 'error': (region.get('error') or 'unresolved coverage')[:500]})
     controller.record.update(patches=patches, verification=verification,
                              repository_statuses=statuses, execution_path='mapping_then_run_backend')
     ledger = []

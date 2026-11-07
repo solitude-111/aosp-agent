@@ -146,6 +146,9 @@ Return the JSON schema. For EACH change-unit id exactly once:
    in the range; use its identifier (optionally qualified or with a parameter signature), not prose.
    Every range uses the pinned target's line numbers, never donor line numbers or a guessed file end.
    action=edit means THIS region must change; read_dependency is inspected but remains read-only.
+   A Java edit range must stay within one method. If the repair spans methods, list each as a
+   separate target with its own pinned excerpt. For state fields, use ClassName.fieldName and
+   data_or_configuration, and map the production methods that set, read and clear the state.
    For a split function list every old region needing the protection separately with action=edit.
    Explain ambiguity and why competing candidates do or do not represent the same functionality
    in that unit's candidate_resolution field. Each unit needs its own field.

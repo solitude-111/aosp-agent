@@ -68,6 +68,36 @@ class ProjectFirstTest(unittest.TestCase):
             plan = json.loads((agent.run_dir / 'routing-plan-2.json').read_text())
             self.assertEqual(plan['retained_projects'], ['repo'])
 
+    def test_coverage_replan_repairs_the_prior_assessment_with_precise_blockers(self):
+        from aosp_agent.assessment_repair import digest
+        with GitFixture() as fx:
+            prior = self.assessment()
+            correction = {'base_sha256': digest(prior), 'replacements': []}
+            runtime = QueueRuntime([(prior, None), (correction, None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, auto_validation=False)
+            seen = []
+
+            def backend(controller, assessment, **kwargs):
+                seen.append(controller)
+                if len(seen) == 1:
+                    controller.record.update(status='VALIDATION_FAILED', coverage_blockers=[{
+                        'unit_id': 'f001-h001', 'path': 'repo/counter.py', 'symbol': 'normalize_count',
+                        'line_start': 1, 'line_end': 2, 'error': 'missing guard at exact target region'}])
+                else:
+                    controller.record['status'] = 'PATCH_UNVERIFIED'
+                controller._save()
+                return controller.record
+
+            with patch('aosp_agent.text_backend.run_text_backends', side_effect=backend):
+                result = agent.run(max_attempts=1)
+            self.assertEqual(result['status'], 'PATCH_UNVERIFIED', result)
+            self.assertEqual(len(runtime.calls), 2)
+            self.assertIn('missing guard at exact target region', runtime.calls[1]['prompt'])
+            self.assertIn(digest(prior), runtime.calls[1]['prompt'])
+            self.assertTrue(seen[1].record['assessment_reused_for_coverage_replan'])
+            self.assertEqual([r['projects'] for r in result['rounds']], [['repo'], ['repo']])
+
     def catalog(self, fx, peer=False):
         projects = [Project('repo', 'platform/repo', fx.target)]
         if peer:
