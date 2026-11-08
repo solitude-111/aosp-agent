@@ -272,6 +272,25 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertEqual(result['migration']['status'], 'INTERRUPTED')
             self.assertFalse((agent.run_dir / 'rounds/r01/workspace').exists())
 
+    def test_unrelated_scope_error_does_not_discard_a_grounded_causal_group(self):
+        with GitFixture() as fx:
+            patch_bytes = self.source() + diff('optional.py', BASELINE, FIXED).encode()
+            assessment = self.assessment()
+            unit_id = diff_units(patch_bytes.decode())[1]['id']
+            assessment['units'].append({**assessment['units'][0], 'id': unit_id, 'status': 'UNKNOWN',
+                                        'evidence': [], 'targets': []})
+            assessment['scope_closure']['units'].append({
+                **assessment['scope_closure']['units'][0], 'unit_id': unit_id, 'evidence': [], 'proof_steps': []})
+            assessment['proof_groups'] = proof_groups_for(assessment)
+            runtime = QueueRuntime([(assessment, None)])
+            agent = ProjectFirstAgent(patch_bytes, fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, max_rounds=1)
+            result = agent.run()
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+            self.assertEqual(result['causal_evidence']['groups'][0]['unit_ids'], ['f001-h001'])
+            self.assertIn(unit_id, result['migration_scope_error'])
+            self.assertEqual(result['delivery_status'], 'BLOCKED')
+
     def test_resume_only_requests_corrections_to_a_checked_pinned_assessment(self):
         from aosp_agent.assessment_repair import digest
         from aosp_agent.diff_prompts import ASSESSMENT_RESPONSE_SCHEMA

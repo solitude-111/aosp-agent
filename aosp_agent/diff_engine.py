@@ -301,6 +301,40 @@ class DiffBackportAgent:
                 'status': 'CONFIRMED', 'decision': decision, 'assessment_sha256': self.protected[path],
                 'targets': {repo.key: repo.head for repo in self.repos}}
 
+    def _independent_affected_proof(self, assessment):
+        from .mapped_impact import check_impact_proofs
+        from .scope_evidence import check_scope
+        closure = assessment.get('scope_closure', {}).get('units', [])
+        impact_open = {row['unit_id'] for row in closure if row['unresolved_questions']}
+        impact_open.update(row['unit_id'] for row in assessment.get('repository_requests', []))
+        for group in assessment.get('proof_groups', []):
+            if group['impact']['status'] != 'AFFECTED':
+                continue
+            units = set(group['unit_ids'])
+            if units & impact_open:
+                continue
+            try:
+                # Auxiliary declarations still need a grounded support link.
+                # The executable primary units establish the baseline fault.
+                scope = check_scope(self, assessment, True, unit_ids=set(group['primary_unit_ids']))
+                if scope['status'] == 'EXPANSION_REQUIRED' or scope['unresolved_questions']:
+                    continue
+                evidence = check_impact_proofs(self, assessment, True, closed_units=units)
+                if evidence['groups']:
+                    return evidence
+            except AssessmentError:
+                continue
+        return None
+
+    def _block_migration(self, assessment, raw, evidence, reason):
+        self.record['causal_evidence'] = evidence
+        self._record_assessment(assessment, 'AFFECTED')
+        self.record.update(status='INCONCLUSIVE', replan_required='MIGRATION_SCOPE_UNRESOLVED',
+                           completion_blocked_by='MIGRATION_SCOPE_UNRESOLVED', migration_scope_error=reason)
+        self.replan_assessment = raw
+        self._save()
+        return self.record
+
     def _runtime(self, name):
         from .retrieval import ACTIVE_BUDGET
         budget = ACTIVE_BUDGET.get()
@@ -609,7 +643,13 @@ class DiffBackportAgent:
                         _write(self.run_dir / f'assessment-{attempt}.json', raw)
                         assessment = self.ground(raw)
                         from .scope_evidence import check_scope
-                        scope = check_scope(self, assessment, self.require_scope_closure)
+                        try:
+                            scope = check_scope(self, assessment, self.require_scope_closure)
+                        except AssessmentError as exc:
+                            evidence = self._independent_affected_proof(assessment)
+                            if evidence is None:
+                                raise
+                            return self._block_migration(assessment, raw, evidence, str(exc))
                         self.record['scope_evidence'] = scope
                         if scope['status'] in ('EXPANSION_REQUIRED', 'OPEN_QUESTIONS'):
                             decision = 'UNKNOWN'
@@ -647,16 +687,10 @@ class DiffBackportAgent:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))
                         self._save()
                         if isinstance(exc, RepairContractError):
-                            self.record['causal_evidence'] = check_impact_proofs(
+                            evidence = check_impact_proofs(
                                 self, assessment, require_causality, closed_units={u['id'] for u in self.units})
-                            if self.record['causal_evidence']['groups']:
-                                self._record_assessment(assessment, 'AFFECTED')
-                                self.record.update(status='INCONCLUSIVE', replan_required='MIGRATION_SCOPE_UNRESOLVED',
-                                    completion_blocked_by='MIGRATION_SCOPE_UNRESOLVED',
-                                    migration_scope_error=str(exc))
-                                self.replan_assessment = raw
-                                self._save()
-                                return self.record
+                            if evidence['groups']:
+                                return self._block_migration(assessment, raw, evidence, str(exc))
                         if isinstance(exc, ExclusionReviewUnresolved):
                             assessment = unresolved_exclusions(self, assessment, str(exc))
                             break

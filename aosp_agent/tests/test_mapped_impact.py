@@ -98,6 +98,31 @@ class MappedImpactTest(unittest.TestCase):
             result = check_impact_proofs(controller, controller.ground(assessment), required=True)
             self.assertEqual(result['groups'][0]['support_units'], [controller.units[1]['id']])
 
+    def test_baseline_impact_does_not_require_support_migration_evidence(self):
+        with GitFixture() as fx:
+            controller, assessment = self.setup_proofs(fx, support=True)
+            self.merge_groups(assessment, support=True)
+            group = assessment['proof_groups'][0]
+            group['support_links'][0]['evidence'].pop()
+            grounded = controller.ground(assessment)
+            with self.assertRaisesRegex(ImpactProofError, 'support link must retain'):
+                check_impact_proofs(controller, grounded, required=True)
+            result = check_impact_proofs(controller, grounded, required=True, closed_units=set(group['unit_ids']))
+            self.assertEqual(result['groups'][0]['proved_primary_unit_ids'], group['primary_unit_ids'])
+
+    def test_one_complete_primary_proves_impact_without_closing_other_edit_obligations(self):
+        with GitFixture() as fx:
+            controller, assessment = self.setup_proofs(fx)
+            self.merge_groups(assessment)
+            group = assessment['proof_groups'][0]
+            chain = group['impact']['causal_chain']
+            chain['donor_fix_evidence'].pop()
+            grounded = controller.ground(assessment)
+            with self.assertRaises(ImpactProofError):
+                check_impact_proofs(controller, grounded, required=True)
+            result = check_impact_proofs(controller, grounded, required=True, closed_units=set(group['unit_ids']))
+            self.assertEqual(result['groups'][0]['proved_primary_unit_ids'], group['primary_unit_ids'][:1])
+
     def test_flag_cleanup_stays_in_affected_group_without_edit_obligation(self):
         with GitFixture() as fx:
             controller, assessment = self.setup_proofs(fx, flag_cleanup=True)

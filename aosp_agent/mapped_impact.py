@@ -204,9 +204,9 @@ def _check(controller, assessment, required, closed_units):
             source = units[link['unit_id']]
             available = {rev for side, rev in (('before', 'source_parent'), ('after', 'source_fix')) if source[side]}
             own = {e['revision'] for e in entries if e['unit_id'] == link['unit_id']}
-            if not available <= own:
-                raise ImpactProofError('support link must retain its own available donor sides')
-            if link.get('target_disposition') == 'no_target_edit':
+            if closed_units is None and not available <= own:
+                raise RepairContractError('support link must retain its own available donor sides')
+            if closed_units is None and link.get('target_disposition') == 'no_target_edit':
                 if proof['status'] != 'AFFECTED' or any(
                         t['action'] != 'read_dependency' for t in mapped[source['id']]['targets']):
                     raise ImpactProofError('no_target_edit requires read-only support in an AFFECTED group')
@@ -218,7 +218,7 @@ def _check(controller, assessment, required, closed_units):
                                            f'{link_index}: {exc}') from exc
             used.update(indices)
 
-        if proof['status'] != 'UNKNOWN':
+        if proof['status'] != 'UNKNOWN' and closed_units is None:
             for ident in members:
                 selected = [evidence[i - 1] for i in used if evidence[i - 1]['unit_id'] == ident]
                 source = units[ident]
@@ -228,14 +228,23 @@ def _check(controller, assessment, required, closed_units):
                 for target in mapped[ident]['targets']:
                     if not any(target in _mapped_anchor({**e, 'origin': e['revision']}, [target]) for e in selected):
                         raise ImpactProofError('causal proof must use evidence from every mapped target region')
+        proved_primaries = []
         if proof['status'] == 'AFFECTED':
             for ident in primaries:
                 for field in fields:
                     own = [evidence[i - 1] for i in chain[field] if evidence[i - 1]['unit_id'] == ident]
                     if not own:
-                        raise ImpactProofError('each primary unit needs its own causal role: ' + ident + '/' + field)
+                        if closed_units is None:
+                            raise ImpactProofError('each primary unit needs its own causal role: ' + ident + '/' + field)
+                        break
                     if field.startswith('donor_') and not any(checks._evidence_overlaps_donor_delta(e) for e in own):
-                        raise ImpactProofError('primary donor causal evidence must overlap its own fix delta: ' + ident)
+                        if closed_units is None:
+                            raise ImpactProofError('primary donor causal evidence must overlap its own fix delta: ' + ident)
+                        break
+                else:
+                    proved_primaries.append(ident)
+            if closed_units is not None and not proved_primaries:
+                raise ImpactProofError('no primary unit has a complete grounded causal chain for baseline impact')
         from .platform_evidence import receipt
         proof_receipt = {'id': group['id'], 'unit_ids': group['unit_ids'], 'primary_unit_ids': group['primary_unit_ids'],
                          'status': proof['status'], 'support_units': [s['unit_id'] for s in support],
@@ -244,6 +253,7 @@ def _check(controller, assessment, required, closed_units):
         if no_edit_support:
             proof_receipt['no_target_edit_support'] = no_edit_support
         if closed_units is not None:
+            proof_receipt['proved_primary_unit_ids'] = sorted(proved_primaries)
             continue
         obligations = {row['id']: row for row in getattr(controller, 'guarded_obligations', ())
                        if row['unit_id'] in members and proof['status'] == 'AFFECTED'}

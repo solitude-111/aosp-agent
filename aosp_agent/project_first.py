@@ -377,6 +377,8 @@ class ProjectFirstAgent:
                                'Every step needs target evidence inside the mapped region; dependencies_checked must name '
                                'exactly the evidenced mapped projects. For executable entrypoint, state_flow and security_condition '
                                'evidence, each individual target excerpt must fit inside a single function. '
+                               'AIDL and abstract declarations are dependency evidence. Map the pinned implementation '
+                               'or caller as read_dependency and cite its executable statements for those roles. '
                                'Cite multiple narrow excerpts for a flow spanning functions. '
                                'Cite both available donor diff sides and every mapped '
                                'target region, including read dependencies. Put a question in unresolved_questions only if '

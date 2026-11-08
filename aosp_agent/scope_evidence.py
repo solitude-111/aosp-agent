@@ -32,8 +32,10 @@ def ground_evidence(controller, unit_id, evidence):
             raise AssessmentError('scope source excerpt mismatch')
 
 
-def check_scope(controller, assessment, required=False):
+def check_scope(controller, assessment, required=False, *, unit_ids=None):
     requests = assessment.get('repository_requests') or []
+    if unit_ids is not None:
+        requests = [request for request in requests if request['unit_id'] in unit_ids]
     for request in requests:
         if not request['evidence']:
             raise AssessmentError('repository expansion requires grounded evidence, not a bare guess')
@@ -47,9 +49,13 @@ def check_scope(controller, assessment, required=False):
             raise AssessmentError('project-first assessment requires per-unit scope_closure or grounded repository_requests')
         return {'status': 'EXPLICIT_SCOPE_ONLY'}
     expected = {u['id'] for u in controller.units}
+    if unit_ids is not None:
+        expected &= unit_ids
     mapped = {u['id']: u for u in assessment['units']}
     sources = {u['id']: u for u in controller.units}
     rows = closure['units']
+    if unit_ids is not None:
+        rows = [row for row in rows if row['unit_id'] in expected]
     if len(rows) != len(expected) or {r['unit_id'] for r in rows} != expected:
         raise AssessmentError('scope closure must cover every source unit exactly once')
     open_questions, migration_questions = [], []
@@ -140,7 +146,8 @@ def check_scope(controller, assessment, required=False):
                                for d in overlaps[:8]) or 'none'
             report(pointer, unit_id, 'code scope obligations require function-region evidence; '
                    f"{role} cites closure evidence #{evidence_index} at {e['path']}:{e['line_start']}-{e['line_end']}; "
-                   f'overlapping functions: {ranges}. Cite a separate exact excerpt within each needed function.')
+                   f'overlapping functions: {ranges}. For a declaration without a body, retain the declaration '
+                   'as dependency evidence and map the pinned implementation or caller as read_dependency for this role.')
     if errors:
         raise MappingEvidenceError(errors)
     return {'status': ('EXPANSION_REQUIRED' if requests else
