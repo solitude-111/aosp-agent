@@ -335,6 +335,12 @@ class ProjectFirstAgent:
                     self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
                     result = controller.run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
                                             impact_only=impact_only, mechanical=mechanical, _source_lease=_source_lease)
+                    review = result.get('repair_obligation_review', {})
+                    if result.get('backend_conflicts') or result.get('impact_decision') in ('NOT_AFFECTED', 'ALREADY_FIXED'):
+                        self.record.pop('repair_obligation_review', None)
+                        self.record['impact_decision'] = result.get('impact_decision', 'UNKNOWN')
+                    elif result.get('impact_decision') == 'AFFECTED' and review.get('status') == 'UNRESOLVED':
+                        self.record.update(impact_decision='AFFECTED', repair_obligation_review=review)
                     if self.factory.exhausted:
                         raise BudgetExceeded('total model turn budget exhausted in a backend')
                     self.record['rounds'].append({'round': number, 'record': str(controller.run_dir / 'run.json'),
@@ -383,7 +389,7 @@ class ProjectFirstAgent:
             self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN', completion_blocked_by='ROUTING_UNRESOLVED',
                                error={'type': type(exc).__name__, 'message': str(exc)})
         except BudgetExceeded as exc:
-            self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN', completion_blocked_by='BUDGET_EXHAUSTED',
+            self.record.update(status='INCONCLUSIVE', completion_blocked_by='BUDGET_EXHAUSTED',
                                error={'type': type(exc).__name__, 'message': str(exc)})
         except KeyboardInterrupt as exc:
             self.record.update(status='CANCELLED', impact_decision='UNKNOWN',
@@ -403,10 +409,14 @@ class ProjectFirstAgent:
         return self.record
 
     def _finish(self, result, blocked=None):
+        preserve_impact = (self.record.get('impact_decision') == 'AFFECTED'
+                           and self.record.get('repair_obligation_review', {}).get('status') == 'UNRESOLVED'
+                           and not result.get('backend_conflicts')
+                           and result.get('impact_decision') in (None, 'UNKNOWN', 'AFFECTED'))
         for key in ('status', 'impact_decision', 'patches', 'verification', 'joint_verification',
                     'repository_statuses', 'android_module_build', 'patch_replay', 'source_guard', 'error',
                     'analysis_scope', 'inventory_status', 'completion_blocked_by', 'causal_evidence', 'model_read_boundary',
-                    'retrieval_summary', 'discovery_status', 'coverage_blockers',
+                    'retrieval_summary', 'discovery_status', 'coverage_blockers', 'repair_obligation_review',
                     'post_fix_review', 'post_fix_impact', 'candidate_bundle_sha256'):
             if key in result:
                 self.record[key] = result[key]
@@ -414,5 +424,7 @@ class ProjectFirstAgent:
         self.record['selected_projects'] = self.record['rounds'][-1]['projects']
         if blocked:
             self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN', completion_blocked_by=blocked)
+        if preserve_impact:
+            self.record['impact_decision'] = 'AFFECTED'
         self._save()
         return self.record

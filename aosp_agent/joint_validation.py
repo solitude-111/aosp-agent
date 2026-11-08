@@ -244,6 +244,7 @@ def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
 def assess_joint_impact(controller):
     """Review the exact final vector regardless of source-input packaging."""
     from .git_policy import OFFLINE_GIT_ENV
+    from .guarded_repair import review_covers_contract
     from .prompts import SYSTEM
     bundle = candidate_bundle(controller)
     bundle_digest = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
@@ -254,7 +255,8 @@ def assess_joint_impact(controller):
             continue
         previous = child.record.get('post_fix_impact') or {}
         prebuild = child.record.get('repair_obligation_review') or {}
-        if (len(bundle['repositories']) == 1 and prebuild.get('status') == 'COVERED'
+        if (len(bundle['repositories']) == 1 and prebuild
+                and review_covers_contract(prebuild, controller.mapping_plan.data().get('repair_contract', []))
                 and prebuild.get('patch_sha256') == child.record.get('patch_sha256')
                 and prebuild.get('mapping_plan_sha256') == controller.mapping_plan.sha256):
             child.record.update(post_fix_impact=prebuild['impact'], post_fix_patch_sha256=prebuild['patch_sha256'],

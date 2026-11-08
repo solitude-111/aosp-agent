@@ -6,7 +6,7 @@ import unittest
 
 from aosp_agent.discovery import diff_units
 from aosp_agent.engine import AospBackportAgent
-from aosp_agent.guarded_repair import guard_obligations
+from aosp_agent.guarded_repair import guard_obligations, review_covers_contract
 from aosp_agent.mapping_plan import MappingPlan
 from test_diff_workflow import QueueRuntime, diff
 
@@ -27,6 +27,7 @@ PARENT = '''class Controller {
     void reconcile() {}
     void retainUntilSafe() { retained = true; }
     boolean mayRemove() { return !retained; }
+    void cancel() { retained = false; }
 }
 '''
 FIX = PARENT.replace('flag() && ', '')
@@ -44,26 +45,37 @@ class GuardedRepairTest(unittest.TestCase):
         self.assertEqual([o['behavior']['excerpt'] for o in obligations], ['reconcile();', 'retainUntilSafe();'])
         self.assertEqual(guard_obligations(UPSTREAM, PARENT, PARENT), [])
 
-    def check(self, after, *, verdict, reason, evidence=None, corrupt=False):
+    def check(self, after, *, verdict, reason, cancellation='covered', evidence=None, corrupt=False):
         obligations = guard_obligations(UPSTREAM, PARENT, FIX)
         main = {'path': 'repo/' + PATH, 'symbol': 'update', 'line_start': 2, 'line_end': 4,
                 'action': 'edit', 'relationship': 'same_function'}
         dependency = {**main, 'symbol': 'release', 'line_start': 5, 'line_end': 5, 'action': 'read_dependency'}
         unit = {'id': UPSTREAM['id'], 'status': 'AFFECTED', 'targets': [main, dependency],
                 'evidence': [{'origin': 'target', 'path': 'repo/' + PATH, 'line_start': 5, 'line_end': 5,
-                              'excerpt': '    void release() { retained = false; }'}]}
+                              'excerpt': '    void release() { retained = false; }'},
+                             {'origin': 'target', 'path': 'repo/' + PATH, 'line_start': 13, 'line_end': 13,
+                              'excerpt': '    void cancel() { retained = false; }'}]}
         contract = [{**o, 'disposition': 'edit', 'targets': [main, dependency]} for o in obligations]
         after_lines = after.splitlines()
         def cite(text):
             return {'window_id': 'C1', 'line_start': after_lines.index(text) + 1,
                     'line_end': after_lines.index(text) + 1}
-        second = evidence or ([cite('            retainUntilSafe();')] if verdict == 'covered' else [])
+        second = [cite('            retainUntilSafe();')] if verdict == 'covered' else []
         if corrupt:
             second[0]['line_end'] = 1000
+        recheck = cite('            reconcile();')
+        paths = [{'id': 'normal', 'verdict': verdict, 'reason': reason, 'evidence': second}]
+        if cancellation is not None:
+            if evidence is None:
+                evidence = [{'window_id': 'B2', 'line_start': 13, 'line_end': 13}] if cancellation == 'covered' else []
+            paths.append({'id': 'cancellation', 'verdict': cancellation,
+                          'reason': 'Cancellation cleanup evidence.', 'evidence': evidence})
         result = {'regions': [], 'obligations': [
-            {'id': obligations[0]['id'], 'verdict': 'covered', 'reason': 'Reconciles after update.',
-             'evidence': [cite('            reconcile();')]},
-            {'id': obligations[1]['id'], 'verdict': verdict, 'reason': reason, 'evidence': second}],
+            {'id': obligations[0]['id'], 'paths': [
+                {'id': 'normal', 'verdict': 'covered', 'reason': 'Reconciles after update.', 'evidence': [recheck]},
+                {'id': 'cancellation', 'verdict': 'not_applicable', 'reason': 'Recheck completes in the call.',
+                 'evidence': [recheck]}]},
+            {'id': obligations[1]['id'], 'paths': paths}],
             'impact': {'overall_risk': 'low', 'reasoning': 'Local change.',
                        **{k: [] for k in ('affected_callers', 'behavior_changes', 'compatibility_risks',
                                           'performance_notes', 'test_recommendations')}}}
@@ -73,7 +85,7 @@ class GuardedRepairTest(unittest.TestCase):
             candidate = diff(PATH, BASELINE, after)
             runtime = QueueRuntime([(result, None)])
             agent = object.__new__(AospBackportAgent)
-            agent.record = {}
+            agent.record = {"impact_decision": "AFFECTED"}
             agent.case = SimpleNamespace(files=(PATH,))
             agent._current_hunks = [UPSTREAM]
             agent.worktree = agent.run_dir = root
@@ -94,16 +106,19 @@ class GuardedRepairTest(unittest.TestCase):
             self.assertEqual(len(runtime.calls), 1)
             self.assertTrue(runtime.calls[0]['read_only'])
             self.assertTrue(ledger['claims'][0]['target_evidence']['ok'])
-            return ledger, agent.record['repair_obligation_review']
+            self.assertEqual(agent.record['impact_decision'], 'AFFECTED')
+            receipt = agent.record['repair_obligation_review']
+            self.assertEqual(review_covers_contract(receipt, contract), ledger['ok'])
+            return ledger, receipt
 
     def test_exact_guard_match_cannot_hide_missing_behavior(self):
-        ledger, receipt = self.check(PARTIAL, verdict='missing', reason='No retention or safe release.')
+        ledger, receipt = self.check(PARTIAL, verdict='unresolved', reason='No retention or safe release.')
         self.assertFalse(ledger['ok'])
         self.assertIn('No retention or safe release', ledger['feedback'])
         self.assertEqual(receipt['status'], 'UNRESOLVED')
 
     def test_timing_gap_stops_even_with_both_operations(self):
-        ledger, _ = self.check(COMPLETE, verdict='missing', reason='Protection ends when the transition starts.')
+        ledger, _ = self.check(COMPLETE, verdict='unresolved', reason='Protection ends when the transition starts.')
         self.assertFalse(ledger['ok'])
         self.assertIn('Protection ends when the transition starts', ledger['feedback'])
 
@@ -118,7 +133,23 @@ class GuardedRepairTest(unittest.TestCase):
 
     def test_remap_requires_grounded_baseline_dependency(self):
         evidence = [{'window_id': 'B1', 'line_start': 5, 'line_end': 5}]
-        ledger, receipt = self.check(PARTIAL, verdict='remap', reason='Release also needs to be mapped.',
-                                     evidence=evidence)
+        ledger, receipt = self.check(PARTIAL, verdict='unresolved', reason='Release also needs to be mapped.',
+                                     cancellation='remap', evidence=evidence)
         self.assertFalse(ledger['ok'])
-        self.assertEqual(receipt['obligations'][1]['targets_to_reconsider'][0]['symbol'], 'release')
+        target = receipt['obligations'][1]['targets_to_reconsider'][0]
+        self.assertEqual((target['symbol'], target['review_path']), ('release', 'cancellation'))
+
+    def test_normal_coverage_cannot_hide_unconfirmed_or_omitted_cancellation(self):
+        for verdict in ('unresolved', None, 'not_applicable'):
+            with self.subTest(verdict=verdict):
+                ledger, receipt = self.check(COMPLETE, verdict='covered', reason='Normal release.',
+                                             cancellation=verdict)
+                self.assertFalse(ledger['ok'])
+                self.assertEqual(receipt['status'], 'UNRESOLVED')
+                self.assertEqual(receipt['coverage_gaps'][0]['path_id'], 'cancellation')
+                self.assertEqual(receipt['obligations'][1]['paths'][0]['verdict'], 'covered')
+
+    def test_old_aggregate_receipt_cannot_authorize_build(self):
+        contract = guard_obligations(UPSTREAM, PARENT, FIX)
+        old = {'status': 'COVERED', 'obligations': [{**o, 'verdict': 'covered'} for o in contract]}
+        self.assertFalse(review_covers_contract(old, contract))

@@ -1853,9 +1853,11 @@ class AospBackportAgent(CausalityChecks):
         require_output_record(self.run_dir / 'run.json')
         audit = self.audit_diff()
         before = self.record.get("patch_sha256")
-        if self.mapping_plan and self.mapping_plan.data().get('repair_contract'):
+        contract = self.mapping_plan.data().get('repair_contract') if self.mapping_plan else None
+        if contract:
+            from .guarded_repair import review_covers_contract
             receipt = self.record.get('repair_obligation_review', {})
-            if (receipt.get('status') != 'COVERED' or receipt.get('patch_sha256') != before
+            if (not review_covers_contract(receipt, contract) or receipt.get('patch_sha256') != before
                     or receipt.get('mapping_plan_sha256') != self.mapping_plan.sha256
                     or hashlib.sha256(self._render_patch(audit).encode()).hexdigest() != before):
                 return {'status': 'FAIL', 'blocked_by': 'GUARDED_REPAIR_REVIEW',

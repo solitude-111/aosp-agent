@@ -67,6 +67,8 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
             patches[key] = {'file': result['patch_file'], 'sha256': result['patch_sha256'],
                             'target': child.case.target_commit, 'replay': result['patch_replay']}
         verification[key] = result.get('final_verification', {'status': 'NOT_RUN'})
+        if 'repair_obligation_review' in result:
+            controller.record['repair_obligation_review'] = result['repair_obligation_review']
         if result.get('obligation_repairs_exhausted'):
             controller.record['obligation_repairs_exhausted'] = True
         if result.get('obligation_remap_required'):

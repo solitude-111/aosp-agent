@@ -98,6 +98,23 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertTrue(seen[1].record['assessment_reused_for_coverage_replan'])
             self.assertEqual([r['projects'] for r in result['rounds']], [['repo'], ['repo']])
 
+    def test_unconfirmed_coverage_does_not_erase_affect_on_replan_exhaustion(self):
+        from aosp_agent.diff_engine import DiffBackportAgent
+        with GitFixture() as fx:
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                                     repository_keys=['repo'], max_rounds=2)
+            review = {'status': 'UNRESOLVED', 'coverage_gaps': [
+                {'obligation_id': 'hold', 'path_id': 'cancellation', 'reason': 'No cleanup evidence.'}]}
+            with patch.object(DiffBackportAgent, 'run', side_effect=[
+                    {'status': 'VALIDATION_FAILED', 'impact_decision': 'AFFECTED',
+                     'repair_obligation_review': review, 'obligation_remap_required': True},
+                    {'status': 'INCONCLUSIVE', 'impact_decision': 'UNKNOWN',
+                     'replan_required': 'CAUSAL_EVIDENCE_UNRESOLVED'}]):
+                result = agent.run()
+            self.assertEqual(result['status'], 'INCONCLUSIVE')
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+            self.assertEqual(result['repair_obligation_review'], review)
+
     def catalog(self, fx, peer=False):
         projects = [Project('repo', 'platform/repo', fx.target)]
         if peer:

@@ -84,6 +84,26 @@ def discover_obligations(controller):
     return obligations
 
 
+# Both paths are declared by the controller. The reviewer may establish that
+# cancellation is inapplicable, but cannot omit it or decide the aggregate.
+REQUIRED_PATHS = ('normal', 'cancellation')
+
+
+def review_covers_contract(receipt, contract):
+    expected = {row['id'] for row in contract}
+    obligations = receipt.get('obligations', [])
+    return (bool(expected) and receipt.get('status') == 'COVERED'
+            and len(obligations) == len(expected) and {row['id'] for row in obligations} == expected
+            and all(row['verdict'] == 'covered' and _paths_covered(row.get('paths', []))
+                    for row in obligations))
+
+
+def _paths_covered(paths):
+    return (len(paths) == len(REQUIRED_PATHS) and {p['id'] for p in paths} == set(REQUIRED_PATHS)
+            and all(p.get('evidence') and (p['verdict'] == 'covered'
+                        or p['id'] != 'normal' and p['verdict'] == 'not_applicable') for p in paths))
+
+
 def reviewer_schema(regions_schema):
     """Use one read-only turn for coverage and compatibility review."""
     from copy import deepcopy
@@ -91,26 +111,30 @@ def reviewer_schema(regions_schema):
     from .prompts import POST_FIX_SCHEMA
 
     schema = deepcopy(regions_schema)
-    schema['properties']['obligations'] = array(obj({
-        'id': STRING, 'verdict': enum('covered', 'missing', 'remap'), 'reason': STRING,
-        'evidence': array(obj({'window_id': STRING, 'line_start': LINE, 'line_end': LINE})),
-    }))
+    path = obj({'id': enum(*REQUIRED_PATHS), 'verdict': enum('covered', 'unresolved', 'not_applicable', 'remap'),
+                'reason': STRING,
+                'evidence': array(obj({'window_id': STRING, 'line_start': LINE, 'line_end': LINE}))})
+    schema['properties']['obligations'] = array(obj({'id': STRING, 'paths': array(path)}))
     schema['properties']['impact'] = POST_FIX_SCHEMA
     schema['required'] += ['obligations', 'impact']
     return schema
 
 
 REVIEW_GUIDANCE = '''
-Also assess EVERY guarded repair obligation below, even if the candidate exactly matches a changed
-donor line. Compare both fixed donor behaviors and old target behavior. Verify the protection for
-the same object and affected state, from update to check/use and safe release. Follow actual old
-definitions when names might hide semantic differences. A pending/starting transition is not a
-running transition. Check normal removal and relevant alternate/cancellation paths; only explain
-an exemption when it is backed by source evidence. A flag declaration or helper name is insufficient.
-Use covered only with exact source excerpts that prove the whole behavior. Edit obligations need
-at least one exact changed candidate excerpt. For already_covered cite exact baseline protection.
-Use missing when the implementation or proof is incomplete. Use remap only if a grounded baseline
-excerpt in a mapped read-dependency region establishes a required change outside the write obligation.
+For EVERY guarded repair obligation return two separate paths, normal and cancellation.
+Normal covers the required effect and ordinary completion. Cancellation covers relevant alternate exits
+such as abort, timeout, and replacement while the protection is active. Account for each relevant exit
+within that path. Do not mark a path covered while any of its required behavior is unresolved.
+Compare the same object and state through update, protection and safe release. A pending transition is
+not a running transition. Normal needs changed candidate evidence for an edit obligation, or pinned
+baseline protection for already_covered. Cancellation may use either revision. If cancellation does not
+apply, mark it not_applicable with the exact mapped source showing why the operation has no applicable
+alternate exit. A missing callback or absent evidence alone never supports not_applicable.
+Report unresolved with the specific gap when evidence is incomplete. Use remap only with a pinned
+excerpt in a mapped read dependency establishing that an additional change is needed.
+Use at least one distinct source citation showing cancellation handling when claiming that path is covered.
+Record any compatibility concern that leaves a required path unproven in that path's verdict.
+The controller computes each obligation verdict from the paths.
 If the supplied windows cannot resolve a decisive dependency, say what is missing. Use only the
 provided numbered candidate and pinned baseline windows; do not call tools or redo discovery.
 Cite supplied window_id and its 1-based line range. Use the exact coordinates displayed.
@@ -174,13 +198,10 @@ def ground_review(agent, rows, contract, patch, source):
     for entry in source['candidate_windows']:
         windows[entry['window_id']] = ('candidate', entry['path'], dict(entry['lines']))
     cache = {}
-    for row in rows:
-        obligation = expected[row['id']]
-        edit_paths = {t['path'][len(prefix):] for t in obligation['targets']
-                      if t['action'] == 'edit' and t['path'].startswith(prefix)}
-        changed_cite, baseline_cite = False, False
-        remap, grounded = [], []
-        for citation in row['evidence']:
+
+    def ground_citations(citations):
+        grounded = []
+        for citation in citations:
             window_id = citation['window_id']
             if window_id not in windows:
                 raise AssessmentError('unknown obligation evidence window: ' + window_id)
@@ -206,21 +227,67 @@ def ground_review(agent, rows, contract, patch, source):
                 cache[cache_key] = text.splitlines()
             _excerpt(cache[cache_key], evidence)
             grounded.append(evidence)
-            if revision == 'candidate':
-                changed_cite |= path in edit_paths and any(low <= line <= high for line in changed.get(path, ()))
-            else:
-                baseline_cite |= any(t['path'] == prefix + path and t['line_start'] <= low <= high <= t['line_end']
-                                     for t in obligation['targets'])
-                remap.extend(t for t in local_targets if t['path'] == path and t['unit_id'] == obligation['unit_id']
-                             and t['action'] == 'read_dependency'
-                             and t['line_start'] <= low <= high <= t['line_end'])
-        row['evidence'] = grounded
-        if row['verdict'] == 'covered':
-            valid = changed_cite if obligation['disposition'] == 'edit' else baseline_cite
-            if not valid:
-                raise AssessmentError('covered obligation lacks grounded changed/baseline evidence: ' + row['id'])
-        if row['verdict'] == 'remap':
-            if not remap:
-                raise AssessmentError('remap requires pinned evidence in a mapped read dependency: ' + row['id'])
-            row['targets_to_reconsider'] = [{**t, 'path': prefix + t['path']} for t in remap]
+        return grounded
+
+    for row in rows:
+        obligation = expected[row['id']]
+        targets = obligation['targets']
+        edit_paths = {t['path'][len(prefix):] for t in targets
+                      if t['action'] == 'edit' and t['path'].startswith(prefix)}
+        submitted = {p['id']: p for p in row['paths']}
+        if len(submitted) != len(row['paths']) or set(submitted) - set(REQUIRED_PATHS):
+            raise AssessmentError('invalid or duplicate review path for ' + row['id'])
+        paths, remap = [], []
+        for ident in REQUIRED_PATHS:
+            path = dict(submitted.get(ident, {'id': ident, 'verdict': 'unresolved',
+                                             'reason': 'Required path was not reviewed.', 'evidence': []}))
+            try:
+                path['evidence'] = ground_citations(path['evidence'])
+            except AssessmentError as exc:
+                path.update(verdict='unresolved', reason='Invalid source citation: ' + str(exc), evidence=[])
+            changed_cite, baseline_cite, mapped_source = False, False, False
+            suggestions = []
+            for e in path['evidence']:
+                low, high = e['line_start'], e['line_end']
+                matching = [t for t in targets if t['path'] == prefix + e['path']]
+                if e['revision'] == 'candidate':
+                    touched = any(low <= line <= high for line in changed.get(e['path'], ()))
+                    changed_cite |= e['path'] in edit_paths and touched
+                    mapped_source |= touched and any(t.get('relationship') not in ('test', 'data_or_configuration')
+                                                     for t in matching)
+                else:
+                    pinned = [t for t in matching if t['line_start'] <= low <= high <= t['line_end']]
+                    baseline_cite |= bool(pinned)
+                    mapped_source |= any(t.get('relationship') not in ('test', 'data_or_configuration')
+                                         for t in pinned)
+                    suggestions.extend(t for t in local_targets if t['path'] == e['path']
+                                       and t['unit_id'] == obligation['unit_id'] and t['action'] == 'read_dependency'
+                                       and t['line_start'] <= low <= high <= t['line_end'])
+            gap = None
+            if path['verdict'] == 'covered':
+                if not path['evidence']:
+                    gap = 'No grounded evidence was cited for the path.'
+                elif ident == 'normal' and not (changed_cite if obligation['disposition'] == 'edit' else baseline_cite):
+                    gap = 'Normal path lacks grounded changed/baseline evidence.'
+            elif path['verdict'] == 'not_applicable' and (ident == 'normal' or not mapped_source):
+                gap = 'Non-applicability requires a mapped production source citation for an alternate path.'
+            elif path['verdict'] == 'remap':
+                if not suggestions:
+                    gap = 'Remap requires pinned evidence in a mapped read dependency.'
+                else:
+                    remap.extend({**t, 'path': prefix + t['path'], 'review_path': ident} for t in suggestions)
+            if ident != 'normal' and path['verdict'] == 'covered' and path['evidence']:
+                def locations(entries):
+                    return {(e['revision'], e['path'], e['line_start'], e['line_end']) for e in entries}
+                if not locations(path['evidence']) - locations(paths[0]['evidence']):
+                    gap = 'Cancellation requires its own source evidence.'
+            if gap:
+                path.update(verdict='unresolved', reason=gap + ' ' + path['reason'])
+            paths.append(path)
+        gaps = [f"{p['id']}: {p['reason']}" for p in paths if p['verdict'] in ('unresolved', 'remap')]
+        covered = _paths_covered(paths)
+        row.update(paths=paths, verdict='covered' if covered else 'remap' if remap else 'missing',
+                   reason='; '.join(gaps if gaps else [f"{p['id']}: {p['reason']}" for p in paths]))
+        if remap:
+            row['targets_to_reconsider'] = remap
     return rows

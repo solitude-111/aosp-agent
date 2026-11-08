@@ -281,9 +281,11 @@ Controller evidence:\n''' + payload + ('\n' + extra if contract else '\nUse the 
     if contract:
         from .guarded_repair import ground_review
         obligations = ground_review(agent, raw['obligations'], contract, candidate_patch, source)
+        gaps = [{'obligation_id': row['id'], 'path_id': path['id'], 'reason': path['reason']}
+                for row in obligations for path in row['paths'] if path['verdict'] in ('unresolved', 'remap')]
         receipt = {'patch_sha256': patch_sha, 'mapping_plan_sha256': agent.mapping_plan.sha256,
-                   'status': 'COVERED' if all(r['verdict'] == 'covered' for r in obligations) else 'UNRESOLVED',
-                   'obligations': obligations, 'impact': raw['impact']}
+                   'status': 'UNRESOLVED' if gaps else 'COVERED',
+                   'obligations': obligations, 'coverage_gaps': gaps, 'impact': raw['impact']}
         agent.record['repair_obligation_review'] = receipt
     agent._json(f'mapped-coverage-{key[:16]}.json', {'patch_sha256': patch_sha, 'requests': requests,
                  'regions': rows, **({'repair_obligation_review': receipt} if receipt else {})})
