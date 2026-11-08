@@ -98,7 +98,7 @@ from .object_cache import ObjectCache
 
 
 class LazyTree(Mapping):
-    """Exact path lookups read one tree entry; enumeration is explicit escalation."""
+    """Read exact pinned tree entries on demand; enumeration is explicit escalation."""
     def __init__(self, root, head, cache=None, progress=None):
         self.root, self.head, self.cache, self.progress = root, head, cache, progress
         self.entries, self.absent, self.complete = {}, set(), False
@@ -124,15 +124,37 @@ class LazyTree(Mapping):
 
     def __getitem__(self, path):
         validate_relative_path(path)
-        if path in self.entries:
-            return self.entries[path]
-        if path not in self.absent and not self.complete:
-            result = self.query('ls-tree', '-z', '--full-tree', self.head, '--', path)
-            self.entries.update(self._parse(result.stdout))
-            if path in self.entries:
-                return self.entries[path]
-            self.absent.add(path)
-        raise KeyError(path)
+        if path not in self.entries and path not in self.absent and not self.complete:
+            self._read_paths([path])
+        return self.entries[path]
+
+    def _read_paths(self, paths):
+        result = self.query('ls-tree', '-z', '--full-tree', self.head, '--', *paths)
+        found = self._parse(result.stdout)
+        for path in paths:
+            if path in found:
+                self.entries[path] = found[path]
+            else:
+                self.absent.add(path)
+
+    def prefetch(self, paths):
+        """Check exact paths in bounded argv batches and reuse their pinned modes."""
+        if self.complete:
+            return
+        pending = sorted(set(paths) - self.entries.keys() - self.absent)
+        batch = []
+        batch_bytes = 0
+        for path in pending:
+            validate_relative_path(path)
+            path_bytes = len(path.encode()) + 1
+            if batch and (len(batch) >= 128 or batch_bytes + path_bytes > 64 * 1024):
+                self._read_paths(batch)
+                batch = []
+                batch_bytes = 0
+            batch.append(path)
+            batch_bytes += path_bytes
+        if batch:
+            self._read_paths(batch)
 
     def enumerate(self):
         if not self.complete:

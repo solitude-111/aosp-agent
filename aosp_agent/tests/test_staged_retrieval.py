@@ -7,7 +7,7 @@ from unittest.mock import patch
 from aosp_agent import discovery
 from aosp_agent.diff_prompts import assessment_prompt
 from aosp_agent.discovery import Locator, diff_units, repositories
-from aosp_agent.retrieval import ObjectCache
+from aosp_agent.retrieval import ObjectCache, ReadBudget
 from engine_fixtures import GitFixture, git
 from test_diff_workflow import diff
 
@@ -61,6 +61,39 @@ class StagedRetrievalTest(unittest.TestCase):
             self.assertEqual(result['units'][0]['retrieval'][0]['stage'], 'NEARBY_DIRECTORIES')
             self.assertIn('services/Legacy.java', [c['path'] for c in result['units'][0]['candidates']])
             self.assertNotIn('other/Other.java', [c['path'] for c in result['units'][0]['candidates']])
+
+    def test_tree_prefetch_batches_exact_paths_and_reuses_overlaps(self):
+        with GitFixture() as fx:
+            paths = [f'legacy/part {index:03d}.java' for index in range(135)]
+            self.seed(fx, {path: 'commonMarker\n' for path in paths})
+            repo = repositories(fx.repo, lazy=True)[0]
+            budget = ReadBudget(operations=3)
+            with budget.active(), patch.object(discovery, 'local_git', wraps=discovery.local_git) as reads:
+                repo.files.prefetch(paths)
+                repo.files.prefetch(reversed(paths))
+                self.assertTrue(all(repo.files[path] == '100644' for path in paths))
+
+            tree_calls = [call.args[1:] for call in reads.call_args_list if call.args[1] == 'ls-tree']
+            self.assertEqual([len(args[5:]) for args in tree_calls], [128, 7])
+            self.assertTrue(all('-r' not in args for args in tree_calls))
+            self.assertEqual(budget.used, 2)
+            self.assertFalse(repo.files.complete)
+
+    def test_broad_identifier_hits_rank_before_tree_checks_and_blob_reads(self):
+        with GitFixture() as fx:
+            noise = 'class Noise { int acceptCount(int requestedCount) { return 7; } }\n'
+            files = {f'noise/Part{index:03d}.java': noise for index in range(135)}
+            files.update({'services/Modern.java': 'class Modern { int unrelated() { return 7; } }\n',
+                          'legacy/Implementation.java': BEFORE})
+            self.seed(fx, files)
+            _, result, calls = self.locate(fx, 'services/Modern.java')
+            unit = result['units'][0]
+            self.assertIn('legacy/Implementation.java', [c['path'] for c in unit['candidates']])
+            self.assertLessEqual(sum(c[0] == 'show' for c in calls), 25)
+            self.assertTrue(any(c[0] == 'ls-tree' and len(c[5:]) > 1 for c in calls))
+            self.assertTrue(any(i['stage'] == 'identifier_candidate_scan' and i['status'] == 'TRUNCATED'
+                                for i in result['issues']))
+            self.assertFalse(unit['retrieval'][0]['absence_proven'])
 
     def test_unrelated_exact_name_escalates_and_keeps_remote_directory_implementation(self):
         with GitFixture() as fx:

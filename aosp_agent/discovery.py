@@ -364,18 +364,48 @@ class Locator:
         self.anchor_indexes = {}
         self.examined = {}
         self.scan_truncated = set()
+        self.identifier_examined = Counter()
+        self.identifier_truncated = set()
 
-    def admit_candidate(self, repo, path, unit):
+    def admit_candidate(self, repo, path, unit, *, identifier_only=False):
         key = (repo.key, unit['id'])
         seen = self.examined.setdefault(key, set())
-        if path not in seen and len(seen) >= self.scan_limit:
+        if path in seen:
+            return True
+        if len(seen) >= self.scan_limit:
             if key not in self.scan_truncated:
                 self.scan_truncated.add(key)
                 self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'candidate_scan',
                                     'status': 'TRUNCATED', 'scanned': len(seen)})
             return False
+        if identifier_only:
+            limit = 2 * self.candidate_limit
+            if self.identifier_examined[key] >= limit:
+                if key not in self.identifier_truncated:
+                    self.identifier_truncated.add(key)
+                    self.issues.append({'unit': unit['id'], 'repository': repo.key,
+                                        'stage': 'identifier_candidate_scan', 'status': 'TRUNCATED',
+                                        'scanned': self.identifier_examined[key], 'limit': limit})
+                return False
+            self.identifier_examined[key] += 1
         seen.add(path)
         return True
+
+    def shortlist(self, repo, ranked, reasons, unit):
+        from .retrieval import LazyTree
+        lazy = isinstance(repo.files, LazyTree)
+        paths = []
+        for path in ranked[:self.scan_limit]:
+            identifier_only = lazy and all(reason.startswith('identifier:') for reason in reasons[path])
+            if self.admit_candidate(repo, path, unit, identifier_only=identifier_only):
+                paths.append(path)
+        if lazy:
+            try:
+                repo.files.prefetch(paths)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.issues.append({'unit': unit['id'], 'repository': repo.key,
+                                    'stage': 'candidate_tree', 'error': str(exc)[-1000:]})
+        return paths
 
     def read(self, repo: Repository, path: str) -> str:
         key = (repo.key, path)
@@ -417,13 +447,12 @@ class Locator:
             anchors.append(found)
         return anchors
 
-    def anchored_candidates(self, repo, scores, parts, unit):
+    def anchored_candidates(self, repo, scores, reasons, parts, unit):
         if not parts:
             return []
         anchors = []
-        for path in sorted(scores, key=lambda p: (-scores[p], p))[:self.scan_limit]:
-            if not self.admit_candidate(repo, path, unit):
-                continue
+        ranked = sorted(scores, key=lambda p: (-scores[p], p))
+        for path in self.shortlist(repo, ranked, reasons, unit):
             try:
                 sites = self.text_anchor(repo, path, parts)
                 if sites:
@@ -475,17 +504,21 @@ class Locator:
             for repo in self.repos:
                 scores: Counter = Counter()
                 reasons = {}
-                def add(path, score, reason):
-                    if repo.files.get(path) in ('100644', '100755'):
-                        scores[path] += score
-                        reasons.setdefault(path, []).append(reason)
                 from .retrieval import LazyTree
                 lazy = isinstance(repo.files, LazyTree)
+                def score_hint(path, score, reason):
+                    validate_relative_path(path)
+                    scores[path] += score
+                    reasons.setdefault(path, []).append(reason)
+                def add(path, score, reason):
+                    if repo.files.get(path) in ('100644', '100755'):
+                        score_hint(path, score, reason)
+                add_identifier = score_hint if lazy else add
                 direct = paths | normalized_paths
                 direct |= {p[len(repo.key) + 1:] for p in direct if p.startswith(repo.key + '/')}
                 for path in sorted(direct):
                     add(path, 8 if path in paths else 7, 'exact_path' if path in paths else 'version_normalized_path')
-                anchors = self.anchored_candidates(repo, scores, parts, unit)
+                anchors = self.anchored_candidates(repo, scores, reasons, parts, unit)
                 stage, scopes = 'DIRECT_FILES', sorted(scores)
                 def path_hints(entries):
                     for path in entries:
@@ -512,10 +545,10 @@ class Locator:
                                 continue
                             stage = 'NEARBY_DIRECTORIES'; scopes.append(directory + '/')
                             path_hints(entries)
-                            anchors = self.anchored_candidates(repo, scores, parts, unit)
+                            anchors = self.anchored_candidates(repo, scores, reasons, parts, unit)
                             if not anchors:
-                                self.identifier_candidates(repo, query[:3], directory, unit, add, search_log)
-                                anchors = self.anchored_candidates(repo, scores, parts, unit)
+                                self.identifier_candidates(repo, query[:3], directory, unit, add_identifier, search_log)
+                                anchors = self.anchored_candidates(repo, scores, reasons, parts, unit)
                             if anchors:
                                 break
                         except (OSError, ValueError, subprocess.SubprocessError) as exc:
@@ -524,12 +557,12 @@ class Locator:
                 if not anchors and parts:
                     stage = 'PROJECT_PATHS'; scopes.append('.')
                     path_hints(() if lazy and scores else repo.files)
-                    anchors = self.anchored_candidates(repo, scores, parts, unit)
+                    anchors = self.anchored_candidates(repo, scores, reasons, parts, unit)
                     if not anchors:
                         stage = 'ADMITTED_PROJECT'
                         # Separate stable terms preserve rare hits; a single OR
                         # query with alphabetical truncation would lose them.
-                        self.identifier_candidates(repo, query, '', unit, add, search_log)
+                        self.identifier_candidates(repo, query, '', unit, add_identifier, search_log)
                 retrieval.append({'repository': repo.key, 'stage': stage, 'queried_scopes': scopes,
                                   'text_anchors': anchors, 'project_search': 'PERFORMED' if stage == 'ADMITTED_PROJECT' else 'DEFERRED',
                                   'scope_complete': False, 'absence_proven': False,
@@ -539,9 +572,7 @@ class Locator:
                 if len(ranked) > self.scan_limit:
                     self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'candidate_scan',
                                         'status': 'TRUNCATED', 'total': len(ranked), 'scanned': self.scan_limit})
-                for path in ranked[:self.scan_limit]:
-                    if not self.admit_candidate(repo, path, unit):
-                        continue
+                for path in self.shortlist(repo, ranked, reasons, unit):
                     try:
                         content = self.read(repo, path)
                         cache_key = (repo.key, path)
@@ -574,7 +605,8 @@ class Locator:
                     'deferred_project_searches': sum(r['project_search'] == 'DEFERRED' for u in output for r in u['retrieval']),
                     'scope_complete': False, 'absence_proven': False},
                 'impact': 'UNASSESSED', 'function_parser': 'python_ast_or_c_family_lexical_hints',
-                'limits': {'files_per_repo_per_unit': self.scan_limit, 'candidates_per_unit': self.candidate_limit},
+                'limits': {'files_per_repo_per_unit': self.scan_limit, 'candidates_per_unit': self.candidate_limit,
+                           'identifier_only_files_per_lazy_repo_per_unit': 2 * self.candidate_limit},
                 'warning': 'Candidate ranking is retrieval only. Missing or truncated search is not evidence of absence.'}
 
     def history(self, report: dict) -> list[dict]:
