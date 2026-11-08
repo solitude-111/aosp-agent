@@ -9,6 +9,10 @@ from .engine import AssessmentError
 from .mapping_plan import _shape
 
 
+MAX_REUSABLE_ASSESSMENT_BYTES = 1024 * 1024
+INLINE_ASSESSMENT_BYTES = 128 * 1024
+
+
 REPAIR_SCHEMA = obj({'base_sha256': STRING, 'replacements': array(obj({
     'path': STRING, 'value_json': STRING}))})
 REPAIR_SCHEMA['properties']['replacements']['maxItems'] = 64
@@ -16,6 +20,36 @@ REPAIR_SCHEMA['properties']['replacements']['maxItems'] = 64
 
 def digest(raw):
     return hashlib.sha256(json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+
+def seed_context(raw, path):
+    """Inline a small checked seed or expose an indexed, read-only copy in this run."""
+    encoded = json.dumps(raw, ensure_ascii=False)
+    if len(encoded.encode()) <= INLINE_ASSESSMENT_BYTES:
+        return '\nAccepted assessment from the previous round:\n' + encoded
+
+    lines, index = [], []
+
+    def append(pointer, row, units=()):
+        lines.append(pointer)
+        first = len(lines) + 1
+        lines.extend(json.dumps(row, ensure_ascii=False, indent=2).split('\n'))
+        index.append({'pointer': pointer, 'unit_ids': list(units), 'start': first, 'end': len(lines)})
+
+    for key, value in raw.items():
+        if key in ('units', 'proof_groups'):
+            for i, row in enumerate(value):
+                append(f'/{key}/{i}', row, [row['id']] if key == 'units' else row['unit_ids'])
+        elif key == 'scope_closure':
+            for i, row in enumerate(value['units']):
+                append(f'/scope_closure/units/{i}', row, [row['unit_id']])
+        else:
+            append('/' + key, value)
+    from .output_budget import write_text
+    write_text(path, '\n'.join(lines) + '\n')
+    return ('\nAccepted assessment sections are indexed below. Read only sections needed to repair '
+            'the reported gaps with aosp_read_file, in small line ranges, from this run file: '
+            + str(path) + '\n' + json.dumps(index, ensure_ascii=False))
 
 
 def apply_repair(raw, repair, *, schema=ASSESSMENT_RESPONSE_SCHEMA):

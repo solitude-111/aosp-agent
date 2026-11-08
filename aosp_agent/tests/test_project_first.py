@@ -279,6 +279,7 @@ class ProjectFirstTest(unittest.TestCase):
         with GitFixture() as fx:
             assessment = self.assessment()
             assessment['scope_closure']['units'][0]['migration_questions'] = ['Which test target covers the change?']
+            assessment['limitations'] = ['ordinary preserved background ' * 6000]
             first = QueueRuntime([(assessment, None)])
             agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
                 repository_keys=['repo'], runtime_factory=first.factory, auto_validation=False, max_rounds=1)
@@ -299,6 +300,8 @@ class ProjectFirstTest(unittest.TestCase):
                 result = resume_project(agent.run_dir / 'run.json', runtime_factory=runtime.factory)
             self.assertEqual(len(runtime.calls), 1)
             self.assertIn('Which test target covers the change?', runtime.calls[0]['prompt'])
+            self.assertIn('accepted-assessment-sections.txt', runtime.calls[0]['prompt'])
+            self.assertNotIn(assessment['limitations'][0], runtime.calls[0]['prompt'])
             self.assertEqual(result['impact_decision'], 'AFFECTED')
             self.assertEqual(result['resumption_policy'], 'checked_assessment_repair_and_fresh_candidates')
             self.assertNotEqual(Path(result['impact_analysis']['round_record']).parent, evidence.parent)

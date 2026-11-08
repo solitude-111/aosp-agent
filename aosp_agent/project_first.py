@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from .case import validate_relative_path
+from .assessment_repair import MAX_REUSABLE_ASSESSMENT_BYTES
 from .diff_engine import DiffBackportAgent, _write
 from .diff_prompts import STRING, array, obj
 from .discovery import diff_units, repository_roots
@@ -435,7 +436,8 @@ class ProjectFirstAgent:
                     if (not requests and (result.get('coverage_blockers')
                             or result.get('completion_blocked_by') == 'MIGRATION_SCOPE_UNRESOLVED')
                             and controller.replan_assessment is not None
-                            and len(json.dumps(controller.replan_assessment, ensure_ascii=False).encode()) <= 128 * 1024):
+                            and len(json.dumps(controller.replan_assessment, ensure_ascii=False).encode())
+                            <= MAX_REUSABLE_ASSESSMENT_BYTES):
                         assessment_seed = controller.replan_assessment
                     if requests:
                         expanded = list(dict.fromkeys(keys + [r['repository'] for r in requests]))

@@ -86,7 +86,8 @@ def _accepted_assessment(root, record):
     path = round_path.parent / 'assessment.json'
     if path.is_symlink():
         raise RecoveryBlocked('accepted assessment is a symlink')
-    if path.stat().st_size > 128 * 1024:
+    from .assessment_repair import MAX_REUSABLE_ASSESSMENT_BYTES
+    if path.stat().st_size > MAX_REUSABLE_ASSESSMENT_BYTES:
         return None
     saved = checked_json(path, impact['assessment_sha256'])
     from .diff_prompts import ASSESSMENT_RESPONSE_SCHEMA

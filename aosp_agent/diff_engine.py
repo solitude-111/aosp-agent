@@ -564,7 +564,7 @@ class DiffBackportAgent:
                     'mapped regions. The candidate reviewer reuses these pinned excerpts.\n'
                     + json.dumps(self.guarded_obligations, ensure_ascii=False))
             with (budget.phase('IMPACT_ANALYSIS') if budget else nullcontext()), ExitStack() as runtimes:
-                from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
+                from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt, seed_context
                 from .exclusion_review import (ExclusionReviewError, ExclusionReviewUnresolved,
                                                review_exclusions, unresolved_exclusions)
                 from .mapped_impact import ImpactProofError, RepairContractError, PROOF_CONTEXT, check_impact_proofs
@@ -575,12 +575,16 @@ class DiffBackportAgent:
                           + review_prompt(review) + self.assessment_context + obligation_context
                           + (PROOF_CONTEXT if require_causality else ''))
                 raw = self.assessment_seed
-                if raw is not None:
+                if raw is not None and not self.revalidate_assessment_seed:
+                    seed_path = self.run_dir / 'accepted-assessment-sections.txt'
                     prompt = (repair_prompt(raw, 'Use the previous scope or coverage blockers below. Keep already grounded '
                                             'evidence and fix only the affected mappings and dependent proof references.')
-                              + '\nAccepted assessment from the previous round:\n' + json.dumps(raw, ensure_ascii=False)
+                              + seed_context(raw, seed_path)
                               + self.assessment_context + self._donor_tools_context() + obligation_context
                               + (PROOF_CONTEXT if require_causality else ''))
+                    if seed_path.exists():
+                        self._protect(seed_path)
+                if raw is not None:
                     self.record['assessment_reused_for_coverage_replan'] = True
                     self._save()
                 for attempt in range(1, max_attempts + 1):
@@ -671,6 +675,12 @@ class DiffBackportAgent:
                                 break
                             raise
                         prompt = repair_prompt(raw, exc)
+                        if revalidate:
+                            seed_path = self.run_dir / 'accepted-assessment-sections.txt'
+                            prompt += (seed_context(raw, seed_path) + self.assessment_context
+                                       + self._donor_tools_context() + obligation_context)
+                            if seed_path.exists():
+                                self._protect(seed_path)
             decision = assessment['status']
             if decision == 'UNKNOWN' and any(group['status'] == 'AFFECTED' for group in
                                              self.record.get('causal_evidence', {}).get('groups', [])):
