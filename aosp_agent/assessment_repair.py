@@ -22,11 +22,13 @@ def digest(raw):
     return hashlib.sha256(json.dumps(raw, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
-def seed_context(raw, path):
+def seed_context(raw, path, *, pending_proof=False):
     """Inline a small checked seed or expose an indexed, read-only copy in this run."""
+    label = ('Previous assessment with verified mappings and unresolved causal proof'
+             if pending_proof else 'Accepted assessment from the previous round')
     encoded = json.dumps(raw, ensure_ascii=False)
     if len(encoded.encode()) <= INLINE_ASSESSMENT_BYTES:
-        return '\nAccepted assessment from the previous round:\n' + encoded
+        return '\n' + label + ':\n' + encoded
 
     lines, index = [], []
 
@@ -47,7 +49,7 @@ def seed_context(raw, path):
             append('/' + key, value)
     from .output_budget import write_text
     write_text(path, '\n'.join(lines) + '\n')
-    return ('\nAccepted assessment sections are indexed below. Read only sections needed to repair '
+    return ('\n' + label + '. Read only sections needed to repair '
             'the reported gaps with aosp_read_file, in small line ranges, from this run file: '
             + str(path) + '\n' + json.dumps(index, ensure_ascii=False))
 

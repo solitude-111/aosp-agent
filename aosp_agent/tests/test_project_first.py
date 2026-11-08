@@ -98,6 +98,33 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertTrue(seen[1].record['assessment_reused_for_coverage_replan'])
             self.assertEqual([r['projects'] for r in result['rounds']], [['repo'], ['repo']])
 
+    def test_causal_retries_reuse_a_grounded_mapping_and_recheck_the_proof(self):
+        from aosp_agent.assessment_repair import digest
+        from aosp_agent.resume import resume_project
+        for resume in (False, True):
+            with self.subTest(resume=resume), GitFixture() as fx:
+                prior = self.assessment()
+                chain = prior['proof_groups'][0]['impact']['causal_chain']
+                harm = chain['target_harm_evidence']
+                chain['target_harm_evidence'] = [999]
+                repair = {'base_sha256': digest(prior), 'replacements': [{
+                    'path': '/proof_groups/0/impact/causal_chain/target_harm_evidence',
+                    'value_json': json.dumps(harm)}]}
+                runtime = QueueRuntime([(prior, None)] + ([] if resume else [(repair, None)]))
+                agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                    repository_keys=['repo'], runtime_factory=runtime.factory, max_rounds=1 if resume else 2,
+                    auto_validation=False)
+                result = agent.run(impact_only=True, max_attempts=1)
+                if resume:
+                    self.assertEqual(result['impact_decision'], 'UNKNOWN')
+                    self.assertIn('grounded_mapping', result)
+                    runtime = QueueRuntime([(repair, None)])
+                    result = resume_project(agent.run_dir / 'run.json', runtime_factory=runtime.factory)
+                self.assertEqual(result['impact_decision'], 'AFFECTED', result)
+                self.assertEqual(result['impact_analysis']['status'], 'CONFIRMED')
+                self.assertIn('verified mappings and unresolved causal proof', runtime.calls[-1]['prompt'])
+                self.assertIn(digest(prior), runtime.calls[-1]['prompt'])
+
     def test_unconfirmed_coverage_does_not_erase_affect_on_replan_exhaustion(self):
         from aosp_agent.diff_engine import DiffBackportAgent
         with GitFixture() as fx:

@@ -68,38 +68,48 @@ def checked_json(path, digest):
 
 def _accepted_assessment(root, record):
     impact = record.get('impact_analysis', {})
-    if impact.get('status') != 'CONFIRMED' or impact.get('decision') != 'AFFECTED':
+    confirmed = impact.get('status') == 'CONFIRMED' and impact.get('decision') == 'AFFECTED'
+    pending = not confirmed and impact.get('status') not in ('CONFIRMED', 'CONFLICT')
+    field = 'grounded_mapping' if pending else 'impact_analysis'
+    checkpoint = record.get(field, {})
+    if not checkpoint or not (confirmed or pending):
         return None
-    targets = impact.get('targets', {})
+    targets = checkpoint.get('targets', {})
     pins = record.get('pinned_targets', {})
     if not targets or set(targets) != set(record.get('selected_projects', [])):
         return None
     if any(pins.get(key, {}).get('head') != head for key, head in targets.items()):
         return None
-    round_path = Path(impact['round_record']).resolve()
+    round_path = Path(checkpoint['round_record']).resolve()
     if not round_path.is_relative_to(root / 'rounds') or round_path.name != 'run.json':
         raise RecoveryBlocked('accepted assessment round is outside the stopped task')
     row = json.loads(round_path.read_text())
     if (row.get('input_patch_sha256') != record['input_patch_sha256']
-            or row.get('impact_analysis') != {k: v for k, v in impact.items() if k != 'round_record'}):
+            or row.get(field) != {k: v for k, v in checkpoint.items() if k != 'round_record'}):
         raise RecoveryBlocked('accepted assessment identity does not match the stopped task')
-    path = round_path.parent / 'assessment.json'
+    filename = checkpoint['file'] if pending else 'assessment.json'
+    if Path(filename).name != filename or not filename.startswith('assessment') or not filename.endswith('.json'):
+        raise RecoveryBlocked('invalid saved assessment filename')
+    path = round_path.parent / filename
     if path.is_symlink():
         raise RecoveryBlocked('accepted assessment is a symlink')
     from .assessment_repair import MAX_REUSABLE_ASSESSMENT_BYTES
     if path.stat().st_size > MAX_REUSABLE_ASSESSMENT_BYTES:
         return None
-    saved = checked_json(path, impact['assessment_sha256'])
+    saved = checked_json(path, checkpoint['sha256' if pending else 'assessment_sha256'])
     from .diff_prompts import ASSESSMENT_RESPONSE_SCHEMA
     assessment = {k: v for k, v in saved.items() if k in ASSESSMENT_RESPONSE_SCHEMA['properties']}
     feedback = {k: record.get(k, row.get(k)) for k in
                 ('scope_evidence', 'coverage_blockers', 'migration_scope_error',
                  'budget_interruption', 'completion_blocked_by')
                 if k in record or k in row}
-    revalidate = (row.get('causal_evidence', {}).get('status') == 'GROUNDED_CAUSAL_PROOFS'
+    if pending:
+        feedback['causal_evidence'] = {'status': 'UNRESOLVED', 'reason': checkpoint['proof_error']}
+    revalidate = (confirmed and row.get('causal_evidence', {}).get('status') == 'GROUNDED_CAUSAL_PROOFS'
                   and not (feedback.get('coverage_blockers') or feedback.get('migration_scope_error')
                            or feedback.get('scope_evidence', {}).get('status') == 'OPEN_QUESTIONS'))
-    return {'targets': targets, 'assessment': assessment, 'feedback': feedback, 'revalidate': revalidate}
+    return {'targets': targets, 'assessment': assessment, 'feedback': feedback,
+            'revalidate': revalidate, 'pending_proof': pending}
 
 
 def verify_stopped_sources(root):

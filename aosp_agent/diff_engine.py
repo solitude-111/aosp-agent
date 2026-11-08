@@ -39,7 +39,8 @@ class DiffBackportAgent:
                  task_id=None, pinned_heads=None, joint_validation=None, repository_keys=None,
                  lazy_reads=False, object_cache=None, assessment_context='', source_sequence=None,
                  require_scope_closure=False, read_denied_roots=(), max_output_bytes=256 * 1024 * 1024,
-                 exclusion_corrections=None, assessment_seed=None, revalidate_assessment_seed=False):
+                 exclusion_corrections=None, assessment_seed=None, revalidate_assessment_seed=False,
+                 seed_pending_proof=False):
         self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -69,6 +70,7 @@ class DiffBackportAgent:
         self.require_scope_closure = require_scope_closure
         self.assessment_seed, self.replan_assessment = assessment_seed, None
         self.revalidate_assessment_seed = revalidate_assessment_seed
+        self.seed_pending_proof = seed_pending_proof
         self.guarded_obligations = []
         self.read_denied_roots = tuple(read_denied_roots)
         self._model_read_roots = None
@@ -300,6 +302,16 @@ class DiffBackportAgent:
             self.record['impact_analysis'] = {
                 'status': 'CONFIRMED', 'decision': decision, 'assessment_sha256': self.protected[path],
                 'targets': {repo.key: repo.head for repo in self.repos}}
+
+    def _remember_mapping_for_proof_repair(self, raw, attempt_path, error):
+        from .assessment_repair import MAX_REUSABLE_ASSESSMENT_BYTES
+        if attempt_path.stat().st_size > MAX_REUSABLE_ASSESSMENT_BYTES:
+            return
+        self._protect(attempt_path)
+        self.replan_assessment = raw
+        self.record['grounded_mapping'] = {
+            'file': attempt_path.name, 'sha256': self.protected[attempt_path],
+            'targets': {repo.key: repo.head for repo in self.repos}, 'proof_error': str(error)}
 
     def _independent_affected_proof(self, assessment):
         from .mapped_impact import check_impact_proofs
@@ -613,13 +625,16 @@ class DiffBackportAgent:
                     seed_path = self.run_dir / 'accepted-assessment-sections.txt'
                     prompt = (repair_prompt(raw, 'Use the previous scope or coverage blockers below. Keep already grounded '
                                             'evidence and fix only the affected mappings and dependent proof references.')
-                              + seed_context(raw, seed_path)
+                              + seed_context(raw, seed_path, pending_proof=self.seed_pending_proof)
                               + self.assessment_context + self._donor_tools_context() + obligation_context
                               + (PROOF_CONTEXT if require_causality else ''))
                     if seed_path.exists():
                         self._protect(seed_path)
                 if raw is not None:
-                    self.record['assessment_reused_for_coverage_replan'] = True
+                    if self.seed_pending_proof:
+                        self.record['grounded_mapping_reused_for_causal_replan'] = True
+                    else:
+                        self.record['assessment_reused_for_coverage_replan'] = True
                     self._save()
                 for attempt in range(1, max_attempts + 1):
                     initial = attempt == 1 and self.assessment_seed is None
@@ -640,7 +655,8 @@ class DiffBackportAgent:
                         elif not revalidate:
                             _write(self.run_dir / f'assessment-repair-{attempt}.json', response)
                             raw = apply_repair(raw, response)
-                        _write(self.run_dir / f'assessment-{attempt}.json', raw)
+                        attempt_path = self.run_dir / f'assessment-{attempt}.json'
+                        _write(attempt_path, raw)
                         assessment = self.ground(raw)
                         from .scope_evidence import check_scope
                         try:
@@ -671,7 +687,13 @@ class DiffBackportAgent:
                                 self.replan_assessment = raw
                             self._save()
                             return self.record
-                        self.record['causal_evidence'] = check_impact_proofs(self, assessment, require_causality)
+                        try:
+                            self.record['causal_evidence'] = check_impact_proofs(self, assessment, require_causality)
+                        except ImpactProofError as exc:
+                            if scope['status'] == 'GROUNDED_MODEL_SCOPE' and not isinstance(exc, RepairContractError):
+                                self._remember_mapping_for_proof_repair(raw, attempt_path, exc)
+                            raise
+                        self.record.pop('grounded_mapping', None)
                         try:
                             review_exclusions(self, assessment, inventory, attempt)
                         except (BudgetExceeded, KeyboardInterrupt):

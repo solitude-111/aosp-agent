@@ -204,6 +204,8 @@ class ProjectFirstAgent:
 
     def _merge_round_impact(self, result, round_path):
         self.record['stage'] = result.get('stage', self.record['stage'])
+        if result.get('grounded_mapping'):
+            self.record['grounded_mapping'] = {**result['grounded_mapping'], 'round_record': str(round_path)}
         previous = self.record['impact_analysis']
         incoming = result.get('impact_analysis')
         if incoming is not None:
@@ -329,7 +331,7 @@ class ProjectFirstAgent:
             with self.budget.active(), self.budget.phase('ROUTING'):
                 self._prepare()
                 feedback, assessment_seed, obligation_remaps = None, None, 0
-                revalidate_seed = False
+                revalidate_seed = seed_pending_proof = False
                 if self.resumed_assessment is not None and not inspect_only:
                     keys = list(self.resumed_assessment['targets'])
                     self._check_keys(keys)
@@ -339,6 +341,7 @@ class ProjectFirstAgent:
                     assessment_seed = self.resumed_assessment['assessment']
                     feedback = self.resumed_assessment['feedback']
                     revalidate_seed = self.resumed_assessment['revalidate']
+                    seed_pending_proof = self.resumed_assessment.get('pending_proof', False)
                 elif self.explicit_keys is not None:
                     keys = list(dict.fromkeys(self.explicit_keys)); self._check_keys(keys)
                     plan = {'summary': 'Explicit user-supplied project scope', 'projects': keys}
@@ -401,7 +404,7 @@ class ProjectFirstAgent:
                                                if p.key not in keys and any(p.key.startswith(k + '/') for k in keys)],
                             source_sequence=self.source_sequence, _source_lease=_source_lease,
                             exclusion_corrections=self.exclusion_corrections, assessment_seed=assessment_seed,
-                            revalidate_assessment_seed=revalidate_seed,
+                            revalidate_assessment_seed=revalidate_seed, seed_pending_proof=seed_pending_proof,
                             **self.donor_options, **self.options)
                         self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
                         try:
@@ -434,13 +437,15 @@ class ProjectFirstAgent:
                                 'causal_evidence', 'coverage_error', 'coverage_blockers', 'repository_errors',
                                 'verification', 'joint_verification', 'migration_scope_error') if k in result}
                     assessment_seed = None
-                    revalidate_seed = False
+                    revalidate_seed = seed_pending_proof = False
                     if (not requests and (result.get('coverage_blockers')
-                            or result.get('completion_blocked_by') == 'MIGRATION_SCOPE_UNRESOLVED')
+                            or result.get('completion_blocked_by') in
+                               ('MIGRATION_SCOPE_UNRESOLVED', 'CAUSAL_EVIDENCE_UNRESOLVED'))
                             and controller.replan_assessment is not None
                             and len(json.dumps(controller.replan_assessment, ensure_ascii=False).encode())
                             <= MAX_REUSABLE_ASSESSMENT_BYTES):
                         assessment_seed = controller.replan_assessment
+                        seed_pending_proof = result.get('completion_blocked_by') == 'CAUSAL_EVIDENCE_UNRESOLVED'
                     if requests:
                         expanded = list(dict.fromkeys(keys + [r['repository'] for r in requests]))
                         self._check_keys(expanded)
