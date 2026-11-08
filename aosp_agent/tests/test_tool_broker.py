@@ -133,6 +133,44 @@ class ToolBrokerTest(unittest.TestCase):
             self.assertTrue(search['success'], search)
             self.assertIn('counter.py', response(search)['text'])
 
+    def test_source_views_reuse_large_pinned_blob_under_io_budget(self):
+        with GitFixture() as fx:
+            lines = [f'{n:04d} ' + 'x' * 96 for n in range(4096)]
+            path = fx.repo / 'large.c'
+            path.write_text('\n'.join(lines) + '\n')
+            git(fx.repo, 'add', 'large.c')
+            git(fx.repo, 'commit', '-qm', 'large fixture')
+            baseline = git(fx.repo, 'rev-parse', 'HEAD')
+            path.write_text('updated first line\n' + '\n'.join(lines[1:]) + '\n')
+            git(fx.repo, 'add', 'large.c')
+            git(fx.repo, 'commit', '-qm', 'updated fixture')
+            updated = git(fx.repo, 'rev-parse', 'HEAD')
+            scope = ModelScope((fx.repo,), tool_repositories={
+                'baseline': {'root': str(fx.repo), 'head': baseline},
+                'updated': {'root': str(fx.repo), 'head': updated},
+            })
+            budget = ReadBudget(seconds=10, output_bytes=1536 * 1024)
+            broker = self.broker(fx.repo, scope=scope, budget=budget, read_only=True)
+            args = dict(operation='view', repo='target:baseline', ref=baseline, path='large.c')
+            for start in (1, 128, 129, 1024, 2049, 3072, 3900, 4096):
+                end = start + 1
+                result = call(broker, 'aosp_source', dict(args, start=start, end=end), str(start))
+                self.assertTrue(result['success'], result)
+                output = response(result)['results'][0]['text']
+                expected = '\n'.join((lines + [''])[start - 1:end])
+                self.assertTrue(output.startswith(
+                    f'Here are lines {start} through {end} of large.c at target:baseline/{baseline}.\n'
+                    f'{expected}\n'))
+            self.assertEqual(budget.used, 9)  # Eight requests, one Git read.
+
+            wrong = call(broker, 'aosp_source', dict(args, ref=updated, start=1, end=1), 'wrong-pin')
+            self.assertFalse(wrong['success'])
+            result = call(broker, 'aosp_source', dict(args, repo='target:updated', ref=updated,
+                                                   start=1, end=1), 'new-pin')
+            self.assertTrue(result['success'], result)
+            self.assertIn('\nupdated first line\n', response(result)['results'][0]['text'])
+            self.assertEqual(budget.used, 12)
+
     def test_output_limit_and_cancel_reap_actual_subprocess(self):
         for mode in ('output', 'cancel'):
             with self.subTest(mode=mode):

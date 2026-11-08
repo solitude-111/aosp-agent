@@ -496,9 +496,8 @@ class CodexRuntime:
         self._closed = True
         broker_error = None
         if self._broker is not None:
-            self._broker.cancelled.set()
             try:
-                self._broker.end()
+                self._broker.close()
             except Exception as exc:
                 broker_error = exc
         client = getattr(self._codex, '_client', None)

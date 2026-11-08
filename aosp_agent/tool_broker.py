@@ -82,6 +82,7 @@ class ToolBroker:
         self.cancelled = threading.Event()
         self.active = False; self.failure = None
         self.seen = set(); self.retired_turns = set(); self.snapshot = None; self.history = {}
+        self._source_views = agent_tools.SourceViewCache()
 
     @property
     def tools(self):
@@ -121,6 +122,10 @@ class ToolBroker:
             self.active = False
         if not self.idle.wait(5):
             raise RuntimeError('controller tool callback did not drain')
+
+    def close(self):
+        self.end()
+        self._source_views.clear()
 
     def handle(self, method, params):
         if method != 'item/tool/call':
@@ -352,7 +357,8 @@ class ToolBroker:
         if handler is None: raise ToolDenied('unknown source operation')
         if operation == 'view' and not args.get('path'): raise ToolDenied('view needs path')
         if operation == 'locate' and not args.get('symbol'): raise ToolDenied('locate needs symbol')
-        code = handler(ctx, options)
+        code = (handler(ctx, options, cache=self._source_views)
+                if operation == 'view' else handler(ctx, options))
         return {'returncode': code, 'results': output}
 
     def _dispatch(self, name, args):

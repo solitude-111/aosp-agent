@@ -20,7 +20,10 @@ under <run_dir>/bin/. Hard constraints enforced inside every command:
 from __future__ import annotations
 
 import argparse
+from array import array
+from collections import OrderedDict
 import errno
+from itertools import islice
 import json
 import os
 import re
@@ -332,7 +335,65 @@ def cmd_locate_symbol(ctx: RunContext, args) -> int:
                    extra={'read_status': located['status'], 'search_scope': located['scope']})
 
 
-def cmd_view_code(ctx: RunContext, args) -> int:
+class _SourceLines:
+    _stride = 128
+
+    def __init__(self, text: str):
+        self.text = text
+        self.line_count = text.count("\n") + 1
+        self.offsets = array('I', [0])
+        # Store a character offset every 128 lines, including for dense files.
+        boundaries = islice(re.finditer("\n", text), self._stride - 1, None, self._stride)
+        self.offsets.extend(match.end() for match in boundaries)
+
+    def _offset(self, line: int) -> int:
+        block, remaining = divmod(line - 1, self._stride)
+        offset = self.offsets[block]
+        for _ in range(remaining):
+            offset = self.text.index("\n", offset) + 1
+        return offset
+
+    def slice(self, start: int, end: int) -> str:
+        stop = self._offset(end + 1) - 1 if end < self.line_count else len(self.text)
+        return self.text[self._offset(start):stop]
+
+
+class SourceViewCache:
+    """Bounded in-memory line index for successful pinned source views."""
+
+    def __init__(self, max_bytes: int = 32 * 1024 * 1024, max_entries: int = 128):
+        self.max_bytes = max_bytes
+        self.max_entries = max_entries
+        self._bytes = 0
+        self._entries = OrderedDict()
+
+    def get(self, key) -> _SourceLines | None:
+        if key not in self._entries:
+            return None
+        self._entries.move_to_end(key)
+        return self._entries[key][0]
+
+    def add(self, key, text: str) -> _SourceLines | None:
+        size = sys.getsizeof(text)
+        if size >= self.max_bytes:
+            return None
+        source = _SourceLines(text)
+        size += sys.getsizeof(source.offsets)
+        if size > self.max_bytes:
+            return None
+        while self._bytes + size > self.max_bytes or len(self._entries) >= self.max_entries:
+            _, (_, removed_size) = self._entries.popitem(last=False)
+            self._bytes -= removed_size
+        self._entries[key] = (source, size)
+        self._bytes += size
+        return source
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self._bytes = 0
+
+
+def cmd_view_code(ctx: RunContext, args, *, cache: SourceViewCache | None = None) -> int:
     ref = ctx.check_ref(args.ref, args.repo)
     try:
         path = validate_relative_path(args.path)
@@ -341,6 +402,40 @@ def cmd_view_code(ctx: RunContext, args) -> int:
     if args.start < 1 or args.end < args.start:
         raise ToolError("--start/--end must describe a 1-based ascending range")
     repo_args, cwd = ctx.repo_selection(args.repo)
+    source = None
+    if cache is not None:
+        root = cwd if cwd is not None else Path(repo_args[1])
+        key = (cwd is None, root.resolve(), ref, path)
+        source = cache.get(key)
+    if source is None:
+        blob = _read_view_blob(ctx, args, repo_args, cwd, ref, path)
+        if isinstance(blob, int):
+            return blob
+        if cache is not None:
+            source = cache.add(key, blob)
+        if source is None:
+            lines = blob.split("\n")
+    line_count = source.line_count if source is not None else len(lines)
+    start, end = args.start, args.end
+    notes = []
+    if end - start + 1 > MAX_VIEW_LINES:
+        end = start + MAX_VIEW_LINES - 1
+        notes.append(f"range clamped to {MAX_VIEW_LINES} lines per call")
+    if end > line_count:
+        start = max(1, start - (end - line_count))
+        end = line_count
+        notes.append(f"this file only has {line_count} lines; window moved up to lines {start}-{end}")
+    body = source.slice(start, end) if source is not None else "\n".join(lines[start - 1:end])
+    header = f"Here are lines {start} through {end} of {path} at {args.repo}/{ref}."
+    if notes:
+        header += " (" + "; ".join(notes) + ")"
+    output = (header + "\n" + body + "\n"
+              "Based on the previous information, think carefully: do you see the target code? "
+              "Keep checking with further calls if not.\n")
+    return _finish(ctx, "view-code", args, _truncate_head(output))
+
+
+def _read_view_blob(ctx, args, repo_args, cwd, ref, path) -> str | int:
     try:
         blob = _git(repo_args, "show", f"{ref}:{path}", cwd=cwd, check=False)
     except (OSError, subprocess.SubprocessError) as exc:
@@ -360,24 +455,7 @@ def cmd_view_code(ctx: RunContext, args) -> int:
         return _finish(ctx, 'view-code', args,
             'READ_FAILED: Git could not read the requested object. File existence and affectedness remain unknown.\n'
             + blob.stderr[-1000:], 3, extra={'read_status': 'READ_FAILED'})
-    lines = blob.stdout.split("\n")
-    start, end = args.start, args.end
-    notes = []
-    if end - start + 1 > MAX_VIEW_LINES:
-        end = start + MAX_VIEW_LINES - 1
-        notes.append(f"range clamped to {MAX_VIEW_LINES} lines per call")
-    if end > len(lines):
-        start = max(1, start - (end - len(lines)))
-        end = len(lines)
-        notes.append(f"this file only has {len(lines)} lines; window moved up to lines {start}-{end}")
-    body = "\n".join(lines[start - 1:end])
-    header = f"Here are lines {start} through {end} of {path} at {args.repo}/{ref}."
-    if notes:
-        header += " (" + "; ".join(notes) + ")"
-    output = (header + "\n" + body + "\n"
-              "Based on the previous information, think carefully: do you see the target code? "
-              "Keep checking with further calls if not.\n")
-    return _finish(ctx, "view-code", args, _truncate_head(output))
+    return blob.stdout
 
 
 def _line_range_log(ctx: RunContext, hunk: dict) -> subprocess.CompletedProcess:
