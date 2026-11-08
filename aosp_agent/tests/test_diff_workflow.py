@@ -330,6 +330,33 @@ class DiffWorkflowTest(unittest.TestCase):
             with self.assertRaisesRegex(AssessmentError, 'named function'):
                 agent.ground(raw)
 
+    def test_java_narrow_mapping_is_bound_to_the_pinned_enclosing_method(self):
+        with GitFixture() as fx:
+            source = ('class Counter {\n int adjust(int n) {\n  int raw = n;\n  return raw;\n }\n'
+                      ' int unrelated() {\n  return 0;\n }\n}\n')
+            (fx.repo / 'Counter.java').write_text(source)
+            git(fx.repo, 'add', 'Counter.java')
+            git(fx.repo, 'commit', '-qm', 'pinned Java counter')
+            agent = self.agent(fx, patch=diff('Counter.java', source, source.replace('return raw;', 'return 0;')))
+            raw = self.assessment(agent)
+            unit = raw['units'][0]
+            path = 'repo/Counter.java'
+            target = unit['targets'][0]
+            target.update(path=path, symbol='adjust', line_start=4, line_end=4)
+            unit['evidence'][0].update(path=path, line_start=4, line_end=4, excerpt='return raw;')
+            unit['evidence'][1].update(line_start=4, line_end=4, excerpt='return 0;')
+            self.assertEqual(agent.ground(raw)['writable_paths'], [path])
+            with self.assertRaisesRegex(AssessmentError, 'named function'):
+                target['symbol'] = 'unrelated'
+                agent.ground(raw)
+            target.update(symbol='adjust', line_end=7)
+            with self.assertRaisesRegex(AssessmentError, 'crosses method boundaries'):
+                agent.ground(raw)
+            target['line_end'] = 4
+            unit['evidence'][0]['excerpt'] = 'return 1;'
+            with self.assertRaisesRegex(AssessmentError, 'excerpt mismatches'):
+                agent.ground(raw)
+
     def test_split_function_left_unmodified_is_incomplete(self):
         with GitFixture() as fx:
             (fx.repo / 'second.py').write_text(BASELINE)

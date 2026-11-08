@@ -97,10 +97,9 @@ class MappingPlanner:
             name = target['symbol'].strip()
             signature = re.fullmatch(r'([A-Za-z_$][\w$]*(?:(?:[.#]|::)[A-Za-z_$][\w$]*)*)(?:\([^()\n]*\))?', name)
             symbol = re.split(r'[.#]|::', signature[1])[-1] if signature else ''
-            if (not re.fullmatch(r'[A-Za-z_$][\w$]*', symbol)
-                    or not re.search(r'\b' + re.escape(symbol) + r'\s*\(', '\n'.join(lines[start - 1:end]))):
-                raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
-            if target['action'] == 'edit' and target['path'].endswith('.java'):
+            has_symbol = bool(symbol and re.search(r'\b' + re.escape(symbol) + r'\s*\(',
+                                                  '\n'.join(lines[start - 1:end])))
+            if target['path'].endswith('.java') and (target['action'] == 'edit' or not has_symbol):
                 from .java_regions import JavaSource, method_name
                 path = target['path']
                 if path not in java_sources:
@@ -108,10 +107,18 @@ class MappingPlanner:
                     java_sources[path] = None if source.tree.root_node.has_error else source
                 source = java_sources[path]
                 methods = source.overlapping_methods(start, end) if source else []
-                if len(methods) > 1:
+                if target['action'] == 'edit' and len(methods) > 1:
                     ranges = ', '.join(f'{method_name(m)}:{source.first(m)}-{source.last(m)}' for m in methods[:8])
                     raise AssessmentError('Java edit mapping crosses method boundaries. Map each needed '
                                           'method separately with its own evidence. Pinned declarations: ' + ranges)
+                if not has_symbol and len(methods) == 1:
+                    method = methods[0]
+                    has_symbol = (method_name(method) == symbol and source.first(method) <= start
+                                  and end <= source.last(method) and not any(
+                                      other != method and source.first(other) <= end and start <= source.last(other)
+                                      for other in source.methods))
+            if not has_symbol:
+                raise AssessmentError(f'named function is not present in the mapped region: {target["symbol"]}')
         if not any(e['origin'] == 'target' and e['path'] == target['path']
                    and start <= e['line_start'] <= e['line_end'] <= end for e in item['evidence']):
             raise AssessmentError(f'target mapping lacks an excerpt within its range: {target["path"]}')

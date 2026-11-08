@@ -150,8 +150,9 @@ Return the JSON schema. For EACH change-unit id exactly once:
    Give exact target function/region ranges and symbol names, or a descriptive name for data/config.
    For imports, includes, fields and other non-function regions use relationship=data_or_configuration,
    with a descriptive symbol and the narrow actual region. Never classify imports as same_function or
-   expand to a whole class to satisfy a function check. For function mappings include the declaration
-   in the range; use its identifier (optionally qualified or with a parameter signature), not prose.
+   expand to a whole class to satisfy a function check. Use the actual function identifier, optionally
+   qualified or with a parameter signature. A narrow Java range may omit the declaration when it
+   lies entirely within that uniquely named method. For other languages include the declaration.
    Every range uses the pinned target's line numbers, never donor line numbers or a guessed file end.
    action=edit means THIS region must change; read_dependency is inspected but remains read-only.
    A Java edit range must stay within one method. If the repair spans methods, list each as a

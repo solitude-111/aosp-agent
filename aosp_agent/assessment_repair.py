@@ -117,8 +117,8 @@ Address all reported locations, including duplicate quotations in other sections
 only where needed. For an absent or invalid path, find the actual pinned path and update all affected
 references and their ranges and excerpts. Imports/includes/fields use data_or_configuration.
 If an evidence entry is a reference, fix the referenced unit evidence or change the index.
-Function ranges must contain the declaration and stay within the file. Do not widen a mapping merely
-to silence a validator.
+Function ranges must stay within the file. Use the declaration or a narrow Java range entirely
+inside the actual named method. Do not widen a mapping merely to silence a validator.
 The merged document must still cover every unit and pass ALL original evidence, scope and causal checks.
 Unresolved facts must remain UNKNOWN. Do not edit source files or claim successful validation.
 '''
