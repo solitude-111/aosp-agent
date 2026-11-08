@@ -8,6 +8,7 @@ from .diff_prompts import MIGRATION_SCHEMA, migration_prompt
 from .engine import AssessmentError, CandidateRejected
 from .prompts import SYSTEM
 from .lifecycle import operation_lease
+from .retrieval import BudgetExceeded
 
 
 def repository_assessment(controller, assessment, key):
@@ -95,6 +96,9 @@ def migrate_repository(controller, assessment, key, *, verify, max_attempts, fee
         # is local and must not prevent later independent repositories running.
         child.record.update(status='FAILED', error={'type': type(exc).__name__,
             'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))})
+        if isinstance(exc, BudgetExceeded):
+            controller.record.setdefault('budget_interruption', {
+                'stage': controller.record['stage'], 'repository': key, 'reason': str(exc)})
         from .lifecycle import RecoveryBlocked
         if isinstance(exc, RecoveryBlocked):
             child.record['status'] = 'BLOCKED'

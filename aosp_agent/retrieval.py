@@ -1,9 +1,11 @@
 """Bounded reads and immutable-object caching; mutable workspace audits bypass it."""
 from collections.abc import Mapping
+from collections import Counter
 from contextlib import contextmanager
 from contextvars import ContextVar
 import hashlib
 import json
+import locale
 import math
 import re
 from pathlib import Path
@@ -16,10 +18,45 @@ from .case import validate_relative_path
 
 ACTIVE_BUDGET = ContextVar('aosp_read_budget', default=None)
 ACTIVE_MODEL_BUDGET = ContextVar('aosp_model_budget', default=None)
+DISCOVERY_RESERVE = ContextVar('aosp_discovery_reserve', default=None)
+ACTIVE_READ_PHASE = ContextVar('aosp_read_phase', default=None)
+
+
+def record_read_activity(**counts):
+    active = ACTIVE_READ_PHASE.get()
+    if active is not None:
+        owner, phase = active
+        with owner._lock:
+            owner._phases.setdefault(phase, Counter()).update(counts)
+
+
+def capture_git(argv, *, check, errors=None, input=None, **options):
+    """Capture controller Git bytes before applying normal subprocess text decoding."""
+    if ACTIVE_READ_PHASE.get() is None:
+        return subprocess.run(argv, check=check, text=True, errors=errors, input=input,
+                              capture_output=True, **options)
+    encoding = locale.getpreferredencoding(False)
+    data = input.encode(encoding, errors or 'strict') if input is not None else None
+    try:
+        result = subprocess.run(argv, input=data, capture_output=True, **options)
+    except subprocess.TimeoutExpired as exc:
+        record_read_activity(git_output_bytes=len(exc.output or b'') + len(exc.stderr or b''))
+        raise
+    record_read_activity(git_output_bytes=len(result.stdout) + len(result.stderr))
+    for name in ('stdout', 'stderr'):
+        text = getattr(result, name).decode(encoding, errors or 'strict')
+        setattr(result, name, text.replace('\r\n', '\n').replace('\r', '\n'))
+    if check:
+        result.check_returncode()
+    return result
 
 
 class BudgetExceeded(RuntimeError):
     pass
+
+
+class DiscoveryDeferred(RuntimeError):
+    """Optional retrieval reached its soft limit before impact analysis."""
 
 
 class ReadBudget:
@@ -33,6 +70,7 @@ class ReadBudget:
         self.used, self.paused_seconds = 0, 0
         self.byte_limit, self.bytes_used = output_bytes, 0
         self._lock = threading.RLock()
+        self._phases = {}
 
     def remaining(self):
         left = self.seconds - (time.monotonic() - self.started - self.paused_seconds)
@@ -43,10 +81,30 @@ class ReadBudget:
     def command_timeout(self, timeout):
         with self._lock:
             left = self.remaining()
+            if DISCOVERY_RESERVE.get() is self:
+                left = self.discovery_remaining()
             if self.used >= self.operations:
                 raise BudgetExceeded('total read/tool operation budget exhausted')
             self.used += 1
+            record_read_activity(operations=1)
             return min(timeout, left)
+
+    def discovery_remaining(self):
+        with self._lock:
+            left = self.remaining() - self.seconds / 2
+            if self.operations - self.used <= self.operations // 2:
+                raise DiscoveryDeferred('DISCOVERY_OPERATION_RESERVE')
+            if left <= 0:
+                raise DiscoveryDeferred('DISCOVERY_TIME_RESERVE')
+            return left
+
+    @contextmanager
+    def reserve_for_impact(self):
+        token = DISCOVERY_RESERVE.set(self)
+        try:
+            yield
+        finally:
+            DISCOVERY_RESERVE.reset(token)
 
     def claim_bytes(self, size):
         """Reserve before read; conservative reservations are not refunded."""
@@ -57,6 +115,7 @@ class ReadBudget:
             if self.bytes_used + size > self.byte_limit:
                 raise BudgetExceeded('model tool I/O byte budget exhausted')
             self.bytes_used += size
+            record_read_activity(io_reserved_bytes=size)
 
     def remaining_bytes(self):
         with self._lock:
@@ -68,6 +127,19 @@ class ReadBudget:
                 'model_io_bytes_reserved': self.bytes_used, 'model_io_byte_limit': self.byte_limit,
                 'operation_accounting': 'controller Git processes plus broker requests and their Git subqueries; legacy unscoped SDK counts tool-start events',
                 'byte_accounting': 'pre-read reservations for broker file I/O and Git output; not total disk or controller I/O'}
+
+    def phase_data(self):
+        with self._lock:
+            return {phase: {key: counts[key] for key in ('operations', 'git_output_bytes',
+                        'broker_file_read_bytes', 'io_reserved_bytes')} for phase, counts in self._phases.items()}
+
+    @contextmanager
+    def phase(self, name):
+        token = ACTIVE_READ_PHASE.set((self, name))
+        try:
+            yield
+        finally:
+            ACTIVE_READ_PHASE.reset(token)
 
     @contextmanager
     def active(self):

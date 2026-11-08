@@ -38,6 +38,8 @@ ASSESSMENT_SCHEMA['properties']['scope_closure'] = obj({'units': array(obj({
     'dependencies_checked': array(STRING), 'unresolved_questions': array(STRING), 'evidence': array(EVIDENCE),
     'proof_steps': array(obj({'role': enum('entrypoint', 'state_flow', 'security_condition', 'dependency'),
                              'reasoning': STRING, 'evidence': array({'type': 'integer', 'minimum': 1})}))}))})
+ASSESSMENT_SCHEMA['properties']['scope_closure']['properties']['units']['items']['properties'][
+    'migration_questions'] = array(STRING)
 MAPPED_IMPACT_SCHEMA = deepcopy(IMPACT_SCHEMA)
 MAPPED_IMPACT_SCHEMA['properties']['evidence']['items']['properties']['unit_id'] = STRING
 MAPPED_IMPACT_SCHEMA['properties']['evidence']['items']['required'].append('unit_id')
@@ -127,6 +129,8 @@ complete old/new diff-side text match is only a candidate hint, not semantic ide
 scope. Investigate competing implementations, callers and dependencies before conclusions. Use
 aosp_source search/paths with a literal path to expand within a directory first; omit path only
 when project-wide investigation is necessary. Request other projects through grounded scope expansion.
+If retrieval_summary.soft_limit is present, use the available candidate hints and investigate
+the listed pending unit IDs from their diff paths and code. An unsearched unit is not absent.
 Reuse earlier pinned reads for each unit and proof section. Read a nearby contiguous window once
 when several needed regions are adjacent. Reopen a range only for new lines or a truncated result.
 Only retrieval counts/stages and bounded candidates are inlined; complete scopes and text-anchor

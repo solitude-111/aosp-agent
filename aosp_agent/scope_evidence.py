@@ -39,10 +39,10 @@ def check_scope(controller, assessment, required=False):
             raise AssessmentError('repository expansion requires grounded evidence, not a bare guess')
         for evidence in request['evidence']:
             ground_evidence(controller, request['unit_id'], evidence)
-    if requests:
-        return {'status': 'EXPANSION_REQUIRED', 'requests': requests}
     closure = assessment.get('scope_closure')
     if not closure:
+        if requests:
+            return {'status': 'EXPANSION_REQUIRED', 'requests': requests}
         if required:
             raise AssessmentError('project-first assessment requires per-unit scope_closure or grounded repository_requests')
         return {'status': 'EXPLICIT_SCOPE_ONLY'}
@@ -52,7 +52,7 @@ def check_scope(controller, assessment, required=False):
     rows = closure['units']
     if len(rows) != len(expected) or {r['unit_id'] for r in rows} != expected:
         raise AssessmentError('scope closure must cover every source unit exactly once')
-    open_questions = []
+    open_questions, migration_questions = [], []
     errors, function_checks = [], []
 
     def report(path, unit_id, message):
@@ -64,6 +64,7 @@ def check_scope(controller, assessment, required=False):
         unit_id = row['unit_id']
         prefix = f'/scope_closure/units/{row_index}'
         open_questions.extend({'unit_id': unit_id, 'question': q} for q in row['unresolved_questions'])
+        migration_questions.extend({'unit_id': unit_id, 'question': q} for q in row.get('migration_questions', []))
         for evidence in row['evidence']:
             ground_evidence(controller, unit_id, evidence)
         if not row['unresolved_questions']:
@@ -142,6 +143,9 @@ def check_scope(controller, assessment, required=False):
                    f'overlapping functions: {ranges}. Cite a separate exact excerpt within each needed function.')
     if errors:
         raise MappingEvidenceError(errors)
-    return {'status': 'OPEN_QUESTIONS' if open_questions else 'GROUNDED_MODEL_SCOPE',
+    return {'status': ('EXPANSION_REQUIRED' if requests else
+                       'OPEN_QUESTIONS' if open_questions or migration_questions else 'GROUNDED_MODEL_SCOPE'),
+            **({'requests': requests} if requests else {}),
             'unresolved_questions': open_questions,
+            'migration_questions': migration_questions,
             'limitation': 'Grounded scope claims are model-assessed; not a whole-program or product reachability proof.'}

@@ -28,18 +28,25 @@ SOURCE_SUFFIXES = {'.java', '.kt', '.c', '.cc', '.cpp', '.h', '.hpp', '.rs', '.p
 
 
 def local_git(repo: Path, *args: str, check: bool = True, timeout: int = 45):
-    from .retrieval import ACTIVE_BUDGET
+    from .retrieval import ACTIVE_BUDGET, DISCOVERY_RESERVE, capture_git, record_read_activity
     budget = ACTIVE_BUDGET.get()
     if budget is not None:
         timeout = budget.command_timeout(timeout)
+    else:
+        record_read_activity(operations=1)
     env = offline_git_env(dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
     from .tool_io import ACTIVE_TOOL_IO
     io = ACTIVE_TOOL_IO.get()
-    run = io.run if io is not None else subprocess.run
-    return run(['git', '-c', 'protocol.allow=never', '-c', 'core.fsmonitor=false',
-                           '-c', 'core.hooksPath=/dev/null', '-c', 'core.quotePath=false', *args],
-                          cwd=repo, env=env, capture_output=True, text=True, errors='replace',
-                          check=check, timeout=timeout)
+    try:
+        argv = ['git', '-c', 'protocol.allow=never', '-c', 'core.fsmonitor=false',
+                '-c', 'core.hooksPath=/dev/null', '-c', 'core.quotePath=false', *args]
+        if io is not None:
+            return io.run(argv, cwd=repo, env=env, check=check, timeout=timeout)
+        return capture_git(argv, cwd=repo, env=env, errors='replace', check=check, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if budget is not None and DISCOVERY_RESERVE.get() is budget:
+            budget.discovery_remaining()
+        raise
 
 
 # First attempt / one timeout-only retry. These are operation budgets, not
@@ -63,6 +70,7 @@ def read_git(repo, *args, stage, check=True, timeout=None, progress=None):
     source integrity audits use this mode; inventory uses the staged policy.
     local_git reaps its process before returning/raising, so retries are serial.
     """
+    from .retrieval import DiscoveryDeferred
     budgets = READ_BUDGETS[stage] if timeout is None else (timeout,)
     if any(not isinstance(t, (int, float)) or isinstance(t, bool) or not math.isfinite(t) or t <= 0 for t in budgets):
         raise ValueError('Git read timeouts must be positive numbers')
@@ -76,6 +84,10 @@ def read_git(repo, *args, stage, check=True, timeout=None, progress=None):
         started = time.monotonic()
         try:
             result = local_git(repo, *args, check=check, timeout=budget)
+        except DiscoveryDeferred as exc:
+            if progress:
+                progress({**event, 'status': 'DEFERRED', 'reason': str(exc)})
+            raise
         except (OSError, subprocess.SubprocessError) as exc:
             timed_out = isinstance(exc, subprocess.TimeoutExpired)
             event.update(status='TIMED_OUT' if timed_out else 'ERROR',
@@ -366,6 +378,7 @@ class Locator:
         self.scan_truncated = set()
         self.identifier_examined = Counter()
         self.identifier_truncated = set()
+        self.partial_candidates = []
 
     def admit_candidate(self, repo, path, unit, *, identifier_only=False):
         key = (repo.key, unit['id'])
@@ -488,9 +501,13 @@ class Locator:
             self.issues.append({'unit': unit['id'], 'repository': repo.key, 'stage': 'identifier_search',
                                 'path_scope': scope or '.', 'error': str(exc)[-1200:]})
 
-    def locate(self, progress=None) -> dict:
-        output = []
+    def _locate_units(self):
+        from .retrieval import DISCOVERY_RESERVE
         for unit in self.units:
+            self.partial_candidates = candidates = []
+            reserve = DISCOVERY_RESERVE.get()
+            if reserve is not None:
+                reserve.discovery_remaining()
             paths = {p for p in (unit['old_path'], unit['new_path']) if p}
             normalized_paths = {p for original in paths for p in version_normalized_paths(original)}
             names = {Path(p).name for p in paths}
@@ -498,7 +515,6 @@ class Locator:
             terms = tokens(text + '\n' + unit['header'])
             title_terms = tokens(re.sub(r'^@@.*?@@', '', unit['header']))
             query = sorted(terms, key=lambda t: (t not in title_terms, -len(t), t))[:12]
-            candidates = []
             search_log, retrieval = [], []
             parts = text_hunks(unit['patch']) if unit['supported'] else []
             for repo in self.repos:
@@ -593,16 +609,37 @@ class Locator:
             status = ('UNSUPPORTED' if not unit['supported'] else 'UNRESOLVED' if not kept else
                       'AMBIGUOUS_CANDIDATES' if len(kept) > 1 and kept[0]['score'] - kept[1]['score'] < 3
                       else 'CANDIDATES')
-            output.append({'id': unit['id'], 'old_path': unit['old_path'], 'new_path': unit['new_path'],
-                           'kind': unit['kind'], 'status': status, 'searches': search_log, 'retrieval': retrieval,
-                           'candidate_count': len(candidates), 'candidates_truncated': len(candidates) > len(kept),
-                           'candidates': kept, 'before': unit['before'], 'after': unit['after']})
-            if progress:
-                progress({'completed_units': len(output), 'total_units': len(self.units),
-                          'last_unit': unit['id'], 'issues': len(self.issues)})
+            yield {'id': unit['id'], 'old_path': unit['old_path'], 'new_path': unit['new_path'],
+                   'kind': unit['kind'], 'status': status, 'searches': search_log, 'retrieval': retrieval,
+                   'candidate_count': len(candidates), 'candidates_truncated': len(candidates) > len(kept),
+                   'candidates': kept, 'before': unit['before'], 'after': unit['after']}
+
+    def locate(self, progress=None) -> dict:
+        from .retrieval import DiscoveryDeferred
+        output, deferred = [], None
+        try:
+            for row in self._locate_units():
+                output.append(row)
+                if progress:
+                    progress({'completed_units': len(output), 'total_units': len(self.units),
+                              'last_unit': row['id'], 'issues': len(self.issues)})
+        except DiscoveryDeferred as exc:
+            pending = self.units[len(output):]
+            deferred = {'reason': str(exc), 'completed_units': len(output),
+                        'pending_units': [unit['id'] for unit in pending]}
+            partial = sorted(self.partial_candidates, key=lambda c: (-c['score'], c['workspace_path']))
+            for i, unit in enumerate(pending):
+                candidates = partial[:self.candidate_limit] if i == 0 else []
+                output.append({**{key: unit[key] for key in ('id', 'old_path', 'new_path', 'kind', 'before', 'after')},
+                    'status': 'DEFERRED', 'searches': [], 'candidate_count': len(candidates),
+                    'candidates_truncated': True, 'candidates': candidates,
+                    'retrieval': [{'repository': repo.key, 'stage': 'DISCOVERY_DEFERRED',
+                                   'project_search': 'DEFERRED', 'scope_complete': False,
+                                   'absence_proven': False} for repo in self.repos]})
         return {'schema_version': 2, 'units': output, 'issues': self.issues,
                 'retrieval_summary': {'strategy': 'direct_files_then_directories_then_admitted_project',
                     'deferred_project_searches': sum(r['project_search'] == 'DEFERRED' for u in output for r in u['retrieval']),
+                    **({'soft_limit': deferred} if deferred else {}),
                     'scope_complete': False, 'absence_proven': False},
                 'impact': 'UNASSESSED', 'function_parser': 'python_ast_or_c_family_lexical_hints',
                 'limits': {'files_per_repo_per_unit': self.scan_limit, 'candidates_per_unit': self.candidate_limit,
@@ -611,6 +648,7 @@ class Locator:
 
     def history(self, report: dict) -> list[dict]:
         """Bounded local target history; unavailable history never becomes absence."""
+        from .retrieval import DiscoveryDeferred
         result, seen = [], set()
         by_key = {r.key: r for r in self.repos}
         for unit in report['units']:
@@ -629,4 +667,7 @@ class Locator:
                                    'truncated': len(res.stdout) > 6000, 'limit': 12})
                 except subprocess.SubprocessError as exc:
                     result.append({'repository': key[0], 'path': key[1], 'status': 'UNAVAILABLE', 'error': str(exc)[-800:]})
+                except DiscoveryDeferred as exc:
+                    report['retrieval_summary']['history_deferred'] = str(exc)
+                    return result
         return result

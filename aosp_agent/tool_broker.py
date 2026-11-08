@@ -19,7 +19,7 @@ import uuid
 
 from jsonschema import validate, ValidationError
 from . import agent_tools
-from .retrieval import ReadBudget, BudgetExceeded
+from .retrieval import ACTIVE_READ_PHASE, ReadBudget, BudgetExceeded, record_read_activity
 from .tool_io import ACTIVE_TOOL_IO, ToolIO
 
 
@@ -106,6 +106,7 @@ class ToolBroker:
             self.active = True; self.cancelled.clear(); self.failure = None
             self.thread_id, self.turn_id, self.cwd, self.read_only = thread_id, None, Path(cwd), read_only
             self.budget = budget or self.fallback
+            self.read_phase = ACTIVE_READ_PHASE.get()
             self.io = ToolIO(self.budget, self.cancelled, time.monotonic() + min(timeout, self.budget.remaining()), MAX_FILE)
 
     def bind_turn(self, ident):
@@ -141,6 +142,7 @@ class ToolBroker:
                 return self._reply(False, {'error': 'inactive, duplicate, concurrent or foreign tool request'})
             self.turn_id = params['turnId']; self.seen.add(ident); self.idle.clear()
         success = False
+        phase_token = ACTIVE_READ_PHASE.set(self.read_phase)
         try:
             self.io.check()
             self.budget.command_timeout(120)  # Before any tool-owned filesystem access.
@@ -173,6 +175,7 @@ class ToolBroker:
             # Unexpected subprocess/parser failures do not provide partial source evidence.
             return self._reply(False, {'error': type(exc).__name__ + ': ' + str(exc)[:1000], 'status': 'READ_FAILED'})
         finally:
+            ACTIVE_READ_PHASE.reset(phase_token)
             try:
                 self.log('broker_tool', tool=name, call_id=ident, success=success, budget=self.budget.data())
             finally:
@@ -231,6 +234,7 @@ class ToolBroker:
                     raise ToolDenied('file is not regular or exceeds the per-file read limit')
                 self.budget.claim_bytes(info.st_size + 1)
                 data = stream.read(info.st_size + 1)
+                record_read_activity(broker_file_read_bytes=len(data))
                 if len(data) != info.st_size:
                     raise ToolDenied('file size changed during read')
                 self.io.check()

@@ -104,7 +104,8 @@ class ProjectFirstAgent:
                  runtime_factory=None, validation=None, joint_validation=None, auto_validation=True,
                  build_runner=None, cache_root=None, max_projects=12, max_rounds=3,
                  investigation_seconds=900, max_git_operations=2000, max_model_turns=48,
-                 project_hints=None, read_budget=None, max_output_bytes=256 * 1024 * 1024):
+                 project_hints=None, read_budget=None, max_output_bytes=256 * 1024 * 1024,
+                 resumed_assessment=None):
         self.patch = patch if isinstance(patch, bytes) else Path(patch).read_bytes()
         self.units = diff_units(self.patch.decode())
         self.target_root = Path(target_root).resolve()
@@ -118,6 +119,7 @@ class ProjectFirstAgent:
         from .output_budget import create_budget
         self.output_budget = create_budget(self.run_dir, max_output_bytes)
         self.record = {'task_id': self.task_id, 'status': 'PREPARING', 'impact_decision': 'UNKNOWN',
+                       'stage': 'ROUTING', 'impact_analysis': {'status': 'NOT_STARTED'},
                        'execution_path': 'project_first', 'input_patch_sha256': hashlib.sha256(self.patch).hexdigest(),
                        'rounds': [], 'runtime_security_proven': False, 'model_execution': 'not_run'}
         self.budget = read_budget or ReadBudget(investigation_seconds, max_git_operations)
@@ -128,6 +130,7 @@ class ProjectFirstAgent:
         self.timeout, self.max_projects, self.max_rounds = turn_timeout, max_projects, max_rounds
         self.catalog, self.target_revision, self.pinned_heads = catalog, target_revision, pinned_heads
         self.explicit_keys = repository_keys
+        self.resumed_assessment = resumed_assessment
         self.project_hints = list(project_hints or [])
         self.donor_options = dict(donor_repo=donor_repo, source_commit=source_commit, source_parent=source_parent)
         self.source_sequence = source_sequence
@@ -161,12 +164,61 @@ class ProjectFirstAgent:
 
     def _save(self):
         from .delivery import update_delivery
+        impact = self.record['impact_analysis']
+        if impact['status'] == 'CONFIRMED':
+            self.record['impact_decision'] = impact['decision']
+        elif impact['status'] == 'CONFLICT':
+            self.record['impact_decision'] = 'UNKNOWN'
         update_delivery(self.record)
+        self.record['migration'] = self._migration_result()
         self.record['investigation_budget'] = self.budget.data()
+        self.record['stage_read_usage'] = self.budget.phase_data()
         self.record['model_turns'] = {'used': self.factory.used, 'limit': self.factory.limit}
         self.record['object_cache'] = self.cache.data()
         self.record['output_budget'] = self.output_budget.data()
         _write(self.run_dir / 'run.json', self.record, control=True)
+
+    def _migration_result(self):
+        options = self.record.get('run_options', {})
+        decision, status = self.record['impact_decision'], self.record['status']
+        if options.get('impact_only') or options.get('inspect_only'):
+            return {'status': 'NOT_REQUESTED'}
+        if decision in ('NOT_AFFECTED', 'ALREADY_FIXED'):
+            return {'status': 'NOT_REQUIRED'}
+        if self.record['impact_analysis']['status'] == 'CONFLICT':
+            return {'status': 'BLOCKED', 'reason': 'IMPACT_EVIDENCE_CONFLICT'}
+        if status in ('VALIDATED', 'NEEDS_REVIEW', 'PATCH_UNVERIFIED'):
+            return {'status': status}
+        if decision == 'AFFECTED' or self.record['stage'] == 'MIGRATION':
+            if self.record.get('budget_interruption'):
+                result = {'status': 'INTERRUPTED', **self.record['budget_interruption']}
+                if self.record.get('scope_evidence', {}).get('migration_questions'):
+                    result['open_questions'] = self.record['scope_evidence']['migration_questions']
+                return result
+            if status in ('INCONCLUSIVE', 'MIGRATION_INCOMPLETE', 'VALIDATION_FAILED',
+                          'FAILED', 'BLOCKED', 'CANCELLED'):
+                return {'status': 'BLOCKED', 'reason': self.record.get('completion_blocked_by') or status}
+            return {'status': 'RUNNING'}
+        return {'status': 'NOT_STARTED'}
+
+    def _merge_round_impact(self, result, round_path):
+        self.record['stage'] = result.get('stage', self.record['stage'])
+        previous = self.record['impact_analysis']
+        incoming = result.get('impact_analysis')
+        if incoming is not None:
+            incoming = {**incoming, 'round_record': str(round_path)}
+        if result.get('backend_conflicts') or (previous.get('decision') == 'AFFECTED'
+                and incoming and incoming.get('decision') in ('NOT_AFFECTED', 'ALREADY_FIXED')):
+            confirmation = (previous.get('prior_confirmation') if previous['status'] == 'CONFLICT' else
+                            previous if previous.get('decision') == 'AFFECTED' else incoming)
+            self.record['impact_analysis'] = {'status': 'CONFLICT',
+                'round_record': str(round_path), 'prior_confirmation': confirmation,
+                'contrary_evidence': result.get('backend_conflicts') or incoming}
+        elif previous['status'] != 'CONFLICT' and incoming and (
+                incoming['status'] == 'CONFIRMED' or
+                previous['status'] not in ('CONFIRMED', 'EVIDENCE_INSUFFICIENT') or
+                previous['status'] == 'EVIDENCE_INSUFFICIENT' and incoming['status'] != 'NOT_STARTED'):
+            self.record['impact_analysis'] = incoming
 
     def _prepare(self):
         from .output_budget import write_bytes
@@ -273,9 +325,20 @@ class ProjectFirstAgent:
              _source_lease=None):
         controller = None
         try:
-            with self.budget.active():
+            with self.budget.active(), self.budget.phase('ROUTING'):
                 self._prepare()
-                if self.explicit_keys is not None:
+                feedback, assessment_seed, obligation_remaps = None, None, 0
+                revalidate_seed = False
+                if self.resumed_assessment is not None and not inspect_only:
+                    keys = list(self.resumed_assessment['targets'])
+                    self._check_keys(keys)
+                    if {key: self.catalog.pin(key)['head'] for key in keys} != self.resumed_assessment['targets']:
+                        raise RecoveryBlocked('accepted assessment target pins changed before resumption')
+                    plan = {'summary': 'Resume from a checked assessment on the same pinned projects', 'projects': keys}
+                    assessment_seed = self.resumed_assessment['assessment']
+                    feedback = self.resumed_assessment['feedback']
+                    revalidate_seed = self.resumed_assessment['revalidate']
+                elif self.explicit_keys is not None:
                     keys = list(dict.fromkeys(self.explicit_keys)); self._check_keys(keys)
                     plan = {'summary': 'Explicit user-supplied project scope', 'projects': keys}
                 elif inspect_only:
@@ -293,13 +356,13 @@ class ProjectFirstAgent:
                     plan = {'summary': 'Metadata-only inspection hints; no model or semantic conclusion', 'projects': keys}
                 else:
                     keys, plan = self._plan(1, max_attempts=max_attempts)
-                feedback, assessment_seed, obligation_remaps = None, None, 0
                 for number in range(1, self.max_rounds + 1):
                     self.budget.remaining()
                     if number > 1:
                         self.cache.retry_transient()
                     pins = {k: self.catalog.pin(k)['head'] for k in keys}
-                    self.record.update(status='INVESTIGATING', selected_projects=keys, pinned_targets=dict(self.catalog.pins))
+                    self.record.update(status='INVESTIGATING', stage='DISCOVERY',
+                                       selected_projects=keys, pinned_targets=dict(self.catalog.pins))
                     self._save()
                     context = ('\nProject-first investigation. Do not read unloaded projects directly. '
                                'Request needed projects using repository_requests [{repository, unit_id, reason, evidence}]. '
@@ -316,7 +379,10 @@ class ProjectFirstAgent:
                                'Cite multiple narrow excerpts for a flow spanning functions. '
                                'Cite both available donor diff sides and every mapped '
                                'target region, including read dependencies. Put a question in unresolved_questions only if '
-                               'its answer is necessary to determine the pinned target impact or the safe migration scope. '
+                               'its answer is necessary to determine the pinned target impact. '
+                               'Use optional migration_questions for blockers limited to repair placement, build or tests, '
+                               'after the baseline vulnerability path and its dependencies have been established. '
+                               'Put uncertain reachability, enabling configuration or protection in unresolved_questions. '
                                'Use an empty array when those questions are resolved. Put future design choices, out-of-scope '
                                'behavior, migration notes and unperformed runtime tests in top-level limitations instead. '
                                'For each material gap state which decision depends on it and what specific evidence is missing. '
@@ -324,17 +390,24 @@ class ProjectFirstAgent:
                                'Use the saved project catalogue for project names, not arbitrary filesystem scans.\n'
                                + json.dumps({'preanalysis': plan, 'catalog_file': str(self.run_dir / 'project-catalog.json'),
                                              'previous_feedback': feedback}, ensure_ascii=False))
-                    controller = DiffBackportAgent(self.patch, self.target_root, self.run_dir / 'rounds',
-                        task_id=f'r{number:02}', repository_keys=keys, pinned_heads=pins, lazy_reads=True,
-                        object_cache=self.cache, assessment_context=context, require_scope_closure=True,
-                        read_denied_roots=[self.target_root / p.key for p in self.catalog.projects.values()
-                                           if p.key not in keys and any(p.key.startswith(k + '/') for k in keys)],
-                        source_sequence=self.source_sequence, _source_lease=_source_lease,
-                        exclusion_corrections=self.exclusion_corrections, assessment_seed=assessment_seed,
-                        **self.donor_options, **self.options)
-                    self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
-                    result = controller.run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
-                                            impact_only=impact_only, mechanical=mechanical, _source_lease=_source_lease)
+                    with self.budget.phase('DISCOVERY'):
+                        controller = DiffBackportAgent(self.patch, self.target_root, self.run_dir / 'rounds',
+                            task_id=f'r{number:02}', repository_keys=keys, pinned_heads=pins, lazy_reads=True,
+                            object_cache=self.cache, assessment_context=context, require_scope_closure=True,
+                            read_denied_roots=[self.target_root / p.key for p in self.catalog.projects.values()
+                                               if p.key not in keys and any(p.key.startswith(k + '/') for k in keys)],
+                            source_sequence=self.source_sequence, _source_lease=_source_lease,
+                            exclusion_corrections=self.exclusion_corrections, assessment_seed=assessment_seed,
+                            revalidate_assessment_seed=revalidate_seed,
+                            **self.donor_options, **self.options)
+                        self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
+                        try:
+                            result = controller.run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
+                                                    impact_only=impact_only, mechanical=mechanical, _source_lease=_source_lease)
+                        except (Exception, KeyboardInterrupt):
+                            self._merge_round_impact(controller.record, controller.run_dir / 'run.json')
+                            raise
+                    self._merge_round_impact(result, controller.run_dir / 'run.json')
                     review = result.get('repair_obligation_review', {})
                     if result.get('backend_conflicts') or result.get('impact_decision') in ('NOT_AFFECTED', 'ALREADY_FIXED'):
                         self.record.pop('repair_obligation_review', None)
@@ -356,9 +429,12 @@ class ProjectFirstAgent:
                     requests = result.get('scope_requests') or []
                     feedback = {k: result[k] for k in ('status', 'replan_required', 'scope_evidence', 'backend_conflicts',
                                 'causal_evidence', 'coverage_error', 'coverage_blockers', 'repository_errors',
-                                'verification', 'joint_verification') if k in result}
+                                'verification', 'joint_verification', 'migration_scope_error') if k in result}
                     assessment_seed = None
-                    if (not requests and result.get('coverage_blockers') and controller.replan_assessment is not None
+                    revalidate_seed = False
+                    if (not requests and (result.get('coverage_blockers')
+                            or result.get('completion_blocked_by') == 'MIGRATION_SCOPE_UNRESOLVED')
+                            and controller.replan_assessment is not None
                             and len(json.dumps(controller.replan_assessment, ensure_ascii=False).encode()) <= 128 * 1024):
                         assessment_seed = controller.replan_assessment
                     if requests:
@@ -379,7 +455,8 @@ class ProjectFirstAgent:
                             _write(self.run_dir / f'routing-plan-{number + 1}.json', plan)
                     else:
                         return self._finish(result)
-                    self.record['status'] = 'REPLANNING'; self._save()
+                    self.record.update(status='REPLANNING', stage='REPLANNING')
+                    self._save()
                 return self._finish(result, blocked='REPLANNING_BUDGET_EXHAUSTED')
         except RecoveryBlocked as exc:
             self.record.update(status='BLOCKED', impact_decision='UNKNOWN',
@@ -390,10 +467,13 @@ class ProjectFirstAgent:
                                error={'type': type(exc).__name__, 'message': str(exc)})
         except BudgetExceeded as exc:
             self.record.update(status='INCONCLUSIVE', completion_blocked_by='BUDGET_EXHAUSTED',
+                               budget_interruption={'stage': self.record['stage'], 'reason': str(exc)},
                                error={'type': type(exc).__name__, 'message': str(exc)})
         except KeyboardInterrupt as exc:
             self.record.update(status='CANCELLED', impact_decision='UNKNOWN',
                                completion_blocked_by='CANCELLED_BY_USER', error={'type': type(exc).__name__, 'message': str(exc)})
+            if self.record['impact_analysis']['status'] == 'RUNNING':
+                self.record['impact_analysis'] = {'status': 'INTERRUPTED', 'reason': 'CANCELLED_BY_USER'}
             if controller is not None:
                 try:
                     controller._originals_unchanged()
@@ -404,6 +484,9 @@ class ProjectFirstAgent:
                 controller.record.update(status='CANCELLED', impact_decision='UNKNOWN', completion_blocked_by='CANCELLED_BY_USER')
                 controller._save()
         except Exception as exc:
+            if getattr(exc, 'kind', None) == 'TIMEOUT':
+                self.record.update(budget_interruption={'stage': self.record['stage'], 'reason': 'MODEL_TIMEOUT'},
+                                   completion_blocked_by='MODEL_TIMEOUT')
             self.record.update(status='FAILED', error={'type': type(exc).__name__, 'message': str(exc)[:2000]})
         self._save()
         return self.record
@@ -416,7 +499,8 @@ class ProjectFirstAgent:
         for key in ('status', 'impact_decision', 'patches', 'verification', 'joint_verification',
                     'repository_statuses', 'android_module_build', 'patch_replay', 'source_guard', 'error',
                     'analysis_scope', 'inventory_status', 'completion_blocked_by', 'causal_evidence', 'model_read_boundary',
-                    'retrieval_summary', 'discovery_status', 'coverage_blockers', 'repair_obligation_review',
+                    'retrieval_summary', 'discovery_status', 'scope_evidence', 'coverage_blockers', 'repair_obligation_review',
+                    'budget_interruption', 'migration_scope_error',
                     'post_fix_review', 'post_fix_impact', 'candidate_bundle_sha256'):
             if key in result:
                 self.record[key] = result[key]
@@ -424,6 +508,10 @@ class ProjectFirstAgent:
         self.record['selected_projects'] = self.record['rounds'][-1]['projects']
         if blocked:
             self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN', completion_blocked_by=blocked)
+            if blocked == 'REPLANNING_BUDGET_EXHAUSTED':
+                self.record['budget_interruption'] = {'stage': 'REPLANNING', 'reason': blocked}
+        if self.record['impact_analysis']['status'] == 'CONFLICT':
+            self.record.update(status='INCONCLUSIVE', completion_blocked_by='IMPACT_EVIDENCE_CONFLICT')
         if preserve_impact:
             self.record['impact_decision'] = 'AFFECTED'
         self._save()

@@ -150,7 +150,8 @@ class ToolBrokerTest(unittest.TestCase):
                 'updated': {'root': str(fx.repo), 'head': updated},
             })
             budget = ReadBudget(seconds=10, output_bytes=1536 * 1024)
-            broker = self.broker(fx.repo, scope=scope, budget=budget, read_only=True)
+            with budget.phase('IMPACT_ANALYSIS'):
+                broker = self.broker(fx.repo, scope=scope, budget=budget, read_only=True)
             args = dict(operation='view', repo='target:baseline', ref=baseline, path='large.c')
             for start in (1, 128, 129, 1024, 2049, 3072, 3900, 4096):
                 end = start + 1
@@ -170,6 +171,12 @@ class ToolBrokerTest(unittest.TestCase):
             self.assertTrue(result['success'], result)
             self.assertIn('\nupdated first line\n', response(result)['results'][0]['text'])
             self.assertEqual(budget.used, 12)
+            usage = budget.phase_data()['IMPACT_ANALYSIS']
+            self.assertEqual(usage['operations'], 12)
+            self.assertEqual(usage['io_reserved_bytes'], budget.bytes_used)
+            expected_git_bytes = sum(len(subprocess.check_output(
+                ['git', '-C', str(fx.repo), 'show', ref + ':large.c'])) for ref in (baseline, updated))
+            self.assertEqual(usage['git_output_bytes'], expected_git_bytes)
 
     def test_output_limit_and_cancel_reap_actual_subprocess(self):
         for mode in ('output', 'cancel'):

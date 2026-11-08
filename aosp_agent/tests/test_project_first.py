@@ -115,6 +115,33 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertEqual(result['impact_decision'], 'AFFECTED')
             self.assertEqual(result['repair_obligation_review'], review)
 
+    def test_confirmed_impact_survives_budget_exhaustion_during_migration_replan(self):
+        with GitFixture() as fx:
+            runtime = QueueRuntime([(self.assessment(), None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, auto_validation=False,
+                max_model_turns=1)
+
+            def backend(controller, assessment, **kwargs):
+                self.assertEqual(controller.record['impact_analysis']['status'], 'CONFIRMED')
+                controller.record.update(status='VALIDATION_FAILED', replan_required='MIGRATION_MAPPING_UNRESOLVED')
+                controller._save()
+                return controller.record
+
+            with patch('aosp_agent.text_backend.run_text_backends', side_effect=backend):
+                result = agent.run(max_attempts=1)
+
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+            self.assertEqual(result['impact_analysis']['status'], 'CONFIRMED')
+            self.assertEqual(result['impact_analysis']['targets'], {'repo': fx.target})
+            self.assertEqual(Path(result['impact_analysis']['round_record']).parent.name, 'r01')
+            self.assertEqual(result['migration']['status'], 'INTERRUPTED')
+            self.assertEqual(result['budget_interruption']['stage'], 'IMPACT_ANALYSIS')
+            for phase in ('DISCOVERY', 'IMPACT_ANALYSIS', 'MIGRATION'):
+                self.assertGreater(result['stage_read_usage'][phase]['operations'], 0)
+                self.assertGreater(result['stage_read_usage'][phase]['git_output_bytes'], 0)
+            self.assertEqual(result, json.loads((agent.run_dir / 'run.json').read_text()))
+
     def catalog(self, fx, peer=False):
         projects = [Project('repo', 'platform/repo', fx.target)]
         if peer:
@@ -226,6 +253,55 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertEqual(result['status'], 'INCONCLUSIVE')
             self.assertEqual(result['impact_decision'], 'UNKNOWN')
             self.assertEqual(result['completion_blocked_by'], 'REPLANNING_BUDGET_EXHAUSTED')
+            self.assertEqual(result['impact_analysis']['status'], 'EVIDENCE_INSUFFICIENT')
+
+    def test_confirmed_causal_path_does_not_wait_for_migration_scope(self):
+        with GitFixture() as fx:
+            assessment = self.assessment()
+            assessment['scope_closure']['units'][0]['migration_questions'] = ['Which test target covers the change?']
+            runtime = QueueRuntime([(assessment, None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, max_rounds=1)
+            result = agent.run()
+            self.assertEqual(result['status'], 'INCONCLUSIVE')
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+            self.assertEqual(result['impact_analysis']['status'], 'CONFIRMED')
+            self.assertEqual(result['causal_evidence']['status'], 'GROUNDED_CLOSED_POSITIVE_GROUPS')
+            self.assertEqual(result['scope_evidence']['migration_questions'][0]['question'],
+                             'Which test target covers the change?')
+            self.assertEqual(result['migration']['status'], 'INTERRUPTED')
+            self.assertFalse((agent.run_dir / 'rounds/r01/workspace').exists())
+
+    def test_resume_only_requests_corrections_to_a_checked_pinned_assessment(self):
+        from aosp_agent.assessment_repair import digest
+        from aosp_agent.diff_prompts import ASSESSMENT_RESPONSE_SCHEMA
+        from aosp_agent.resume import resume_project
+        with GitFixture() as fx:
+            assessment = self.assessment()
+            assessment['scope_closure']['units'][0]['migration_questions'] = ['Which test target covers the change?']
+            first = QueueRuntime([(assessment, None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=first.factory, auto_validation=False, max_rounds=1)
+            old = agent.run(max_attempts=1)
+            evidence = Path(old['impact_analysis']['round_record']).parent / 'assessment.json'
+            saved = json.loads(evidence.read_text())
+            prior = {k: v for k, v in saved.items() if k in ASSESSMENT_RESPONSE_SCHEMA['properties']}
+            correction = {'base_sha256': digest(prior), 'replacements': [{
+                'path': '/scope_closure/units/0/migration_questions', 'value_json': '[]'}]}
+            runtime = QueueRuntime([(correction, None)])
+
+            def backend(controller, grounded, **kwargs):
+                controller.record.update(status='PATCH_UNVERIFIED')
+                controller._save()
+                return controller.record
+
+            with patch('aosp_agent.text_backend.run_text_backends', side_effect=backend):
+                result = resume_project(agent.run_dir / 'run.json', runtime_factory=runtime.factory)
+            self.assertEqual(len(runtime.calls), 1)
+            self.assertIn('Which test target covers the change?', runtime.calls[0]['prompt'])
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+            self.assertEqual(result['resumption_policy'], 'checked_assessment_repair_and_fresh_candidates')
+            self.assertNotEqual(Path(result['impact_analysis']['round_record']).parent, evidence.parent)
 
     def test_model_turn_exhaustion_is_unknown_and_durable(self):
         with GitFixture() as fx:

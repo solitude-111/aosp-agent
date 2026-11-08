@@ -6,7 +6,7 @@ import signal
 import subprocess
 import time
 
-from .retrieval import BudgetExceeded
+from .retrieval import BudgetExceeded, record_read_activity
 
 
 ACTIVE_TOOL_IO = ContextVar('aosp_tool_io', default=None)
@@ -65,6 +65,7 @@ class ToolIO:
                         time.sleep(.01)
                     code = process.returncode
             finally:
+                record_read_activity(git_output_bytes=total)
                 try:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:

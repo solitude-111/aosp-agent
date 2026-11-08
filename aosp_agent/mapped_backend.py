@@ -4,6 +4,7 @@ import re
 
 from .agent_tools import _write_wrappers
 from .lifecycle import operation_lease, RecoveryBlocked
+from .retrieval import BudgetExceeded
 
 
 def run_backends(controller, assessment, *, verify, max_attempts, impact_only, mechanical):
@@ -53,6 +54,9 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
             statuses[key] = 'FAILED'
             controller.record.setdefault('repository_errors', {})[key] = {
                 'type': type(exc).__name__, 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))}
+            if isinstance(exc, BudgetExceeded):
+                controller.record.setdefault('budget_interruption', {
+                    'stage': controller.record['stage'], 'repository': key, 'reason': str(exc)})
             continue
         controller._audit_peers(key, peers)
         statuses[key] = result['status']

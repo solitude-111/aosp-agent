@@ -211,13 +211,16 @@ class LifecycleTest(unittest.TestCase):
             coverage = {'summary': 'Bound count', 'limitations': [], 'coverage': [{
                 'id': 'f001-h001', 'status': 'implemented', 'explanation': 'Both bounds implemented',
                 'evidence': [{'path': 'repo/counter.py', 'line_start': 1, 'line_end': 2, 'excerpt': FIXED.strip()}]}]}
-            runtime = QueueRuntime([(routing.ProjectFirstTest().assessment(), None), (coverage, edit)])
+            runtime = QueueRuntime([(coverage, edit)])
             result = resume_project(old.run_dir / 'run.json', runtime_factory=runtime.factory)
             self.assertEqual(result['status'], 'PATCH_UNVERIFIED', result)
             self.assertNotEqual(Path(result['record']).parent, old.run_dir)
             self.assertEqual(json.loads((old.run_dir / 'run.json').read_text())['status'], 'CANCELLED')
             self.assertEqual((fx.repo / 'counter.py').read_text(), BASELINE)
             self.assertEqual(result['pinned_targets']['repo']['head'], fx.target)
+            self.assertFalse(runtime.calls[0]['read_only'])
+            new_round = Path(result['impact_analysis']['round_record'])
+            self.assertTrue(json.loads(new_round.read_text())['assessment_revalidated_without_model'])
 
     def test_live_lease_prevents_resume_and_status_detects_actual_lease(self):
         with GitFixture() as fx:

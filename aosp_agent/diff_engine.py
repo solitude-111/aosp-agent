@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import time
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 
 from .case import Case, validate_relative_path
@@ -38,7 +39,7 @@ class DiffBackportAgent:
                  task_id=None, pinned_heads=None, joint_validation=None, repository_keys=None,
                  lazy_reads=False, object_cache=None, assessment_context='', source_sequence=None,
                  require_scope_closure=False, read_denied_roots=(), max_output_bytes=256 * 1024 * 1024,
-                 exclusion_corrections=None, assessment_seed=None):
+                 exclusion_corrections=None, assessment_seed=None, revalidate_assessment_seed=False):
         self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -67,12 +68,14 @@ class DiffBackportAgent:
         self.exclusion_corrections = exclusion_corrections if exclusion_corrections is not None else ExclusionCorrections()
         self.require_scope_closure = require_scope_closure
         self.assessment_seed, self.replan_assessment = assessment_seed, None
+        self.revalidate_assessment_seed = revalidate_assessment_seed
         self.guarded_obligations = []
         self.read_denied_roots = tuple(read_denied_roots)
         self._model_read_roots = None
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZING',
                        'backend': 'codex_sdk', 'model': model or 'codex_config_default', 'model_execution': 'not_run',
                        'impact_decision': 'UNKNOWN', 'patch_replay': 'not_run',
+                       'stage': 'DISCOVERY', 'impact_analysis': {'status': 'NOT_STARTED'},
                        'verification_scope': 'configured_commands_only', 'runtime_security_proven': False,
                        'android_module_build': 'NOT_CONFIGURED', 'android_runtime': 'NOT_CONFIGURED',
                        'poc_execution': 'NOT_RUN', 'inventory_issues': self.inventory_issues}
@@ -200,6 +203,8 @@ class DiffBackportAgent:
                 if status in ('NOT_AFFECTED', 'ALREADY_FIXED'):
                     self.record['available_scope_impact'] = self.record['impact_decision']
                     self.record['impact_decision'] = 'UNKNOWN'
+                    self.record['impact_analysis'] = {
+                        'status': 'EVIDENCE_INSUFFICIENT', 'reason': self.record['completion_blocked_by']}
         from .delivery import update_delivery
         update_delivery(self.record)
         self.record['output_budget'] = self.output_budget.data()
@@ -282,6 +287,19 @@ class DiffBackportAgent:
 
     def ground(self, raw):
         return self.mapper.ground(raw)
+
+    def _record_assessment(self, assessment, decision, *, reason='IMPACT_UNRESOLVED'):
+        path = self.run_dir / 'assessment.json'
+        _write(path, assessment)
+        self._protect(path)
+        self.record.update(model_execution=('reused_assessment' if self.record.get('assessment_revalidated_without_model')
+                                            else 'succeeded'), impact_decision=decision)
+        if decision == 'UNKNOWN':
+            self.record['impact_analysis'] = {'status': 'EVIDENCE_INSUFFICIENT', 'reason': reason}
+        else:
+            self.record['impact_analysis'] = {
+                'status': 'CONFIRMED', 'decision': decision, 'assessment_sha256': self.protected[path],
+                'targets': {repo.key: repo.head for repo in self.repos}}
 
     def _runtime(self, name):
         from .retrieval import ACTIVE_BUDGET
@@ -503,7 +521,11 @@ class DiffBackportAgent:
                 self._save()
                 _write_wrappers(self.run_dir)
             locator = Locator(self.repos, self.units)
-            location = locator.locate(lambda state: _write(self.run_dir / 'discovery-progress.json', state))
+            from .retrieval import ACTIVE_BUDGET, BudgetExceeded
+            budget = ACTIVE_BUDGET.get()
+            with budget.reserve_for_impact() if budget and self.require_scope_closure else nullcontext():
+                location = locator.locate(lambda state: _write(self.run_dir / 'discovery-progress.json', state))
+                location['target_history'] = locator.history(location)
             location['issues'] = self.inventory_issues + location['issues']
             location['inventory_status'] = self.record['inventory_status']
             self.record['discovery_status'] = ('INCOMPLETE' if any('error' in i for i in location['issues'])
@@ -511,7 +533,6 @@ class DiffBackportAgent:
                                                 if location['retrieval_summary']['deferred_project_searches']
                                                 else 'COMPLETE_WITH_RETRIEVAL_LIMITS')
             self.record['retrieval_summary'] = location['retrieval_summary']
-            location['target_history'] = locator.history(location)
             location['source_history'] = self.donor
             _write(self.run_dir / 'location.json', location)
             self._originals_unchanged()
@@ -524,7 +545,8 @@ class DiffBackportAgent:
                     self._save()
                 return self.record
             from .guarded_repair import discover_obligations
-            self.guarded_obligations = discover_obligations(self)
+            with budget.phase('IMPACT_ANALYSIS') if budget else nullcontext():
+                self.guarded_obligations = discover_obligations(self)
             obligation_context = ''
             if self.guarded_obligations:
                 self.record['guarded_source_obligations'] = self.guarded_obligations
@@ -541,20 +563,20 @@ class DiffBackportAgent:
                     'target definitions of decisive predicates, state updates and callbacks within their own '
                     'mapped regions. The candidate reviewer reuses these pinned excerpts.\n'
                     + json.dumps(self.guarded_obligations, ensure_ascii=False))
-            with self._runtime('assessment') as runtime:
+            with (budget.phase('IMPACT_ANALYSIS') if budget else nullcontext()), ExitStack() as runtimes:
                 from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
                 from .exclusion_review import (ExclusionReviewError, ExclusionReviewUnresolved,
                                                review_exclusions, unresolved_exclusions)
-                from .mapped_impact import ImpactProofError, PROOF_CONTEXT, check_impact_proofs
+                from .mapped_impact import ImpactProofError, RepairContractError, PROOF_CONTEXT, check_impact_proofs
                 require_causality = (self.require_scope_closure or self.donor['status'] == 'VERIFIED_SEQUENCE'
                                      or bool(self.guarded_obligations))
-                runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
+                runtime = None
                 prompt = (assessment_prompt(self.diff, inventory, location) + self._donor_tools_context()
                           + review_prompt(review) + self.assessment_context + obligation_context
                           + (PROOF_CONTEXT if require_causality else ''))
                 raw = self.assessment_seed
                 if raw is not None:
-                    prompt = (repair_prompt(raw, 'Use the previous coverage_blockers below. Keep already grounded '
+                    prompt = (repair_prompt(raw, 'Use the previous scope or coverage blockers below. Keep already grounded '
                                             'evidence and fix only the affected mappings and dependent proof references.')
                               + '\nAccepted assessment from the previous round:\n' + json.dumps(raw, ensure_ascii=False)
                               + self.assessment_context + self._donor_tools_context() + obligation_context
@@ -563,12 +585,21 @@ class DiffBackportAgent:
                     self._save()
                 for attempt in range(1, max_attempts + 1):
                     initial = attempt == 1 and self.assessment_seed is None
-                    response = self._turn(runtime, prompt, ASSESSMENT_RESPONSE_SCHEMA if initial else REPAIR_SCHEMA,
-                                          read_only=True)
+                    revalidate = attempt == 1 and self.revalidate_assessment_seed
+                    if attempt == 1:
+                        self.record.update(stage='IMPACT_ANALYSIS', impact_analysis={'status': 'RUNNING'})
+                        self._save()
+                    if not revalidate:
+                        if runtime is None:
+                            runtime = runtimes.enter_context(self._runtime('assessment'))
+                            runtime.start(self.run_dir, SYSTEM +
+                                '\nAssessment phase is strictly read-only, using pinned original Git objects.')
+                        response = self._turn(runtime, prompt, ASSESSMENT_RESPONSE_SCHEMA if initial else REPAIR_SCHEMA,
+                                              read_only=True)
                     try:
                         if initial:
                             raw = response
-                        else:
+                        elif not revalidate:
                             _write(self.run_dir / f'assessment-repair-{attempt}.json', response)
                             raw = apply_repair(raw, response)
                         _write(self.run_dir / f'assessment-{attempt}.json', raw)
@@ -577,24 +608,59 @@ class DiffBackportAgent:
                         scope = check_scope(self, assessment, self.require_scope_closure)
                         self.record['scope_evidence'] = scope
                         if scope['status'] in ('EXPANSION_REQUIRED', 'OPEN_QUESTIONS'):
-                            _write(self.run_dir / 'assessment.json', assessment)
-                            self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN',
-                                replan_required=scope['status'], scope_requests=scope.get('requests', []))
+                            decision = 'UNKNOWN'
+                            if 'unresolved_questions' in scope:
+                                open_units = {row['unit_id'] for row in
+                                              scope['unresolved_questions'] + scope.get('requests', [])}
+                                closed_units = {unit['id'] for unit in self.units} - open_units
+                                if any(group['impact']['status'] == 'AFFECTED' and set(group['unit_ids']) <= closed_units
+                                       for group in assessment.get('proof_groups', [])):
+                                    self.record['causal_evidence'] = check_impact_proofs(
+                                        self, assessment, require_causality, closed_units=closed_units)
+                                    if self.record['causal_evidence']['groups']:
+                                        decision = 'AFFECTED'
+                            self._record_assessment(assessment, decision, reason=scope['status'])
+                            self.record.update(status='INCONCLUSIVE', replan_required=scope['status'],
+                                scope_requests=scope.get('requests', []))
+                            if decision == 'AFFECTED':
+                                self.record['completion_blocked_by'] = 'MIGRATION_SCOPE_UNRESOLVED'
+                                self.replan_assessment = raw
                             self._save()
                             return self.record
                         self.record['causal_evidence'] = check_impact_proofs(self, assessment, require_causality)
-                        review_exclusions(self, assessment, inventory, attempt)
+                        try:
+                            review_exclusions(self, assessment, inventory, attempt)
+                        except (BudgetExceeded, KeyboardInterrupt):
+                            if any(group['status'] == 'AFFECTED' for group in self.record['causal_evidence'].get('groups', [])):
+                                self._record_assessment(assessment, 'AFFECTED')
+                                self._save()
+                            raise
                         self.replan_assessment = raw
+                        if revalidate:
+                            self.record['assessment_revalidated_without_model'] = True
                         break
                     except AssessmentError as exc:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))
                         self._save()
+                        if isinstance(exc, RepairContractError):
+                            self.record['causal_evidence'] = check_impact_proofs(
+                                self, assessment, require_causality, closed_units={u['id'] for u in self.units})
+                            if self.record['causal_evidence']['groups']:
+                                self._record_assessment(assessment, 'AFFECTED')
+                                self.record.update(status='INCONCLUSIVE', replan_required='MIGRATION_SCOPE_UNRESOLVED',
+                                    completion_blocked_by='MIGRATION_SCOPE_UNRESOLVED',
+                                    migration_scope_error=str(exc))
+                                self.replan_assessment = raw
+                                self._save()
+                                return self.record
                         if isinstance(exc, ExclusionReviewUnresolved):
                             assessment = unresolved_exclusions(self, assessment, str(exc))
                             break
                         if attempt == max_attempts:
                             if isinstance(exc, ImpactProofError):
                                 self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN',
+                                    impact_analysis={'status': 'EVIDENCE_INSUFFICIENT',
+                                                     'reason': 'CAUSAL_EVIDENCE_UNRESOLVED'},
                                     completion_blocked_by='CAUSAL_EVIDENCE_UNRESOLVED',
                                     replan_required='CAUSAL_EVIDENCE_UNRESOLVED',
                                     causal_evidence={'status': 'UNRESOLVED', 'reason': str(exc)})
@@ -605,30 +671,44 @@ class DiffBackportAgent:
                                 break
                             raise
                         prompt = repair_prompt(raw, exc)
-            _write(self.run_dir / 'assessment.json', assessment)
-            self._protect(self.run_dir / 'assessment.json')
-            self.record.update(model_execution='succeeded', impact_decision=assessment['status'])
+            decision = assessment['status']
+            if decision == 'UNKNOWN' and any(group['status'] == 'AFFECTED' for group in
+                                             self.record.get('causal_evidence', {}).get('groups', [])):
+                decision = 'AFFECTED'
+                self.record.update(completion_blocked_by='MIGRATION_SCOPE_UNRESOLVED',
+                                   replan_required='MIGRATION_SCOPE_UNRESOLVED')
+            self._record_assessment(assessment, decision)
             if assessment['status'] != 'AFFECTED':
                 self.record['status'] = 'INCONCLUSIVE' if assessment['status'] == 'UNKNOWN' else assessment['status']
                 self._save()
                 return self.record
-            self._prepare_children(assessment, build_requested=verify and not impact_only)
-            if self.donor['status'] == 'VERIFIED':
-                from .mapped_backend import run_backends
+            if not impact_only:
+                self.record['stage'] = 'MIGRATION'
+            self._save()
+            phase = 'IMPACT_ANALYSIS' if impact_only else 'MIGRATION'
+            with budget.phase(phase) if budget else nullcontext():
+                self._prepare_children(assessment, build_requested=verify and not impact_only)
+                if self.donor['status'] == 'VERIFIED':
+                    from .mapped_backend import run_backends
+                    from .retrieval import suspend_investigation_budget
+                    with suspend_investigation_budget():
+                        return run_backends(self, assessment, verify=verify, max_attempts=max_attempts,
+                                            impact_only=impact_only, mechanical=mechanical)
+                if impact_only:
+                    self.record['status'] = 'AFFECTED'
+                    self._save()
+                    return self.record
+                from .text_backend import run_text_backends
                 from .retrieval import suspend_investigation_budget
                 with suspend_investigation_budget():
-                    return run_backends(self, assessment, verify=verify, max_attempts=max_attempts,
-                                        impact_only=impact_only, mechanical=mechanical)
-            if impact_only:
-                self.record['status'] = 'AFFECTED'
-                self._save()
-                return self.record
-            from .text_backend import run_text_backends
-            from .retrieval import suspend_investigation_budget
-            with suspend_investigation_budget():
-                return run_text_backends(self, assessment, verify=verify, max_attempts=max_attempts)
+                    return run_text_backends(self, assessment, verify=verify, max_attempts=max_attempts)
         except Exception as exc:
             from .lifecycle import RecoveryBlocked
+            if self.record['impact_analysis']['status'] == 'RUNNING':
+                self.record['impact_analysis'] = (
+                    {'status': 'EVIDENCE_INSUFFICIENT', 'reason': 'ASSESSMENT_REJECTED'}
+                    if isinstance(exc, AssessmentError) else
+                    {'status': 'INTERRUPTED', 'reason': type(exc).__name__})
             self.record.update(status='BLOCKED' if isinstance(exc, RecoveryBlocked) else 'FAILED', error={'type': type(exc).__name__, 'kind': getattr(exc, 'kind', 'DIFF_WORKFLOW_ERROR'),
                 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))})
             if self.record['model_execution'] == 'not_run' and not inspect_only:

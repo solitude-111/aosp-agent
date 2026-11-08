@@ -66,6 +66,41 @@ def checked_json(path, digest):
     return json.loads(data)
 
 
+def _accepted_assessment(root, record):
+    impact = record.get('impact_analysis', {})
+    if impact.get('status') != 'CONFIRMED' or impact.get('decision') != 'AFFECTED':
+        return None
+    targets = impact.get('targets', {})
+    pins = record.get('pinned_targets', {})
+    if not targets or set(targets) != set(record.get('selected_projects', [])):
+        return None
+    if any(pins.get(key, {}).get('head') != head for key, head in targets.items()):
+        return None
+    round_path = Path(impact['round_record']).resolve()
+    if not round_path.is_relative_to(root / 'rounds') or round_path.name != 'run.json':
+        raise RecoveryBlocked('accepted assessment round is outside the stopped task')
+    row = json.loads(round_path.read_text())
+    if (row.get('input_patch_sha256') != record['input_patch_sha256']
+            or row.get('impact_analysis') != {k: v for k, v in impact.items() if k != 'round_record'}):
+        raise RecoveryBlocked('accepted assessment identity does not match the stopped task')
+    path = round_path.parent / 'assessment.json'
+    if path.is_symlink():
+        raise RecoveryBlocked('accepted assessment is a symlink')
+    if path.stat().st_size > 128 * 1024:
+        return None
+    saved = checked_json(path, impact['assessment_sha256'])
+    from .diff_prompts import ASSESSMENT_RESPONSE_SCHEMA
+    assessment = {k: v for k, v in saved.items() if k in ASSESSMENT_RESPONSE_SCHEMA['properties']}
+    feedback = {k: record.get(k, row.get(k)) for k in
+                ('scope_evidence', 'coverage_blockers', 'migration_scope_error',
+                 'budget_interruption', 'completion_blocked_by')
+                if k in record or k in row}
+    revalidate = (row.get('causal_evidence', {}).get('status') == 'GROUNDED_CAUSAL_PROOFS'
+                  and not (feedback.get('coverage_blockers') or feedback.get('migration_scope_error')
+                           or feedback.get('scope_evidence', {}).get('status') == 'OPEN_QUESTIONS'))
+    return {'targets': targets, 'assessment': assessment, 'feedback': feedback, 'revalidate': revalidate}
+
+
 def verify_stopped_sources(root):
     try:
         return _verify_stopped_sources(Path(root))
@@ -120,10 +155,15 @@ def resume_project(record_path, *, runtime_factory=None, run_root=None, task_id=
             projects = [Project(**p) for p in catalog_data['projects']]
             projects = [replace(p, revision=pins[p.key]['head']) if p.key in pins else p for p in projects]
             options['catalog'] = ProjectCatalog(spec['target_root'], projects, catalog_data['provenance'])
+        accepted = _accepted_assessment(root, record)
+        if accepted:
+            options['resumed_assessment'] = accepted
         task_id = task_id or 'resume-' + uuid.uuid4().hex[:12]
         agent = ProjectFirstAgent(data, spec['target_root'], run_root or root / 'resumptions', task_id=task_id,
                                   runtime_factory=runtime_factory, **options)
-        agent.record.update(resumed_from=str(path), resumption_policy='fresh_mapping_and_candidates; immutable_object_cache_only')
+        agent.record.update(resumed_from=str(path), resumption_policy=(
+            'checked_assessment_repair_and_fresh_candidates' if accepted else
+            'fresh_mapping_and_candidates; immutable_object_cache_only'))
         agent.record['run_options'] = dict(record['run_options'])
         # A crash before run() must still preserve the pinned catalogue needed
         # to resume this prepared child instead of rediscovering current HEADs.

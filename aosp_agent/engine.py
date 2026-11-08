@@ -259,17 +259,20 @@ class AospBackportAgent(CausalityChecks):
 
     def _git(self, *args: str, cwd: Path | None = None, check: bool = True,
              env: dict[str, str] | None = None, input: str | None = None):
+        from .retrieval import capture_git, record_read_activity
         repo = cwd or self.repo
         git_env = offline_git_env(env)
-        return subprocess.run(["git", "-c", f"safe.directory={repo}", "-c", "protocol.allow=never",
+        record_read_activity(operations=1)
+        return capture_git(["git", "-c", f"safe.directory={repo}", "-c", "protocol.allow=never",
                                "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", *args], cwd=repo,
-                              text=True, capture_output=True, check=check, env=git_env, input=input, timeout=180)
+                           check=check, env=git_env, input=input, timeout=180)
 
     def _source_git(self, *args: str, check: bool = True):
         if self.donor_root:
-            return subprocess.run(["git", "-c", "protocol.allow=never", "--git-dir", str(self.donor_repo), *args],
-                                  text=True, capture_output=True, check=check, timeout=180,
-                                  env=offline_git_env())
+            from .retrieval import capture_git, record_read_activity
+            record_read_activity(operations=1)
+            return capture_git(["git", "-c", "protocol.allow=never", "--git-dir", str(self.donor_repo), *args],
+                               check=check, timeout=180, env=offline_git_env())
         return self._git(*args, check=check)
 
     def _event(self, name: str, **data: Any) -> None:

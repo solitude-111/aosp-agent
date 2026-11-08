@@ -79,6 +79,25 @@ class StagedRetrievalTest(unittest.TestCase):
             self.assertEqual(budget.used, 2)
             self.assertFalse(repo.files.complete)
 
+    def test_soft_limit_keeps_completed_candidates_and_budget_for_pending_units(self):
+        with GitFixture() as fx:
+            self.seed(fx, {'First.java': BEFORE, 'Second.java': BEFORE})
+            repo = repositories(fx.repo, lazy=True)[0]
+            units = diff_units(diff('First.java', BEFORE, AFTER) + diff('Second.java', BEFORE, AFTER))
+            locator = Locator([repo], units)
+            budget = ReadBudget(operations=8)
+            with budget.active():
+                with budget.reserve_for_impact():
+                    report = locator.locate()
+                self.assertEqual(budget.used, 4)
+                self.assertEqual(repo.read('Second.java'), BEFORE)
+            first, second = report['units']
+            self.assertEqual(first['candidates'][0]['path'], 'First.java')
+            self.assertEqual(second['status'], 'DEFERRED')
+            self.assertFalse(second['retrieval'][0]['absence_proven'])
+            self.assertEqual(report['retrieval_summary']['soft_limit']['pending_units'], [second['id']])
+            self.assertEqual(budget.used, 6)
+
     def test_broad_identifier_hits_rank_before_tree_checks_and_blob_reads(self):
         with GitFixture() as fx:
             noise = 'class Noise { int acceptCount(int requestedCount) { return 7; } }\n'

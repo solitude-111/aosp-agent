@@ -224,6 +224,7 @@ def _main() -> int:
                 result['record'] = exc.record_path
         summary = {k: result[k] for k in ("task_id", "status", "impact_decision", "model", "patches", "error", "record",
                                         "inventory_status", "completion_blocked_by", "execution_path", "selected_projects",
+                                        "impact_analysis", "migration", "budget_interruption", "stage_read_usage",
                                         "build_validation", "review_status", "delivery_status", "delivery") if k in result}
         if agent:
             summary["record"] = str(agent.run_dir / "run.json")
