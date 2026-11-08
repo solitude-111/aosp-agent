@@ -195,20 +195,37 @@ def collect_regions(agent, claims, candidate_patch):
     return requests
 
 
-def _review(agent, requests, candidate_patch):
+def _review(agent, requests, candidate_patch, contract=()):
     payload = json.dumps(requests, ensure_ascii=False)
-    if len(payload.encode()) > MAX_CONTEXT:
-        return {}
-    key = hashlib.sha256((candidate_patch + '\0' + payload).encode()).hexdigest()
+    schema, extra = REVIEW_SCHEMA, ''
+    if contract:
+        from .guarded_repair import REVIEW_GUIDANCE, review_source, reviewer_schema
+        schema = reviewer_schema(REVIEW_SCHEMA)
+        source = review_source(agent, contract, candidate_patch)
+        pin = agent.mapping_plan.data()['targets'][agent.mapping_repository]
+        extra = (REVIEW_GUIDANCE + f'\nPinned target selector target:{agent.mapping_repository}, ref {pin}.'
+                 + '\nGuarded obligations:\n' + json.dumps(contract, ensure_ascii=False)
+                 + '\nPinned baseline and candidate evidence:\n'
+                 + json.dumps(source, ensure_ascii=False))
+    if len((payload + extra).encode()) > (72 * 1024 if contract else MAX_CONTEXT):
+        raise AssessmentError('mapped coverage review exceeds its bounded source window')
+    key = hashlib.sha256((candidate_patch + '\0' + payload + extra).encode()).hexdigest()
     cache = agent.__dict__.setdefault('_mapped_coverage_reviews', {})
     if key in cache:
-        return cache[key]
+        review, receipt = cache[key]
+        if receipt:
+            agent.record['repair_obligation_review'] = receipt
+        return review
     from .sdk_runtime import CodexRuntime
     factory = agent.runtime_factory or CodexRuntime
+    scope = agent.model_scope(read_only=True)
+    if contract and scope is not None:
+        from dataclasses import replace
+        scope = replace(scope, tool_readable=(), tool_context=None, tool_repositories={})
     try:
         with factory(events_path=agent.run_dir / 'sdk-mapped-coverage.jsonl', model=agent.model,
-                     model_provider=agent.model_provider, turn_timeout=min(180, agent.turn_timeout),
-                     env=OFFLINE_GIT_ENV, read_scope=agent.model_scope(read_only=True)) as runtime:
+                     model_provider=agent.model_provider, turn_timeout=min(480 if contract else 180, agent.turn_timeout),
+                     env=OFFLINE_GIT_ENV, read_scope=scope) as runtime:
             runtime.start(agent.worktree, 'Independently review candidate coverage. Strictly read only.')
             result = runtime.run('''Review every region in the controller evidence below. Use only the supplied snippets.
 For direct_edit, confirm the changed executable code implements that region's part of the invariant.
@@ -223,8 +240,9 @@ If behavior depends on an omitted implementation, path, release condition or unp
 UNRESOLVED. Explain the actual obligation in reason. For COVERED, candidate_lines must include
 a listed added_executable_lines entry for direct_edit, or the first_line of every guard for
 guarded_callers. For UNRESOLVED the list may be empty.
-Return every supplied id exactly once. Do not edit, run tools or claim build or runtime validation.
-Controller evidence:\n''' + payload, read_only=True, output_schema=REVIEW_SCHEMA)
+Return every supplied id exactly once. Do not edit or claim build or runtime validation.
+Controller evidence:\n''' + payload + ('\n' + extra if contract else '\nUse the supplied snippets only.'),
+                                 read_only=True, output_schema=schema)
     finally:
         audit = agent.audit_diff()
         if agent._render_patch(audit) != candidate_patch:
@@ -232,7 +250,7 @@ Controller evidence:\n''' + payload, read_only=True, output_schema=REVIEW_SCHEMA
     if result.get('status') != 'completed':
         raise RuntimeError('mapped coverage review turn did not complete')
     raw = result.get('output') or json.loads(result.get('final_response', '{}'))
-    _shape(raw, REVIEW_SCHEMA)
+    _shape(raw, schema)
     rows = raw['regions']
     if len(rows) != len(requests) or {r['id'] for r in rows} != {r['id'] for r in requests}:
         raise AssessmentError('mapped coverage review must cover every requested region exactly once')
@@ -258,27 +276,40 @@ Controller evidence:\n''' + payload, read_only=True, output_schema=REVIEW_SCHEMA
             valid = cited == required
         if not valid:
             raise AssessmentError('mapped coverage review cites ungrounded candidate lines for ' + row['id'])
-    agent._json(f'mapped-coverage-{key[:16]}.json', {'patch_sha256': hashlib.sha256(candidate_patch.encode()).hexdigest(),
-                 'requests': requests, 'regions': rows})
-    cache[key] = {row['id']: row for row in rows}
-    return cache[key]
+    patch_sha = hashlib.sha256(candidate_patch.encode()).hexdigest()
+    receipt = None
+    if contract:
+        from .guarded_repair import ground_review
+        obligations = ground_review(agent, raw['obligations'], contract, candidate_patch, source)
+        receipt = {'patch_sha256': patch_sha, 'mapping_plan_sha256': agent.mapping_plan.sha256,
+                   'status': 'COVERED' if all(r['verdict'] == 'covered' for r in obligations) else 'UNRESOLVED',
+                   'obligations': obligations, 'impact': raw['impact']}
+        agent.record['repair_obligation_review'] = receipt
+    agent._json(f'mapped-coverage-{key[:16]}.json', {'patch_sha256': patch_sha, 'requests': requests,
+                 'regions': rows, **({'repair_obligation_review': receipt} if receipt else {})})
+    review = {row['id']: row for row in rows}
+    cache[key] = review, receipt
+    return review
 
 
 def review_regions(agent, claims, candidate_patch):
     pending = [claim for claim in claims if claim.get('target_evidence', {}).get('ok') is False]
-    if not pending or not candidate_patch or not agent.mapping_plan:
+    if not candidate_patch or not agent.mapping_plan:
         return
-    requests = collect_regions(agent, pending, candidate_patch)
-    if not requests:
+    contract = agent.mapping_plan.data().get('repair_contract', [])
+    if not pending and not contract:
         return
+    requests = collect_regions(agent, pending, candidate_patch) if pending else []
     rows = [r for c in pending for r in c['target_evidence'].get('regions', []) if not r['ok']]
     if any('coverage_request' not in row for row in rows):
         return  # A structural blocker already prevents this candidate from reaching build.
     try:
-        review = _review(agent, requests, candidate_patch)
+        review = _review(agent, requests, candidate_patch, contract)
     except (AssessmentError, json.JSONDecodeError) as exc:
         for row in rows:
             row['error'] = str(exc)
+        if contract:
+            agent.record['repair_obligation_review'] = {'status': 'UNRESOLVED', 'error': str(exc)}
         return
     for row in rows:
         result = review.get(row['coverage_request'])

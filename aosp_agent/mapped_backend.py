@@ -67,6 +67,15 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
             patches[key] = {'file': result['patch_file'], 'sha256': result['patch_sha256'],
                             'target': child.case.target_commit, 'replay': result['patch_replay']}
         verification[key] = result.get('final_verification', {'status': 'NOT_RUN'})
+        if result.get('obligation_repairs_exhausted'):
+            controller.record['obligation_repairs_exhausted'] = True
+        if result.get('obligation_remap_required'):
+            controller.record['obligation_remap_required'] = True
+            blockers = controller.record.setdefault('coverage_blockers', [])
+            for row in result['repair_obligation_review']['obligations']:
+                for target in row.get('targets_to_reconsider', []):
+                    if len(blockers) < 16:
+                        blockers.append({**target, 'obligation_id': row['id'], 'error': row['reason'][:500]})
         if verification[key].get('blocked_by') == 'HUNK_LEDGER':
             for claim in result.get('hunk_results', []):
                 for region in claim.get('target_evidence', {}).get('regions', []):

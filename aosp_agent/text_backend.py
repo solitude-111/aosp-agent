@@ -69,7 +69,9 @@ def migrate_repository(controller, assessment, key, *, verify, max_attempts, fee
                 if not error:
                     declarations = '\n'.join(f"HUNK-RESULT {c['id']} implemented {c['explanation']}"
                                              for c in raw['coverage'] if c['id'] in required)
-                    ledger = child._check_hunk_results(declarations, child._last_audit['changed_files'], patch)
+                    guarded = bool(controller.mapping_plan.data().get('repair_contract'))
+                    ledger = child._check_hunk_results(declarations, child._last_audit['changed_files'],
+                                                       patch, review_mapped=guarded)
                     child.record['hunk_results'] = ledger['claims']
                     if not ledger['ok']:
                         error = ledger['feedback']

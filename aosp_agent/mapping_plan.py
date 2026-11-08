@@ -226,13 +226,16 @@ class MappingPlan:
     payload: str
 
     @classmethod
-    def create(cls, assessment, repositories, units, source):
-        return cls(json.dumps({
+    def create(cls, assessment, repositories, units, source, *, repair_contract=()):
+        plan = {
             'version': 1, 'assessment': assessment, 'source': source,
             'targets': {repo.key: repo.head for repo in repositories},
             'donor_paths': {u['id']: [p for p in (u['old_path'], u['new_path']) if p] for u in units},
             'write_scope_origin': 'grounded_mapping_not_dataset_files',
-        }, sort_keys=True, ensure_ascii=False))
+        }
+        if repair_contract:
+            plan['repair_contract'] = repair_contract
+        return cls(json.dumps(plan, sort_keys=True, ensure_ascii=False))
 
     @property
     def sha256(self):

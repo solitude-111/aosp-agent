@@ -67,6 +67,7 @@ class DiffBackportAgent:
         self.exclusion_corrections = exclusion_corrections if exclusion_corrections is not None else ExclusionCorrections()
         self.require_scope_closure = require_scope_closure
         self.assessment_seed, self.replan_assessment = assessment_seed, None
+        self.guarded_obligations = []
         self.read_denied_roots = tuple(read_denied_roots)
         self._model_read_roots = None
         self.record = {'task_id': self.task_id, 'input_patch_sha256': self.digest, 'status': 'INITIALIZING',
@@ -332,7 +333,10 @@ class DiffBackportAgent:
         return output
 
     def _prepare_children(self, assessment, *, build_requested=True):
-        self.mapping_plan = MappingPlan.create(assessment, self.repos, self.units, self.donor)
+        repair_contract = [row for group in self.record.get('causal_evidence', {}).get('groups', [])
+                           for row in group.get('repair_obligations', [])]
+        self.mapping_plan = MappingPlan.create(assessment, self.repos, self.units, self.donor,
+                                               repair_contract=repair_contract)
         _write(self.run_dir / 'mapping-plan.json', self.mapping_plan.data())
         self._protect(self.run_dir / 'mapping-plan.json')
         self.record['mapping_plan_sha256'] = self.mapping_plan.sha256
@@ -519,22 +523,41 @@ class DiffBackportAgent:
                                        completion_blocked_by='INCOMPLETE_DISCOVERY')
                     self._save()
                 return self.record
+            from .guarded_repair import discover_obligations
+            self.guarded_obligations = discover_obligations(self)
+            obligation_context = ''
+            if self.guarded_obligations:
+                self.record['guarded_source_obligations'] = self.guarded_obligations
+                self._save()
+                obligation_context = (
+                    '\nRequired upstream behaviors extracted from fixed source. A weakened guard activates '
+                    'all the enclosed statements, including unchanged ones. In each AFFECTED proof group '
+                    'list every corresponding id in repair_obligations. Use target_indices (1-based into '
+                    'that source unit targets) to map each behavior separately. Use edit with production '
+                    'edit locations and supporting reads. Use already_covered only with exact target '
+                    'evidence of the same state, timing, and release paths. Missing modern helpers require '
+                    'adapting the old implementation. An unresolved required behavior blocks migration. '
+                    'Keep pending, running, safe-release and cancellation paths distinct. Cite the actual '
+                    'target definitions of decisive predicates, state updates and callbacks within their own '
+                    'mapped regions. The candidate reviewer reuses these pinned excerpts.\n'
+                    + json.dumps(self.guarded_obligations, ensure_ascii=False))
             with self._runtime('assessment') as runtime:
                 from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
                 from .exclusion_review import (ExclusionReviewError, ExclusionReviewUnresolved,
                                                review_exclusions, unresolved_exclusions)
                 from .mapped_impact import ImpactProofError, PROOF_CONTEXT, check_impact_proofs
-                require_causality = self.require_scope_closure or self.donor['status'] == 'VERIFIED_SEQUENCE'
+                require_causality = (self.require_scope_closure or self.donor['status'] == 'VERIFIED_SEQUENCE'
+                                     or bool(self.guarded_obligations))
                 runtime.start(self.run_dir, SYSTEM + '\nAssessment phase is strictly read-only, using pinned original Git objects.')
                 prompt = (assessment_prompt(self.diff, inventory, location) + self._donor_tools_context()
-                          + review_prompt(review) + self.assessment_context
+                          + review_prompt(review) + self.assessment_context + obligation_context
                           + (PROOF_CONTEXT if require_causality else ''))
                 raw = self.assessment_seed
                 if raw is not None:
                     prompt = (repair_prompt(raw, 'Use the previous coverage_blockers below. Keep already grounded '
                                             'evidence and fix only the affected mappings and dependent proof references.')
                               + '\nAccepted assessment from the previous round:\n' + json.dumps(raw, ensure_ascii=False)
-                              + self.assessment_context + self._donor_tools_context()
+                              + self.assessment_context + self._donor_tools_context() + obligation_context
                               + (PROOF_CONTEXT if require_causality else ''))
                     self.record['assessment_reused_for_coverage_replan'] = True
                     self._save()

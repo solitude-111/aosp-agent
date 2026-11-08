@@ -640,6 +640,9 @@ class AospBackportAgent(CausalityChecks):
                             candidate_patch: str | None = None, *,
                             review_mapped=False) -> dict[str, Any]:
         """Require a complete, non-contradictory donor-hunk ledger."""
+        guarded = review_mapped and self.mapping_plan and self.mapping_plan.data().get('repair_contract')
+        if guarded:
+            self.record.pop('repair_obligation_review', None)
         claims = [{"id": match.group(1), "status": match.group(2), "reason": match.group(3)}
                   for match in _HUNK_RESULT_RE.finditer(response or "")]
         expected_ids = {hunk["id"] for hunk in self._current_hunks}
@@ -706,6 +709,12 @@ class AospBackportAgent(CausalityChecks):
         if review_mapped and not contradictions and self.mapping_plan:
             from .mapped_coverage import review_regions
             review_regions(self, claims, candidate_patch)
+        if guarded:
+            receipt = self.record.get('repair_obligation_review', {})
+            if receipt.get('status') != 'COVERED':
+                unresolved = [f"{r['id']}: {r['reason']}" for r in receipt.get('obligations', [])
+                              if r['verdict'] != 'covered']
+                contradictions.extend(unresolved or [receipt.get('error', 'guarded repair review is unresolved')])
         for claim in claims:
             evidence = claim.get('target_evidence')
             if not evidence or not evidence['required'] or evidence['ok']:
@@ -1345,6 +1354,14 @@ class AospBackportAgent(CausalityChecks):
                                   "callers can establish coverage. Check for alternate callers before relying on a guard. "
                                   "Explain the target-specific change and guarded call paths in the HUNK-RESULT.\n")
 
+                contract = self.mapping_plan.data().get('repair_contract', [])
+                if contract:
+                    base_prompt += ("\nRequired guarded repair behaviors. Implement every edit obligation "
+                                    "and preserve existing protection. Verify the same object remains protected "
+                                    "during the entire hazardous period, including after a pending transition starts. "
+                                    "Ground release and alternate cleanup paths.\n"
+                                    + json.dumps(contract, ensure_ascii=False))
+            obligation_failures = 0
             self.record["attempts"] = []
             self.record.setdefault("attempt_verifications", {})
             diagnosis_json: dict[str, Any] | None = None
@@ -1452,6 +1469,17 @@ class AospBackportAgent(CausalityChecks):
                     self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
                     claim_feedback = claims["feedback"]
                     diagnosis_json = None
+                    obligation_review = self.record.get('repair_obligation_review')
+                    if obligation_review and obligation_review.get('status') != 'COVERED':
+                        rows = obligation_review.get('obligations', [])
+                        if any(row['verdict'] == 'remap' for row in rows):
+                            self.record['obligation_remap_required'] = True
+                            return
+                        obligation_failures += 1
+                        repeated = len(previous_patch_shas) >= 2 and previous_patch_shas[-1] == previous_patch_shas[-2]
+                        if obligation_failures >= 3 or repeated:
+                            self.record['obligation_repairs_exhausted'] = True
+                            return
                     continue
                 claim_feedback = None
                 if not verify:
@@ -1823,7 +1851,16 @@ class AospBackportAgent(CausalityChecks):
     def verify(self) -> dict[str, Any]:
         from .output_budget import require_output_record
         require_output_record(self.run_dir / 'run.json')
-        self.audit_diff(); before = self.record.get("patch_sha256"); results = []
+        audit = self.audit_diff()
+        before = self.record.get("patch_sha256")
+        if self.mapping_plan and self.mapping_plan.data().get('repair_contract'):
+            receipt = self.record.get('repair_obligation_review', {})
+            if (receipt.get('status') != 'COVERED' or receipt.get('patch_sha256') != before
+                    or receipt.get('mapping_plan_sha256') != self.mapping_plan.sha256
+                    or hashlib.sha256(self._render_patch(audit).encode()).hexdigest() != before):
+                return {'status': 'FAIL', 'blocked_by': 'GUARDED_REPAIR_REVIEW',
+                        'patch_sha256': before, 'sufficient_for_validated': False, 'commands': [], 'stages': {}}
+        results = []
         checks = self.case.validation_checks or tuple(
             {"stage": "configured", "argv": list(argv), "artifacts": []}
             for argv in self.case.validation)

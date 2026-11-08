@@ -63,6 +63,8 @@ PATH_GUIDANCE = (
 
 def review_prompt(controller, assessment, inventory):
     proposals = [u for u in assessment['units'] if u['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED')]
+    behaviors = [row for row in getattr(controller, 'guarded_obligations', ())
+                 if row['unit_id'] in {u['id'] for u in proposals}]
     return f'''Independently challenge these proposed no-fix-needed conclusions. Work READ ONLY.
 The proposals are hypotheses, not reference answers. Do not fetch, edit originals, run builds,
 read previous runs or look for dataset verdicts. Inspect pinned target code and the supplied diff.
@@ -100,6 +102,9 @@ modern representation. If the old operation exists under the same or an equivale
 use COUNTERPART_POSSIBLE and cite its target entry/state-flow path for remapping.
 COUNTERPART_POSSIBLE is not an AFFECTED verdict. UNKNOWN is mandatory if proof remains incomplete.
 Never infer runtime safety or affectedness just from compilation, version numbers or API names.
+For any extracted guarded source behaviors, separately account for every operation and protection
+before confirming an exclusion. Missing any one of them leaves the proposal unresolved.
+Extracted source behaviors: {json.dumps(behaviors, ensure_ascii=False)}
 
 Repository inventory:\n''' + json.dumps(inventory, ensure_ascii=False) + '\nInitial retrieval limits:\n' + json.dumps(
         controller.record.get('retrieval_summary', {}), ensure_ascii=False) + '\nProposals:\n' + json.dumps(

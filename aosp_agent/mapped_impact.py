@@ -230,11 +230,45 @@ def _check(controller, assessment, required):
                         raise ImpactProofError('each primary unit needs its own causal role: ' + ident + '/' + field)
                     if field.startswith('donor_') and not any(checks._evidence_overlaps_donor_delta(e) for e in own):
                         raise ImpactProofError('primary donor causal evidence must overlap its own fix delta: ' + ident)
+        obligations = {row['id']: row for row in getattr(controller, 'guarded_obligations', ())
+                       if row['unit_id'] in members and proof['status'] == 'AFFECTED'}
+        rows = group.get('repair_obligations', [])
+        if len(rows) != len(obligations) or {r['id'] for r in rows} != set(obligations):
+            raise ImpactProofError(f'/proof_groups/{group_index}/repair_obligations must cover every '
+                                   f'required upstream behavior exactly once: {list(obligations)}')
+        repair_contract = []
+        for row_index, row in enumerate(rows):
+            origin = obligations[row['id']]
+            targets = mapped[origin['unit_id']]['targets']
+            indices = row['target_indices']
+            pointer = f'/proof_groups/{group_index}/repair_obligations/{row_index}'
+            if not indices or len(indices) != len(set(indices)) or any(not 1 <= i <= len(targets) for i in indices):
+                raise ImpactProofError(pointer + ': target_indices must select grounded unit targets')
+            selected = [targets[i - 1] for i in indices]
+            edits = [t for t in selected if t['action'] == 'edit']
+            if row['disposition'] == 'edit':
+                if not any(t['relationship'] not in ('test', 'data_or_configuration') for t in edits):
+                    raise ImpactProofError(pointer + ': behavior requires a production edit mapping')
+            elif edits or not any(t['relationship'] not in ('test', 'data_or_configuration') for t in selected):
+                raise ImpactProofError(pointer + ': existing protection needs read-only production mappings')
+            owners = {controller._owner(t['path'])[0].key for t in edits}
+            if len(owners) > 1:
+                raise ImpactProofError(pointer + ': a single guarded behavior spanning multiple write projects '
+                                       'requires bundle-level coverage support')
+            repair_contract.append({**origin, 'disposition': row['disposition'], 'reason': row['reason'],
+                                    'targets': selected, 'write_repository': next(iter(owners), None)})
         from .platform_evidence import receipt
         receipts.append({'id': group['id'], 'unit_ids': group['unit_ids'], 'primary_unit_ids': group['primary_unit_ids'],
             'status': proof['status'], 'support_units': [s['unit_id'] for s in support],
             'platform_behavior_evidence': receipt(proof)})
         if no_edit_support:
             receipts[-1]['no_target_edit_support'] = no_edit_support
+        if repair_contract:
+            receipts[-1]['repair_obligations'] = repair_contract
+    if any(group.get('repair_obligations') for group in receipts):
+        writable_projects = {controller._owner(path)[0].key for path in assessment['writable_paths']}
+        if len(writable_projects) != 1:
+            raise ImpactProofError('guarded behavior review currently requires one writable project; '
+                                   'read-only dependencies may span projects')
     return {'status': 'GROUNDED_CAUSAL_PROOFS', 'contract': 'shared_run_impact_rules', 'groups': receipts,
             'runtime_security_proven': False, 'limitation': 'Grounded model proof obligations; not formal semantic proof.'}

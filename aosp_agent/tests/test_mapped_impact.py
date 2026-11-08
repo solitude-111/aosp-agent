@@ -121,6 +121,23 @@ class MappedImpactTest(unittest.TestCase):
                 with self.assertRaisesRegex(ImpactProofError, expected):
                     check_impact_proofs(controller, controller.ground(assessment), required=True)
 
+    def test_proof_group_cannot_drop_a_controller_extracted_behavior(self):
+        with GitFixture() as fx:
+            controller, assessment = self.setup_proofs(fx)
+            group = assessment['proof_groups'][0]
+            unit_id = group['unit_ids'][0]
+            controller.guarded_obligations = [{'id': unit_id + ':guard:' + str(i), 'unit_id': unit_id}
+                                              for i in (1, 2)]
+            group['repair_obligations'] = [{
+                'id': controller.guarded_obligations[0]['id'], 'disposition': 'edit',
+                'target_indices': [1], 'reason': 'Adapt the original behavior.'}]
+            with self.assertRaisesRegex(ImpactProofError, 'every required upstream behavior'):
+                check_impact_proofs(controller, controller.ground(assessment), required=True)
+            group['repair_obligations'].append({**group['repair_obligations'][0],
+                                               'id': controller.guarded_obligations[1]['id']})
+            receipt = check_impact_proofs(controller, controller.ground(assessment), required=True)
+            self.assertEqual(len(receipt['groups'][0]['repair_obligations']), 2)
+
     def test_missing_duplicate_or_uncovered_units_are_rejected(self):
         for mode in ('missing', 'duplicate', 'empty'):
             with self.subTest(mode=mode), GitFixture() as fx:

@@ -253,6 +253,17 @@ def assess_joint_impact(controller):
         if not child.case.files:
             continue
         previous = child.record.get('post_fix_impact') or {}
+        prebuild = child.record.get('repair_obligation_review') or {}
+        if (len(bundle['repositories']) == 1 and prebuild.get('status') == 'COVERED'
+                and prebuild.get('patch_sha256') == child.record.get('patch_sha256')
+                and prebuild.get('mapping_plan_sha256') == controller.mapping_plan.sha256):
+            child.record.update(post_fix_impact=prebuild['impact'], post_fix_patch_sha256=prebuild['patch_sha256'],
+                post_fix_bundle_sha256=bundle_digest,
+                post_fix_review={'status': 'COMPLETED', 'patch_sha256': prebuild['patch_sha256'],
+                                 'scope': 'prebuild_coverage_and_compatibility', 'runtime_security_proven': False})
+            child._write_record()
+            statuses[key] = 'COMPLETED'
+            continue
         if (child.record.get('post_fix_patch_sha256') == child.record.get('patch_sha256')
                 and child.record.get('post_fix_bundle_sha256') == bundle_digest
                 and previous and not previous.get('error')):

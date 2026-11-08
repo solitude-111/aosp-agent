@@ -46,6 +46,10 @@ PROOF_GROUP = obj({'id': STRING, 'unit_ids': array(STRING), 'primary_unit_ids': 
         'unit_id': STRING, 'supports': array(STRING), 'reason': STRING,
         'evidence': array({'type': 'integer', 'minimum': 1})}))})
 PROOF_GROUP['properties']['support_links']['items']['properties']['target_disposition'] = enum('no_target_edit')
+PROOF_GROUP['properties']['repair_obligations'] = array(obj({
+    'id': STRING, 'disposition': enum('edit', 'already_covered'),
+    'target_indices': array(LINE), 'reason': STRING,
+}))
 ASSESSMENT_SCHEMA['properties']['proof_groups'] = array(PROOF_GROUP)
 
 # Preserve the materialized format for the checks and downstream consumers.

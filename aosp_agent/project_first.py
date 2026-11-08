@@ -293,7 +293,7 @@ class ProjectFirstAgent:
                     plan = {'summary': 'Metadata-only inspection hints; no model or semantic conclusion', 'projects': keys}
                 else:
                     keys, plan = self._plan(1, max_attempts=max_attempts)
-                feedback, assessment_seed = None, None
+                feedback, assessment_seed, obligation_remaps = None, None, 0
                 for number in range(1, self.max_rounds + 1):
                     self.budget.remaining()
                     if number > 1:
@@ -341,8 +341,12 @@ class ProjectFirstAgent:
                                                   'status': result['status'], 'projects': list(keys),
                                                   'mapping_plan_sha256': result.get('mapping_plan_sha256')})
                     self.record['model_execution'] = result.get('model_execution', 'not_run')
-                    if inspect_only:
+                    if inspect_only or result.get('obligation_repairs_exhausted'):
                         return self._finish(result)
+                    if result.get('obligation_remap_required'):
+                        if obligation_remaps:
+                            return self._finish(result)
+                        obligation_remaps += 1
                     requests = result.get('scope_requests') or []
                     feedback = {k: result[k] for k in ('status', 'replan_required', 'scope_evidence', 'backend_conflicts',
                                 'causal_evidence', 'coverage_error', 'coverage_blockers', 'repository_errors',
