@@ -36,6 +36,7 @@ def prepare_joint(controller, deferred):
         mergeable = (controller.build_runner and check['argv'][0] == str(controller.build_runner)
                      and all(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', arg) for arg in check['argv'][1:]))
         existing = next((c for c in merged if mergeable and c['argv'][0] == check['argv'][0]
+                         and c.get('coverage') == check.get('coverage')
                          and all(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', arg) for arg in c['argv'][1:])), None)
         if existing:
             existing['argv'] = [existing['argv'][0], *sorted(set(existing['argv'][1:] + check['argv'][1:]))]
@@ -178,7 +179,8 @@ def verify_joint(controller):
                         'returncode': code, 'stdout': stdout[-10000:], 'stderr': stderr[-10000:],
                         'stdout_log': stem + '.stdout', 'stderr_log': stem + '.stderr',
                         'elapsed_seconds': round(time.monotonic() - started, 3), 'artifacts': artifacts,
-                        'build_receipt_verified': build_receipt_verified})
+                        'build_receipt_verified': build_receipt_verified,
+                        **({'coverage': 'partial'} if check.get('coverage') == 'partial' else {})})
         controller._audit()
         if candidate_bundle(controller) != bundle:
             raise RuntimeError('joint validation mutated the candidate bundle')

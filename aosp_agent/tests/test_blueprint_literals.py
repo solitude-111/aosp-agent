@@ -125,6 +125,37 @@ class BlueprintLiteralsTest(unittest.TestCase):
                 self.assertEqual(result['status'], 'UNRESOLVED')
                 self.assertTrue(result['unresolved_consumers'])
 
+    def test_literal_includes_resolve_production_owner_with_pinned_scope(self):
+        repo = Blobs({
+            'Android.bp': 'build = ["root-fragment.bp"]\nroot_sources = ["src/A.java"]',
+            'root-fragment.bp': 'build = ["nested.bp"]\nfragment_sources = root_sources',
+            'nested.bp': 'filegroup {name: "shared", srcs: fragment_sources}',
+            'app/Android.bp': 'java_library {name: "main", srcs: [":shared"]}',
+        })
+        plan = make_plan(repo, [], {}, ['src/A.java'], '', build_runner='/trusted/build')
+        self.assertEqual(plan['build']['status'], 'RESOLVED')
+        self.assertEqual(plan['checks'][0]['argv'], ['/trusted/build', 'main'])
+        self.assertEqual({row['path'] for row in plan['build']['metadata_inputs']}, set(repo.files))
+        self.assertEqual(discover_build(repo, ['src/A.java'], limit=3)['issues'],
+                         [{'reason': 'build file scan limit exceeded'}])
+        repo.files['app/Android.bp'] += '\nother = fragment_sources'
+        self.assertEqual(discover_build(repo, ['src/A.java'])['status'], 'UNRESOLVED')
+
+    def test_invalid_includes_cannot_create_a_build_command(self):
+        for root, fragment in (
+            ('build = ["missing.bp"]', ''),
+            ('build = ["*.bp"]', ''),
+            ('build = ["../other.bp"]', ''),
+            ('build = ["fragment.bp", "fragment.bp"]', ''),
+            ('build = ["fragment.bp"]', 'build = ["fragment.bp"]'),
+        ):
+            with self.subTest(root=root, fragment=fragment):
+                repo = Blobs({'Android.bp': root + '\njava_library {name: "main", srcs: ["A.java"]}',
+                              'fragment.bp': fragment})
+                plan = make_plan(repo, [], {}, ['A.java'], '', build_runner='/trusted/build')
+                self.assertEqual(plan['build']['status'], 'UNRESOLVED')
+                self.assertEqual(plan['checks'], [])
+
     def test_expression_resource_limits_reject_expansion_and_deep_nesting(self):
         expanded = 'v0 = ["A.java"]\n' + '\n'.join(f'v{i} = v{i-1} + v{i-1}' for i in range(1, 30))
         deeply_nested = 'x = ' + '[' * 70 + '"A.java"' + ']' * 70

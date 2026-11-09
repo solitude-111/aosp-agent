@@ -70,10 +70,18 @@ def make_plan(repo, units, mappings, files, diff, *, explicit=None, auto=True, b
                                         'EXPLICIT_BUILD_OVERRIDE' if 'android_module_build' in replaced else
                                         'NO_CHANGED_FILES' if not files else 'NO_BUILD_RUNNER')}
         plan['build']['runner_configured'] = build_runner is not None
-        if build_runner and plan['build']['status'] == 'RESOLVED':
-            names = sorted({m['name'] for m in plan['build']['modules']})
+        build = plan['build']
+        # Each changed file has a known production consumer. Other module
+        # edges can remain unresolved, but an unreadable build file can hide
+        # duplicate definitions, so it prevents even a partial build plan.
+        partial = (build['status'] == 'UNRESOLVED' and build['modules']
+                   and not build['production_uncovered']
+                   and all('module' in issue for issue in build['unresolved_consumers']))
+        if build_runner and (build['status'] == 'RESOLVED' or partial):
+            names = sorted({m['name'] for m in build['modules'] if not partial or m['role'] == 'production'})
             generated.append({'stage': 'android_module_build',
-                              'argv': [str(build_runner), *names], 'artifacts': []})
+                              'argv': [str(build_runner), *names], 'artifacts': [],
+                              **({'coverage': 'partial'} if partial else {})})
     else:
         plan['build'] = {'status': 'DISABLED', 'modules': []}
     # A repository's explicit empty list disables auto checks for that repo;

@@ -7,6 +7,7 @@ reads never enter the index; immutable syntax limitations remain explicit.
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 import unicodedata
@@ -34,8 +35,49 @@ def _read_metadata(repo, limit):
               'limit_exceeded': len(files) > limit, 'reusable': True}
     if result['limit_exceeded']:
         return result
-    scopes = {}
+    scopes, seen = {}, set(files)
+    remaining = limit - len(files)
+
+    def read_file(bp, inherited, depth=0):
+        nonlocal remaining
+        includes = []
+        try:
+            text = repo.read(bp)
+            result['metadata_inputs'].append({'path': bp, 'sha256': hashlib.sha256(text.encode()).hexdigest()})
+            found, errors, exported = blueprint_literals.parse_metadata(text, bp, inherited, build_includes=includes)
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            # A failed read is environmental, not an immutable missing module.
+            result['reusable'] = False
+            result['issues'].append({'path': bp, 'reason': str(exc)})
+            return None
+        result['modules'].extend(found)
+        result['issues'].extend(errors)
+        for name in includes:
+            if not remaining or depth >= blueprint_literals.MAX_DEPTH:
+                result['limit_exceeded'] = True
+                break
+            remaining -= 1
+            if not re.fullmatch(r'[A-Za-z0-9_.+-]+\.bp', name):
+                result['issues'].append({'path': bp, 'reason': 'unsupported Blueprint build include: ' + name})
+                continue
+            included = str(PurePosixPath(bp).with_name(name))
+            if included not in repo.files:
+                result['issues'].append({'path': bp, 'reason': 'missing Blueprint build include: ' + included})
+                continue
+            if included in seen:
+                result['issues'].append({'path': bp, 'reason': 'duplicate or cyclic Blueprint build include: ' + included})
+                continue
+            seen.add(included)
+            # Included files inherit the including scope. Their local variables
+            # do not leak into siblings or the directory's Android.bp scope.
+            read_file(included, exported, depth + 1)
+            if result['limit_exceeded']:
+                break
+        return exported
+
     for bp in files:
+        if result['limit_exceeded']:
+            break
         directory = PurePosixPath(bp).parent
         ancestor = next((p for p in directory.parents if p in scopes), None)
         inherited = scopes.get(ancestor, {})
@@ -43,18 +85,7 @@ def _read_metadata(repo, limit):
             result['issues'].append({'path': bp, 'reason': 'ancestor Blueprint scope is unresolved'})
             scopes[directory] = None
             continue
-        try:
-            text = repo.read(bp)
-            result['metadata_inputs'].append({'path': bp, 'sha256': hashlib.sha256(text.encode()).hexdigest()})
-            found, errors, exported = blueprint_literals.parse_metadata(text, bp, inherited)
-            scopes[directory] = exported
-            result['modules'].extend(found)
-            result['issues'].extend(errors)
-        except (ValueError, OSError, subprocess.SubprocessError) as exc:
-            # A failed read is environmental, not an immutable missing module.
-            result['reusable'] = False
-            scopes[directory] = None
-            result['issues'].append({'path': bp, 'reason': str(exc)})
+        scopes[directory] = read_file(bp, inherited)
     return result
 
 

@@ -58,19 +58,27 @@ def discover_build(repo, paths, limit=2000):
         directory = str(PurePosixPath(module['path']).parent)
         relative = path if directory == '.' else path.removeprefix(directory + '/')
         inside = directory == '.' or relative != path
-        if any(source.startswith(':') for source in literals(p, 'exclude_srcs')):
-            raise ValueError('filegroup exclusion requires Soong evaluation: ' + name)
-        if inside and any(glob_matches(pattern, relative) for pattern in literals(p, 'exclude_srcs')):
+
+        def matches(source):
+            if not source.startswith(':'):
+                return inside and glob_matches(source, relative)
+            groups = by_name.get(source[1:], [])
+            if len(groups) != 1 or groups[0]['kind'] != 'filegroup':
+                raise ValueError('unresolved filegroup: ' + source)
+            return owns(groups[0], path, seen | {name})
+
+        if any(matches(source) for source in literals(p, 'exclude_srcs')):
             return False
-        found = False
+        found, unresolved_source = False, None
         for source in literals(p, 'srcs'):
-            if source.startswith(':'):
-                groups = by_name.get(source[1:], [])
-                if len(groups) != 1 or groups[0]['kind'] != 'filegroup':
-                    raise ValueError('unresolved filegroup: ' + source)
-                found |= owns(groups[0], path, seen | {name})
-            else:
-                found |= inside and glob_matches(source, relative)
+            try:
+                found |= matches(source)
+            except ValueError as exc:
+                unresolved_source = unresolved_source or exc
+        # srcs adds inputs. Once exclusions and defaults are known, an
+        # unresolved generator cannot erase a positively matched source edge.
+        if not found and unresolved_source is not None:
+            raise unresolved_source
         return found
     def could_consume(module, path, seen=frozenset()):
         """Only prune a consumer when literal metadata proves no source edge.

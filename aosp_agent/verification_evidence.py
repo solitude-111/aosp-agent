@@ -15,6 +15,7 @@ def validation_policy(commands, required_repositories, *, expected_checks):
     required = set(required_repositories)
     covered = {key for c in commands if c.get('returncode') == 0
                and c.get('stage') == 'android_module_build'
+               and c.get('coverage') != 'partial'
                and c.get('build_receipt_verified') is True for key in c.get('covers', [])}
     all_checks_passed = (bool(commands) and len(commands) == expected_checks
                          and all(c.get('returncode') == 0 for c in commands))

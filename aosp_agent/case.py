@@ -96,7 +96,9 @@ class Case:
                 raise ValueError(f"case {cve} must use argv validation commands, not a shell string")
             argv = tuple(str(token) for token in command)
             commands.append(argv)
-            checks.append({"stage": stage, "argv": list(argv), "artifacts": artifacts})
+            checks.append({"stage": stage, "argv": list(argv), "artifacts": artifacts,
+                           **({"coverage": "partial"} if isinstance(entry, dict)
+                              and entry.get("coverage") == "partial" else {})})
         repositories_raw = raw.get("repositories", [])
         if not isinstance(repositories_raw, list):
             raise ValueError(f"case {cve} repositories must be a list")

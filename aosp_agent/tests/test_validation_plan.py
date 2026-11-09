@@ -3,6 +3,7 @@ import unittest
 from aosp_agent.build_discovery import discover_build, glob_matches, parse_modules
 from aosp_agent.discovery import diff_units
 from aosp_agent.validation_plan import make_plan, normalize_checks
+from aosp_agent.verification_evidence import validation_policy
 from test_diff_workflow import diff
 
 
@@ -16,6 +17,30 @@ class Blobs:
 
 
 class ValidationPlanTest(unittest.TestCase):
+    def test_known_source_with_other_unresolved_consumers_can_compile_without_delivery_credit(self):
+        repo = Blobs({
+            'Android.bp': '''
+                filegroup {name: "excluded", srcs: ["src/Excluded.java"]}
+                filegroup {name: "java_srcs", srcs: ["src/**/*.java"], exclude_srcs: [":excluded"]}
+                genrule {name: "generated_java", out: ["Generated.java"]}
+                java_library_static {name: "main", srcs: [":generated_java", ":java_srcs"]}
+                java_genrule {name: "other", srcs: [":main"]}
+            ''',
+        })
+        plan = make_plan(repo, [], {}, ['src/A.java'], '', build_runner='/trusted/build')
+        self.assertEqual(plan['build']['status'], 'UNRESOLVED')
+        self.assertEqual(plan['build']['production_uncovered'], [])
+        self.assertEqual([i['module'] for i in plan['build']['unresolved_consumers']], ['other'])
+        check, = normalize_checks(plan['checks'])
+        self.assertEqual(check['argv'], ['/trusted/build', 'main'])
+        self.assertEqual(check['coverage'], 'partial')
+        policy = validation_policy([{**check, 'covers': ['repo'], 'returncode': 0,
+                                     'build_receipt_verified': True}], ['repo'], expected_checks=1)
+        self.assertTrue(policy['all_configured_checks_passed'])
+        self.assertFalse(policy['satisfied'])
+        excluded = make_plan(repo, [], {}, ['src/Excluded.java'], '', build_runner='/trusted/build')
+        self.assertEqual(excluded['checks'], [])
+
     def test_test_only_ownership_does_not_generate_production_build(self):
         for production in ('', 'java_library {name: "production", srcs: ["A.java"], product_variables: {debuggable: {enabled: true}}}'):
             with self.subTest(production=production):

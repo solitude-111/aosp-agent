@@ -2068,7 +2068,8 @@ class AospBackportAgent(CausalityChecks):
                             "stdout_log": stem + ".stdout", "stderr_log": stem + ".stderr",
                             "elapsed_seconds": round(time.monotonic() - start, 3), "artifacts": artifacts,
                             "check_id": identity, "validation_id": nonce,
-                            "covers": [self.case.repository], 'build_receipt_verified': build_receipt_verified})
+                            "covers": [self.case.repository], 'build_receipt_verified': build_receipt_verified,
+                            **({'coverage': 'partial'} if check_spec.get('coverage') == 'partial' else {})})
             if not code and cacheable:
                 completed[identity] = results[-1]
             if code: break
