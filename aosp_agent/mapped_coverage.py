@@ -9,7 +9,7 @@ from .diff_prompts import LINE, STRING, array, enum, obj
 from .engine import AssessmentError
 from .git_policy import OFFLINE_GIT_ENV
 from .hunk_scope import change_blocks
-from .java_regions import JavaSource, TYPES, mapped_name, method_name, owner as _owner
+from .java_regions import JavaSource, TYPES, TYPE_DECLARATIONS, mapped_name, method_name, owner as _owner
 from .mapping_plan import _shape
 from .patches import split_hunks
 
@@ -121,7 +121,8 @@ def _parse_path(agent, path, hunks):
 
 def _method_evidence(before, after, blocks, region):
     start, end = region['line_start'], region['line_end']
-    methods = before.overlapping_methods(start, end)
+    typed = region.get('region_kind') in ('method', 'constructor')
+    methods = before.overlapping_callables(start, end) if typed else before.overlapping_methods(start, end)
     named = [m for m in methods if method_name(m) == mapped_name(region['symbol'])]
     if len(methods) == 1 and before.first(methods[0]) <= start <= end <= before.last(methods[0]):
         old = methods[0]
@@ -134,7 +135,7 @@ def _method_evidence(before, after, blocks, region):
     else:
         return None, 'map each Java method separately with its pinned declaration and range'
     identity = ts_key(old)
-    matches = [m for m in after.methods if ts_key(m) == identity]
+    matches = [m for m in (after.callables if typed else after.methods) if ts_key(m) == identity]
     if len(matches) != 1:
         return None, 'candidate has no uniquely corresponding Java method'
     new = matches[0]
@@ -143,8 +144,100 @@ def _method_evidence(before, after, blocks, region):
     direct = _direct_sites(after, new, blocks, region)
     if direct:
         return {**detail, 'kind': 'direct_edit', 'added_executable_lines': direct}, None
+    if region.get('region_kind') == 'constructor':
+        return None, 'constructor coverage requires a changed executable statement in the pinned region'
     calls, error = _guarded_callers(before, after, old, new, blocks)
     return (None, error) if error else ({**detail, 'kind': 'guarded_callers', 'call_edges': calls}, None)
+
+
+def _import_evidence(before, after, hunks, region, donor_patch):
+    from .location_regions import import_changes, import_key
+    expected = import_changes(donor_patch)
+    if not expected:
+        return None, 'import coverage requires a donor unit consisting of import changes'
+    changed = {'+': set(), '-': set()}
+    for hunk in hunks:
+        for first, last, rows in change_blocks(hunk['patch']):
+            if region['line_start'] <= first <= last <= region['line_end']:
+                for row in rows:
+                    marker = row['marker']
+                    if marker in changed and row['text'].strip():
+                        changed[marker].add(row['new_line' if marker == '+' else 'old_line'])
+    nodes = {marker: [n for n in source.imports
+                       if any(source.first(n) <= line <= source.last(n) for line in changed[marker])]
+             for marker, source in (('-', before), ('+', after))}
+    actual = {marker: Counter(import_key(node) for node in entries) for marker, entries in nodes.items()}
+    neutral = actual['+'] & actual['-']
+    for marker in changed:
+        actual[marker] -= neutral
+        skipped = neutral.copy()
+        relevant = []
+        for node in nodes[marker]:
+            key = import_key(node)
+            if skipped[key]:
+                skipped[key] -= 1
+            else:
+                relevant.append(node)
+        nodes[marker] = relevant
+    donor_neutral = expected['+'] & expected['-']
+    required = {'+': expected['+'] - donor_neutral - Counter(import_key(n) for n in before.imports),
+                '-': expected['-'] - donor_neutral}
+    if any(required[m].total() > actual[m].total() for m in changed):
+        return None, 'candidate does not supply the required import changes inside the pinned region'
+    if not any(actual.values()):
+        return None, 'no changed import declaration inside the pinned region'
+    return {'kind': 'import_edit',
+            'exact': all(not (required[m] - actual[m]) for m in changed),
+            'removed_imports': [before.snippet(n) for n in nodes['-']],
+            'added_imports': [after.snippet(n) for n in nodes['+']]}, None
+
+
+def _type_header_evidence(before, after, blocks, region):
+    def declarations(source):
+        return [n for n in walk(source.tree.root_node)
+                if n.type in TYPE_DECLARATIONS and method_name(n) == region['symbol']]
+    old = [n for n in declarations(before)
+           if (bounds := before.header_bounds(n)) and bounds[0] <= region['line_start'] <= region['line_end'] <= bounds[1]]
+    if len(old) != 1:
+        return None, 'type header requires one pinned declaration'
+    new = [n for n in declarations(after) if ts_key(n) == ts_key(old[0])]
+    if len(new) != 1 or not (header := after.header_bounds(new[0])):
+        return None, 'candidate type header is ambiguous or unavailable'
+    changed = sorted({line for first, last, lines in blocks
+                      if region['line_start'] <= first <= last <= region['line_end']
+                      for line in lines if header[0] <= line <= header[1]})
+    if not changed:
+        return None, 'no changed declaration lines inside the candidate type header'
+    lines = after.text.splitlines()
+    return {'kind': 'type_header_edit', 'candidate_lines': changed,
+            'candidate': {'first_line': header[0], 'last_line': header[1],
+                          'excerpt': '\n'.join(lines[header[0] - 1:header[1]])}}, None
+
+
+def _member_evidence(before, after, blocks, region):
+    from .location_regions import type_path
+    start, end = region['insertion_lines']
+    peers = [n for n in before.callables if type_path(_owner(n, TYPE_DECLARATIONS)) == region['type_path']]
+    left = [n for n in peers if before.last(n) == start - 1]
+    right = [n for n in peers if before.first(n) == end]
+    if len(left) != 1 or len(right) != 1:
+        return None, 'baseline member boundary is ambiguous'
+    after_left = [n for n in after.callables if ts_key(n) == ts_key(left[0])]
+    after_right = [n for n in after.callables if ts_key(n) == ts_key(right[0])]
+    if len(after_left) != 1 or len(after_right) != 1:
+        return None, 'candidate no longer has the pinned neighboring declarations'
+    # Git may group the inserted helper with a preceding caller edit. Bind
+    # the new declaration to the AST neighbors instead of the diff offset.
+    changed = set().union(*(lines for _, _, lines in blocks))
+    old = {ts_key(node) for node in before.callables}
+    members = [after.snippet(n) for n in after.callables
+               if after.first(n) in changed and ts_key(n) not in old
+               and n.parent == after_left[0].parent == after_right[0].parent
+               and after.last(after_left[0]) < after.first(n) <= after.last(n) < after.first(after_right[0])]
+    if not members:
+        return None, 'no new callable declaration at the pinned member boundary'
+    return {'kind': 'member_insertion', 'members': members,
+            'candidate_lines': [m['first_line'] for m in members]}, None
 
 
 def collect_regions(agent, claims, candidate_patch):
@@ -173,7 +266,18 @@ def collect_regions(agent, claims, candidate_patch):
             before, after, blocks = cache[path]
             request = {'id': f"{claim['id']}:{index}", 'mapping': region,
                        'invariant': units[claim['id']]['invariant'], 'donor_patch': donors[claim['id']]['patch']}
-            if region.get('relationship') == 'data_or_configuration':
+            if region.get('region_kind') == 'imports':
+                detail, error = _import_evidence(before, after, [h for h in hunks if h['path'] == path],
+                                                 region, donors[claim['id']]['patch'])
+                if detail and detail.pop('exact'):
+                    row.update(ok=True, error=None, match='required import changes in the pinned region')
+                    continue
+            elif region.get('region_kind') == 'type_header':
+                detail, error = _type_header_evidence(before, after, blocks, region)
+            elif region.get('region_kind') == 'member_insertion':
+                detail, error = _member_evidence(before, after, blocks, region)
+            elif region.get('region_kind') == 'field' or (
+                    not region.get('region_kind') and region.get('relationship') == 'data_or_configuration'):
                 from .java_field_coverage import field_evidence
                 for related in {m['path'] for m in mappings}:
                     if related not in cache:
@@ -229,6 +333,12 @@ def _review(agent, requests, candidate_patch, contract=()):
             runtime.start(agent.worktree, 'Independently review candidate coverage. Strictly read only.')
             result = runtime.run('''Review every region in the controller evidence below. Use only the supplied snippets.
 For direct_edit, confirm the changed executable code implements that region's part of the invariant.
+For import_edit, compare every donor import change with the actual added/removed declarations.
+Confirm any different import binds the API needed by the target repair. Unrelated declarations
+do not count. For COVERED cite the first_line of every listed added import, or an empty list for
+a removal-only change. For type_header_edit, cite a changed declaration line and explain its role.
+For member_insertion, cite the new declaration's first_line and confirm its implementation
+supports the target repair obligation. A helper declaration alone does not prove its callers use it.
 For guarded_callers, confirm each listed guard blocks the relevant operation for the same object and
 state at the right time, and ordinary behavior remains possible. A guard or change alone is insufficient.
 For field_lifecycle, verify the same object is updated, used by the guard, and cleared after the
@@ -263,6 +373,10 @@ Controller evidence:\n''' + payload + ('\n' + extra if contract else '\nUse the 
         if request['kind'] == 'direct_edit':
             allowed = set(request['added_executable_lines'])
             valid = bool(cited) and cited <= allowed
+        elif request['kind'] == 'import_edit':
+            valid = cited == {entry['first_line'] for entry in request['added_imports']}
+        elif request['kind'] in ('type_header_edit', 'member_insertion'):
+            valid = bool(cited) and cited <= set(request['candidate_lines'])
         elif request['kind'] == 'field_lifecycle':
             from .java_field_coverage import ROLES, receiver_key
             uses = request['state_uses']
@@ -306,7 +420,7 @@ def review_regions(agent, claims, candidate_patch):
     if any('coverage_request' not in row for row in rows):
         return  # A structural blocker already prevents this candidate from reaching build.
     try:
-        review = _review(agent, requests, candidate_patch, contract)
+        review = _review(agent, requests, candidate_patch, contract) if requests or contract else {}
     except (AssessmentError, json.JSONDecodeError) as exc:
         for row in rows:
             row['error'] = str(exc)

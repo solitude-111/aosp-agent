@@ -88,12 +88,16 @@ class MappingPlanner:
             raise AssessmentError(str(exc)) from exc
         return repo, relative
 
-    def _check_target(self, item, target, read, java_sources):
+    def _check_target(self, item, target, read, java_sources, *, normalize=None):
         lines = read(target["path"])
         start, end = target['line_start'], target['line_end']
         if start < 1 or end < start or end > len(lines):
             raise AssessmentError(f'invalid target mapping range: {target["path"]}:{start}-{end}; pinned file has {len(lines)} lines')
-        if target['relationship'] not in ('dependency', 'test', 'data_or_configuration'):
+        if normalize is not None:
+            normalize(item, target, lines, java_sources)
+            start, end = target['line_start'], target['line_end']
+        typed = normalize is not None and target.get('region_kind')
+        if not typed and target['relationship'] not in ('dependency', 'test', 'data_or_configuration'):
             name = target['symbol'].strip()
             signature = re.fullmatch(r'([A-Za-z_$][\w$]*(?:(?:[.#]|::)[A-Za-z_$][\w$]*)*)(?:\([^()\n]*\))?', name)
             symbol = re.split(r'[.#]|::', signature[1])[-1] if signature else ''
@@ -143,7 +147,7 @@ class MappingPlanner:
             if excerpt.strip() != evidence['excerpt'].strip():
                 raise AssessmentError('source evidence mismatches supplied diff')
 
-    def _check_all_evidence(self, raw, expected, *, excluded_unit_evidence=()):
+    def _check_all_evidence(self, raw, expected, *, excluded_unit_evidence=(), normalize_target=None):
         cache, java_sources, errors = {}, {}, []
         def read(path):
             if path not in cache:
@@ -159,7 +163,8 @@ class MappingPlanner:
                     raise MappingEvidenceError(errors) from exc
         for i, item in enumerate(raw['units']):
             for j, target in enumerate(item['targets']):
-                check(f'/units/{i}/targets/{j}', lambda: self._check_target(item, target, read, java_sources))
+                check(f'/units/{i}/targets/{j}', lambda: self._check_target(
+                    item, target, read, java_sources, normalize=normalize_target))
             for j, evidence in enumerate(item['evidence']):
                 # Keep error pointers indexed against the original response.
                 if (i, j) in excluded_unit_evidence:

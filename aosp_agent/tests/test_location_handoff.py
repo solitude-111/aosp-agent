@@ -5,6 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
+from aosp_agent.assessment_repair import digest
 from aosp_agent.diff_engine import DiffBackportAgent
 from aosp_agent.resume import resume_project
 from aosp_agent.runtime_batch import RuntimeBatch
@@ -36,7 +37,7 @@ def unassociated_reference(fx):
 
 class LocationHandoffTest(unittest.TestCase):
     def execute(self, fx, response, *, located=None, extras=(), turns=None, max_rounds=1,
-                resume=False, prepared_manifest=False, verify=False):
+                resume=False, prepared_manifest=False, verify=False, max_attempts=1):
         if not prepared_manifest:
             manifest(fx)
         data = fx.root / 'input.jsonl'
@@ -63,14 +64,14 @@ class LocationHandoffTest(unittest.TestCase):
             scopes.append((name, kwargs['read_scope'].writable))
             if not scripted.get(name):
                 self.fail(f'unexpected model turn: {name}')
-            queue = scripted[name]
-            answer = queue.pop(0)
-            return Runtime([answer])
+            runtime = Runtime([])
+            runtime.replies = scripted[name]
+            return runtime
 
         agent = RuntimeBatch(data, fx.source_root, fx.run_root, fx.root / 'donors',
                              donor_map={ORIGIN: str(fx.repo)}, runtime_factory=factory,
                              agent_options={'locate_first': True, 'max_rounds': max_rounds})
-        result = agent.run(max_attempts=1, verify=verify)['rows'][0]
+        result = agent.run(max_attempts=max_attempts, verify=verify)['rows'][0]
         if resume:
             self.assertEqual(result['status'], 'INCONCLUSIVE', result)
             result = resume_project(result['execution_record'], runtime_factory=factory)
@@ -143,6 +144,33 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertEqual(outcome['completion_blocked_by'], 'BACKEND_IMPACT_UNRESOLVED')
             self.assertEqual(outcome['impact_decision'], 'UNKNOWN')
             self.assertFalse(outcome['patches'])
+            self.assertTrue(all(call['read_only'] for call in calls))
+            self.assertTrue(all(not paths for _, paths in scopes))
+
+    def test_location_correction_reuses_unaffected_fields(self):
+        with GitFixture() as fx:
+            candidate = location()
+            candidate['units'][0]['targets'][0]['line_end'] = 100
+            repair = {'base_sha256': digest(candidate), 'replacements': [
+                {'path': '/units/0/targets/0/line_end', 'value_json': '2'},
+            ]}
+            outcome, calls, _ = self.execute(fx, impact_reply(fx, 'UNKNOWN'), max_attempts=2, turns={
+                'sdk-location-handoff.jsonl': [(candidate, None), (repair, None)],
+            })
+            self.assertEqual(outcome['location_handoff']['status'], 'READY')
+            self.assertIn('Return only base_sha256 and replacements', calls[2]['prompt'])
+            record = Path(outcome['final_round_record']).parent
+            self.assertEqual(json.loads((record / 'grounded-location.json').read_text()), location())
+
+    def test_partial_locations_can_reach_impact_without_opening_writes(self):
+        with GitFixture() as fx:
+            candidate = location()
+            unit = candidate['units'][0]
+            unit['targets'].append({**unit['targets'][0], 'line_end': 100})
+            outcome, calls, scopes = self.execute(fx, impact_reply(fx, 'AFFECTED'), located=candidate)
+            self.assertEqual(outcome['location_handoff']['scope'], 'READ_ONLY_WITH_GAPS')
+            self.assertEqual(outcome['impact_decision'], 'AFFECTED')
+            self.assertIn('invalid target mapping range', outcome['migration_scope_error'])
             self.assertTrue(all(call['read_only'] for call in calls))
             self.assertTrue(all(not paths for _, paths in scopes))
 

@@ -633,7 +633,7 @@ class AospBackportAgent(CausalityChecks):
                     return False
                 start = index + 1
         return start is not None and any(
-            region['action'] == 'edit' and region['path'] == path
+            region['action'] == 'edit' and region['path'] == path and region.get('region_kind') != 'member_insertion'
             and region['line_start'] <= start
             and start + len(old) - 1 <= region['line_end']
             for region in self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id']))
@@ -800,6 +800,9 @@ class AospBackportAgent(CausalityChecks):
             return result
         if candidate_patch is None:
             result["error"] = "candidate patch evidence is unavailable"
+            return result
+        if scope and scope.get('region_kind') in ('imports', 'member_insertion'):
+            result['error'] = 'Java declaration coverage requires pinned structural evidence'
             return result
         try:
             candidates = split_hunks(candidate_patch)

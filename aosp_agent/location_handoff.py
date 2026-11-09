@@ -5,7 +5,8 @@ import json
 from .diff_prompts import ASSESSMENT_SCHEMA, EVIDENCE, LINE, STRING, TARGET, array, compact_location, obj
 from .discovery import RepositoryReadConstraintError
 from .engine import AssessmentError
-from .mapping_plan import _shape
+from .location_regions import donor_adds_callable, import_changes, normalize_java_target
+from .mapping_plan import MappingEvidenceError, _shape
 from .prompts import IMPACT_SCHEMA
 from .scope_evidence import check_scope
 
@@ -50,8 +51,28 @@ def ground_locations(controller, raw, *, unassociated=None):
                     })
                 continue
             evidence.append(citation)
-        units.append({**unit, 'evidence': evidence})
-    controller.mapper._check_all_evidence(raw, source, excluded_unit_evidence=excluded)
+        units.append({**unit, 'targets': [dict(target) for target in unit['targets']], 'evidence': evidence})
+    # Keep citation indices in validation feedback tied to the model response.
+    validation = {**raw, 'units': [{**unit, 'evidence': original['evidence']}
+                                   for unit, original in zip(units, raw['units'])]}
+    import_units, donor_members, donor_sources = {}, {}, {}
+
+    def normalize_target(unit, target, lines, java_sources):
+        read_context = target['action'] == 'read_dependency' and target['relationship'] in (
+            'dependency', 'test', 'data_or_configuration')
+        if target['path'].endswith('.java') and not read_context:
+            ident = unit['id']
+            if ident not in import_units:
+                donor = source[ident]
+                import_units[ident] = donor['supported'] and import_changes(donor['patch']) is not None
+            def adds_callable():
+                if ident not in donor_members:
+                    donor_members[ident] = donor_adds_callable(controller, source[ident], donor_sources)
+                return donor_members[ident]
+            normalize_java_target(unit, target, lines, java_sources, import_units[ident], adds_callable)
+
+    controller.mapper._check_all_evidence(validation, source, excluded_unit_evidence=excluded,
+                                          normalize_target=normalize_target)
     scope = check_scope(controller, {'repository_requests': raw['repository_requests']})
     anchors, writable = set(), set()
     for unit in units:
@@ -81,14 +102,52 @@ def ground_locations(controller, raw, *, unassociated=None):
             'scope_requests': scope.get('requests', [])}
 
 
+def _read_only_locations(controller, raw, errors):
+    """Recover checked anchors after a local mapping failure, with no edit scope."""
+    rejected_targets, rejected_evidence = set(), set()
+    for entry in errors:
+        parts = entry['path'].split('/')
+        if len(parts) != 5 or parts[1] != 'units':
+            return None
+        unit_index, index = int(parts[2]), int(parts[4])
+        if parts[3] == 'targets':
+            rejected_targets.add((unit_index, index))
+        elif parts[3] == 'evidence':
+            rejected_evidence.add((unit_index, index))
+        else:
+            return None
+    units, owners = [], set()
+    for i, unit in enumerate(raw['units']):
+        evidence = [e for j, e in enumerate(unit['evidence']) if (i, j) not in rejected_evidence]
+        targets = [{**t, 'action': 'read_dependency'} for j, t in enumerate(unit['targets'])
+                   if (i, j) not in rejected_targets and any(
+                       e['origin'] == 'target' and e['path'] == t['path']
+                       and t['line_start'] <= e['line_start'] <= e['line_end'] <= t['line_end']
+                       for e in evidence)]
+        owners.update(controller._owner(t['path'])[0].key for t in targets)
+        notes = [e['error'] for e in errors if e['path'].startswith(f'/units/{i}/')]
+        units.append({**unit, 'targets': targets, 'evidence': evidence,
+                      'location_notes': ' '.join([unit['location_notes'], *notes])})
+    if not owners:
+        return None
+    primary = raw['primary_repository']
+    return ground_locations(controller, {**raw, 'units': units, 'new_files': [],
+                                         'primary_repository': primary if primary in owners else min(owners)})
+
+
 def locate(controller, inventory, location, max_attempts):
+    from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
     from .diff_engine import _write
     from .retrieval import ACTIVE_BUDGET
+    from .sdk_runtime import CodexRuntimeError
 
     prompt = ('''Locate target code on the pinned commits. Work read-only.
 Return every donor unit ID once. Map its counterpart, callers and dependencies to exact
-repository-prefixed paths, symbols and line ranges with short pinned target excerpts inside
-each range. Mark possible edits as edit and other evidence as read_dependency. This is a
+repository-prefixed paths and line ranges with short pinned target excerpts inside each range.
+Use names observed in the target. When the donor API is missing, look for the older operation,
+its entrypoint or caller. Do not invent a matching declaration. Mark possible edits as edit
+and other evidence as read_dependency. For a needed new helper, quote the boundary between
+adjacent members of the actual target class and separately map affected callers. This is a
 candidate scope for a later backend, not a required edit. For imports, fields, tests and
 configuration map the actual region. Cite target files only when they are mapped in the same
 unit. For a required dependency, map its region as read_dependency and cite the pinned lines.
@@ -115,19 +174,33 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
     budget = ACTIVE_BUDGET.get()
     controller.record.update(stage='LOCATION', location_handoff={'status': 'RUNNING'})
     controller._save()
+    raw, errors = None, []
     with controller._runtime('location-handoff', timeout=budget.remaining() / 2 if budget else None) as runtime:
         runtime.start(controller.run_dir, 'Resolve source locations. Read pinned objects only.')
         for attempt in range(1, min(max_attempts, 2) + 1):
-            raw = controller._turn(runtime, prompt, LOCATION_SCHEMA, read_only=True)
-            _write(controller.run_dir / f'location-attempt-{attempt}.json', raw)
             unassociated = []
             try:
+                if raw is None:
+                    raw = controller._turn(runtime, prompt, LOCATION_SCHEMA, read_only=True)
+                else:
+                    correction = controller._turn(runtime, prompt, REPAIR_SCHEMA, read_only=True)
+                    _write(controller.run_dir / f'location-repair-{attempt}.json', correction)
+                    raw = apply_repair(raw, correction, schema=LOCATION_SCHEMA)
+                errors = []
+                _write(controller.run_dir / f'location-attempt-{attempt}.json', raw)
                 grounded = ground_locations(controller, raw, unassociated=unassociated)
             except AssessmentError as exc:
                 grounded = None
                 controller.record.setdefault('location_rejections', []).append(str(exc))
-                prompt = ('Correct the previous location response. Preserve unaffected locations. '
-                          'The controller rejected it for: ' + str(exc))
+                if isinstance(exc, MappingEvidenceError):
+                    errors = exc.errors
+                if raw is not None:
+                    prompt = repair_prompt(raw, str(exc))
+            except CodexRuntimeError as exc:
+                if raw is None or exc.kind != 'INVALID_OUTPUT':
+                    raise
+                controller.record.setdefault('location_rejections', []).append(str(exc)[:1000])
+                break
             if unassociated:
                 controller.record.setdefault('location_unassociated_evidence', []).extend(
                     {**entry, 'attempt': attempt} for entry in unassociated)
@@ -135,6 +208,15 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
                 save_location(controller, grounded)
                 return grounded
             controller._save()
+    if errors:
+        try:
+            partial = _read_only_locations(controller, raw, errors)
+        except AssessmentError:
+            partial = None
+        if partial is not None:
+            controller.record['location_gaps'] = errors
+            save_location(controller, partial)
+            return partial
     controller.record['location_handoff'] = {'status': 'UNRESOLVED', 'reason': 'LOCATION_EVIDENCE_REJECTED'}
     return None
 
@@ -142,13 +224,16 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
 def save_location(controller, grounded):
     from .diff_engine import _write
     raw = {key: grounded[key] for key in LOCATION_SCHEMA['properties']}
-    raw['units'] = [{key: value for key, value in unit.items() if key != 'status'} for unit in raw['units']]
+    raw['units'] = [{**{key: value for key, value in unit.items() if key != 'status'},
+                     'targets': [{key: target[key] for key in TARGET['properties']} for target in unit['targets']]}
+                    for unit in raw['units']]
     path = controller.run_dir / 'grounded-location.json'
     _write(path, raw)
     controller._protect(path)
     controller.record['location_handoff'] = {
         'status': 'READY' if raw['primary_repository'] else 'UNRESOLVED',
         'file': path.name, 'sha256': controller.protected[path],
+        **({'scope': 'READ_ONLY_WITH_GAPS'} if controller.record.get('location_gaps') else {}),
         'primary_repository': raw['primary_repository'],
         'targets': {repo.key: repo.head for repo in controller.repos},
         'unmapped_units': [row['id'] for row in raw['units'] if not row['targets']]}
@@ -254,7 +339,10 @@ declaration that is absent from the target, use flag_cleanup_support to link it 
 the selected production hunk(s) that remove the flag check. The controller checks
 the donor delta and target flag references. Return an empty array for either field
 when it does not apply.
+Select a member_insertion only if a new target member is required. Its insertion_lines
+name the permitted boundary; the wider quoted range is context.
 ''' + '\n' + assessment + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
+                + '\nUnverified location gaps: ' + json.dumps(self.controller.record.get('location_gaps', []), ensure_ascii=False)
                 + '\nGuarded obligations: ' + json.dumps(self.controller.guarded_obligations, ensure_ascii=False))
 
     def accept(self, child, impact, response, *, impact_only):
@@ -295,7 +383,8 @@ when it does not apply.
         try:
             assessment, ids = select_edits(self.location, response)
             if not ids:
-                raise AssessmentError(' / '.join(response['location_gaps']) or
+                gaps = [entry['error'] for entry in controller.record.get('location_gaps', [])]
+                raise AssessmentError(' / '.join(response['location_gaps'] or gaps) or
                                       'confirmed impact requires at least one grounded edit location')
             obligations = {row['id']: row for row in controller.guarded_obligations}
             repair = ground_repair_contract(controller, {row['id']: row for row in assessment['units']},
@@ -310,6 +399,8 @@ when it does not apply.
         if self.flag_support:
             controller.record['no_target_edit_support'] = list(self.flag_support.values())
             child.record['no_target_edit_support'] = list(self.flag_support.values())
+        for unit in assessment['units']:
+            unit['invariant'] = impact['scope_contract']['donor_security_invariant']
         self.location_gaps = response['location_gaps']
         if self.location_gaps:
             controller.record.update(replan_required='LOCATION_SCOPE_UNRESOLVED',
