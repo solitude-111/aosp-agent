@@ -133,7 +133,7 @@ def _main() -> int:
     args = parser.parse_args()
     if args.command == 'status':
         from .lifecycle import process_state
-        from .output_budget import require_output_record, OutputBudgetUnavailable
+        from .output_budget import require_output_record, OutputBudgetExceeded, OutputBudgetUnavailable
         output_error = None
         try:
             require_output_record(args.record)
@@ -153,6 +153,10 @@ def _main() -> int:
             update_delivery(record)
         if output_error is not None:
             record.update(status='BLOCKED', delivery_status='BLOCKED', completion_blocked_by=output_error.kind)
+        result_fields = ('impact_decision', 'impact_analysis', 'migration', 'budget_interruption')
+        compacted = isinstance(output_error, OutputBudgetExceeded) and record.get('record_compacted')
+        phases = ({key: record[key] for key in result_fields if key in record}
+                  if output_error is None or compacted else {})
         print(json.dumps({'record': str(args.record.resolve()), 'saved_status': saved_status,
                           'effective_status': record.get('status'),
                           'delivery_status': record.get('delivery_status'),
@@ -161,7 +165,7 @@ def _main() -> int:
                           'review_status': record.get('review_status'),
                           'process_state': process_state(args.record.parent),
                           'active_round_record': record.get('active_round_record'),
-                          'counts': record.get('counts')}, ensure_ascii=False, indent=2))
+                          'counts': record.get('counts'), **phases}, ensure_ascii=False, indent=2))
         return 0
     if args.command == 'resume':
         from .resume import resume_project, resume_batch
@@ -169,7 +173,8 @@ def _main() -> int:
             old = json.loads(args.record.read_text())
             result = (resume_batch(args.record) if old.get('execution') == 'serial_project_first' else resume_project(args.record))
             print(json.dumps({k: result[k] for k in ('status', 'impact_decision', 'record', 'resumed_from', 'counts', 'delivery_counts',
-                'build_validation', 'review_status', 'delivery_status', 'delivery', 'error') if k in result},
+                'build_validation', 'review_status', 'delivery_status', 'delivery', 'error',
+                'impact_analysis', 'migration', 'budget_interruption', 'stage_read_usage') if k in result},
                              ensure_ascii=False, indent=2))
             if result.get('execution') == 'serial_project_first':
                 return (exit_status(result['status']) if result['status'] != 'COMPLETED' else

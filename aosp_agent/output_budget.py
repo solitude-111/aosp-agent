@@ -115,7 +115,8 @@ class OutputBudget:
 
     def write(self, path, data, *, append=False, control=False):
         path = Path(path)
-        if path.is_symlink() or not path.resolve().is_relative_to(self.root):
+        resolved_path = path.resolve()
+        if path.is_symlink() or not resolved_path.is_relative_to(self.root):
             raise OutputBudgetUnavailable('managed output path escapes its task root')
         with self._locked() as value:
             used = value['normal_reserved'] + value['control_reserved']
@@ -124,7 +125,7 @@ class OutputBudget:
                 allowed = allowed and not value['exhausted'] and value['normal_reserved'] + len(data) <= value['normal_limit']
             if not allowed:
                 if not value['exhausted']:
-                    value.update(exhausted=True, blocked_path=str(path.relative_to(self.root))[:512])
+                    value.update(exhausted=True, blocked_path=str(resolved_path.relative_to(self.root))[:512])
                     self._save(value)
                 if control:
                     return False  # The persistent exhausted state remains authoritative.
@@ -193,25 +194,39 @@ def write_text(path, text, *, append=False, budget=None):
 
 
 def _blocked_record(value, budget):
-    # Do not truncate semantic evidence into a successful result. A compact
-    # record is explicitly blocked and cannot be resumed as a complete record.
+    # Delivery stays blocked. The controller's confirmed baseline decision is
+    # independent of the later failure to persist migration output.
+    reason = 'OUTPUT_BUDGET_EXHAUSTED'
+    essential = dict(status='BLOCKED', impact_decision='UNKNOWN', delivery_status='BLOCKED',
+                     completion_blocked_by=reason, record_compacted=True, output_budget=budget.data())
+    if 'verdict' in value:
+        essential['verdict'] = 'ERROR'
+    if 'stage' in value:
+        stage = value['stage']
+        essential.update(stage=stage, budget_interruption={'stage': stage, 'reason': reason})
+    impact = value.get('impact_analysis')
+    if impact:
+        if impact['status'] == 'RUNNING':
+            impact = {'status': 'INTERRUPTED', 'reason': reason}
+        if impact['status'] == 'CONFIRMED':
+            essential['impact_decision'] = impact['decision']
+        essential['impact_analysis'] = {key: impact[key] for key in ('status', 'decision', 'reason')
+                                        if key in impact}
+    migration = value.get('migration')
+    if migration is None and value.get('stage') == 'MIGRATION':
+        migration = {'status': 'RUNNING'}
+    if migration is not None:
+        if migration['status'] not in ('NOT_STARTED', 'NOT_REQUESTED', 'NOT_REQUIRED'):
+            migration = {'status': 'INTERRUPTED', **essential.get('budget_interruption', {'reason': reason})}
+        essential['migration'] = migration
     keep = ('task_id', 'cve', 'execution', 'execution_path', 'input_sha256', 'input_patch_sha256',
             'resume_input_sha256', 'resumed_from', 'resumed_to', 'active_round_record', 'final_round_record',
-            'row_count', 'counts', 'remaining_rows', 'source_guard', 'cancellation_source_guard')
-    compact = {key: value[key] for key in keep if key in value}
-    compact.update(status='BLOCKED', impact_decision='UNKNOWN', delivery_status='BLOCKED',
-                   completion_blocked_by='OUTPUT_BUDGET_EXHAUSTED', record_compacted=True,
-                   output_budget=budget.data())
-    if 'verdict' in value:
-        compact['verdict'] = 'ERROR'
-    # The actual persistent quota record is sufficient to block status/resume
-    # even if user-controlled metadata would exceed the control reservation.
-    if len(json.dumps(compact).encode()) > 4096:
-        compact = {key: compact[key] for key in ('status', 'impact_decision', 'delivery_status',
-                   'completion_blocked_by', 'record_compacted', 'output_budget')}
-        if 'verdict' in value:
-            compact['verdict'] = 'ERROR'
-    return compact
+            'row_count', 'counts', 'remaining_rows', 'source_guard', 'cancellation_source_guard',
+            'investigation_budget', 'stage_read_usage')
+    compact = {**{key: value[key] for key in keep if key in value}, **essential}
+    if impact:
+        compact['impact_analysis'] = impact
+    return compact if len(json.dumps(compact, ensure_ascii=False, indent=2).encode()) < 4096 else essential
 
 
 def write_json(path, value, *, control=False):
@@ -220,7 +235,11 @@ def write_json(path, value, *, control=False):
         compact = _blocked_record(value, budget)
         if isinstance(value, dict):
             value.update({k: compact[k] for k in ('status', 'impact_decision', 'delivery_status',
-                          'completion_blocked_by', 'record_compacted', 'output_budget')})
+                          'completion_blocked_by', 'record_compacted', 'output_budget', 'impact_analysis',
+                          'migration', 'budget_interruption') if k in compact})
+            if 'delivery' in value:
+                from .delivery import update_delivery
+                update_delivery(value)
             if 'verdict' in compact:
                 value['verdict'] = compact['verdict']
         return budget.write(path, (json.dumps(compact, ensure_ascii=False, indent=2) + '\n').encode(), control=True)

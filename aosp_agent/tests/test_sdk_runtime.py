@@ -49,6 +49,9 @@ class FakeHandle:
                 '"properties":{"verdict":"ready"}}'),
         }
         text = texts.get(self.mode, texts["completed"])
+        if self.mode == "deltas":
+            for method in ("item/reasoning/textDelta", "item/agentMessage/delta"):
+                yield types.SimpleNamespace(method=method, payload={"delta": "incremental text"})
         item = {"type": "agentMessage", "phase": "final_answer", "text": text}
         yield types.SimpleNamespace(method="item/completed", payload={"item": item})
         yield types.SimpleNamespace(method="thread/tokenUsage/updated", payload={"token_usage": {"total": {"total_tokens": 123}}})
@@ -138,6 +141,15 @@ class RuntimeTest(unittest.TestCase):
         self.assertNotIn("model", fake.thread.calls[0])
         self.assertNotIn("effort", fake.thread.calls[0])
         self.assertTrue(any(event.get("method") == "item/completed" for event in events))
+
+    def test_stream_log_keeps_completed_items_instead_of_text_deltas(self):
+        result, _, events = self.run_fake("deltas")
+        self.assertEqual(result["final_response"], '{"verdict":"ready"}')
+        methods = {event.get("method") for event in events}
+        self.assertIn("item/completed", methods)
+        self.assertIn("turn/completed", methods)
+        self.assertNotIn("item/reasoning/textDelta", methods)
+        self.assertNotIn("item/agentMessage/delta", methods)
 
     def test_explicit_model_and_effort_are_forwarded(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -390,9 +390,11 @@ class CodexRuntime:
         try:
             self._output_guard()
             async for notification in self._handle.stream():
-                payload = _plain(notification.payload)
                 method = notification.method
-                self._log("sdk_notification", method=method, payload=payload)
+                # The completed item carries the assembled text.
+                if method not in ('item/reasoning/textDelta', 'item/agentMessage/delta'):
+                    payload = _plain(notification.payload)
+                    self._log("sdk_notification", method=method, payload=payload)
                 self._output_guard()
                 if self._broker is not None and self._broker.failure is not None:
                     raise self._broker.failure

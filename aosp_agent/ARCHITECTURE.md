@@ -98,7 +98,7 @@ platform_behavior_evidence 只报告 SOURCE_GROUNDED/NOT_USED，semantic_correct
 
 跨版本分析的 API 与 CLI 统一在外部 `run_root` 下创建唯一输出目录，事件与结果均不再写入补丁所在目录。输出根按实际路径解析后必须在原始源码树之外；默认 `cwd/runs/inherit` 不满足时须显式指定。词法提示与验收命令也分开：自动 donor 符号只保存为 `validation_plan.provenance`，不产生硬性 `source_contract` 检查或 PASS 信用。显式配置的检查继续参与完整验收策略，功能检查失败、生产构建证据不足或因果账本缺失不会因词法提示而放行。
 
-控制器受管输出由 output_budget 的持久累计预留计数约束。默认根任务 256 MiB，嵌套任务及正常 resume 继承祖先额度；跨进程 flock 覆盖状态校验、预留和输出写入，锁等待最多约 2 秒。写前预留，失败或覆盖不退款；状态文件损坏、软链接逃逸及 I/O 故障不能降为无限额。普通输出保留额度之外另留 min(总额/8, 4 MiB) 的控制记录空间及 8 KiB 配额元数据空间。额度耗尽后最小 run/batch 记录标记 BLOCKED、UNKNOWN、record_compacted；控制记录空间也用完时，以持久 exhausted 标记阻断 status/resume，不能读取旧成功记录继续执行。
+控制器受管输出由 output_budget 的持久累计预留计数约束。默认根任务 256 MiB，嵌套任务及正常 resume 继承祖先额度；跨进程 flock 覆盖状态校验、预留和输出写入，锁等待最多约 2 秒。写前预留，失败或覆盖不退款；状态文件损坏、软链接逃逸及 I/O 故障不能降为无限额。普通输出保留额度之外另留 min(总额/8, 4 MiB) 的控制记录空间及 8 KiB 配额元数据空间。SDK 日志保存完整消息、工具事件和终态，跳过重复的逐 token 文本事件。额度耗尽后精简记录标记 BLOCKED 和 record_compacted，分别保存已确认的影响结论、迁移状态和中断阶段。控制记录空间也用完时，持久 exhausted 标记仍使 status 显示 BLOCKED 并阻止 resume 继续执行。
 
 SDK 主线程在调用前和事件消费后检查输出额度；日志线程只设置失败/取消信号，避免日志写入异常中断 SDK 的 interrupt/close。单仓和联合验证在启动检查前核查额度，实际验证进程必须先完成清理/恢复，再保存受限日志。源码恢复回执不属于普通额度。该计数只覆盖控制器管理的 payload，不是磁盘 block、目录数或全工作区配额；源码/候选 Git 工作树、缓存、外部构建产物和恢复回执另有所有权。未创建任务预算的低层诊断写入仅有单文件 32 MiB 限制，不作总额保证。
 

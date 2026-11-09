@@ -67,6 +67,48 @@ class OutputBudgetTest(unittest.TestCase):
             self.assertEqual(state['normal_reserved'], 100000)
             self.assertTrue(state['exhausted'])
 
+    def test_compact_terminal_keeps_confirmed_impact_and_separate_migration_interruption(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            create_budget(root, 131072)
+            record_path = root / 'run.json'
+            impact = {'status': 'CONFIRMED', 'decision': 'AFFECTED', 'assessment_sha256': 'a' * 64,
+                      'targets': {'system/bt': 'b' * 40}, 'round_record': str(root / 'r01/run.json')}
+            record = {'status': 'INVESTIGATING', 'stage': 'MIGRATION', 'impact_decision': 'UNKNOWN',
+                      'impact_analysis': impact, 'migration': {'status': 'RUNNING'}}
+            with self.assertRaises(OutputBudgetExceeded):
+                write_bytes(root / 'sdk-events.jsonl', b'x' * 131072)
+            self.assertTrue(write_json(record_path, record, control=True))
+            saved = json.loads(record_path.read_text())
+            self.assertEqual(saved['status'], 'BLOCKED')
+            self.assertEqual(saved['delivery_status'], 'BLOCKED')
+            self.assertEqual(saved['impact_decision'], 'AFFECTED')
+            self.assertEqual(saved['impact_analysis'], impact)
+            interruption = {'stage': 'MIGRATION', 'reason': 'OUTPUT_BUDGET_EXHAUSTED'}
+            self.assertEqual(saved['budget_interruption'], interruption)
+            self.assertEqual(saved['migration'], {'status': 'INTERRUPTED', **interruption})
+            self.assertEqual(record['impact_decision'], saved['impact_decision'])
+            output = subprocess.run([sys.executable, '-m', 'aosp_agent', 'status', '--record', str(record_path)],
+                                    capture_output=True, text=True, timeout=10, check=True)
+            status = json.loads(output.stdout)
+            self.assertEqual(status['effective_status'], 'BLOCKED')
+            self.assertEqual(status['impact_analysis'], impact)
+            self.assertEqual(status['migration'], saved['migration'])
+
+    def test_compact_terminal_before_confirmation_keeps_analysis_interrupted(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            create_budget(root, 131072)
+            with self.assertRaises(OutputBudgetExceeded):
+                write_bytes(root / 'sdk-events.jsonl', b'x' * 131072)
+            record = {'status': 'INVESTIGATING', 'stage': 'IMPACT_ANALYSIS',
+                      'impact_decision': 'AFFECTED', 'impact_analysis': {'status': 'RUNNING'},
+                      'migration': {'status': 'NOT_STARTED'}}
+            self.assertTrue(write_json(root / 'run.json', record, control=True))
+            self.assertEqual(record['impact_decision'], 'UNKNOWN')
+            self.assertEqual(record['impact_analysis'], {'status': 'INTERRUPTED', 'reason': 'OUTPUT_BUDGET_EXHAUSTED'})
+            self.assertEqual(record['migration'], {'status': 'NOT_STARTED'})
+
     def test_corrupt_metadata_and_symlink_escape_fail_closed(self):
         variants = ['{', '[]', '{"version":1}', json.dumps(dict(version=1, limit=131072,
                     normal_limit=999999, normal_reserved=0, control_reserved=0, exhausted=False))]

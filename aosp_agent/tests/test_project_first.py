@@ -299,6 +299,29 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertEqual(result['migration']['status'], 'INTERRUPTED')
             self.assertFalse((agent.run_dir / 'rounds/r01/workspace').exists())
 
+    def test_output_exhaustion_during_migration_keeps_confirmed_impact(self):
+        from aosp_agent.output_budget import write_bytes
+        with GitFixture() as fx:
+            runtime = QueueRuntime([(self.assessment(), None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, auto_validation=False,
+                max_output_bytes=4 * 1024 * 1024)
+
+            def backend(controller, assessment, **kwargs):
+                write_bytes(controller.run_dir / 'sdk-migration.jsonl', b'x' * (4 * 1024 * 1024))
+
+            with patch('aosp_agent.text_backend.run_text_backends', side_effect=backend):
+                result = agent.run()
+            saved = json.loads((agent.run_dir / 'run.json').read_text())
+            for record in (result, saved):
+                self.assertEqual(record['status'], 'BLOCKED')
+                self.assertEqual(record['delivery_status'], 'BLOCKED')
+                self.assertEqual(record['impact_decision'], 'AFFECTED')
+                self.assertEqual(record['impact_analysis']['targets'], {'repo': fx.target})
+                self.assertEqual(record['budget_interruption']['stage'], 'MIGRATION')
+                self.assertEqual(record['migration']['status'], 'INTERRUPTED')
+            self.assertEqual((fx.repo / 'counter.py').read_text(), BASELINE)
+
     def test_unrelated_scope_error_does_not_discard_a_grounded_causal_group(self):
         with GitFixture() as fx:
             patch_bytes = self.source() + diff('optional.py', BASELINE, FIXED).encode()
