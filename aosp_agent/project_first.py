@@ -205,6 +205,11 @@ class ProjectFirstAgent:
 
     def _merge_round_impact(self, result, round_path):
         self.record['stage'] = result.get('stage', self.record['stage'])
+        for key in ('repository_errors', 'source_audit_errors', 'budget_interruption'):
+            if key in result:
+                self.record[key] = result[key]
+            else:
+                self.record.pop(key, None)
         if 'frontend_workflow' in result:
             self.record['frontend_workflow'] = result['frontend_workflow']
         if 'location_handoff' in result:

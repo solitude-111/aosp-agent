@@ -213,7 +213,10 @@ class BackendHandoff:
                       if reused_impact else 'Use your usual impact analysis in the impact field.')
         return ('''
 The locations below are pinned candidate anchors, not a verdict. Qualify cross-project target evidence with its
-repository key. To read an admitted dependency, use dependency:<repository-key> and its pinned ref.
+repository key. To read an admitted dependency, use target:<repository-key> and its pinned ref.
+Search and symbol lookup without a path use the grounded files in the requested project.
+If more evidence is needed, name a specific file or directory in the path argument. A limited
+search result or a timed-out read cannot establish absence.
 Check all relevant donor changes, including read-only support.
 After an AFFECTED decision, select the edits with 1-based target_indices within
 each unit. Select only candidate edit locations. List location_gaps only for
@@ -345,7 +348,14 @@ def run_location_handoff(controller, inventory, candidates, *, verify, impact_on
         controller.record['frontend_workflow'] = {'mode': 'legacy', 'reason': 'MULTIPLE_WRITE_PROJECTS'}
         return None
     handoff = BackendHandoff(controller, location)
-    controller.record.update(stage='IMPACT_ANALYSIS', impact_analysis={'status': 'RUNNING'}, model_execution='succeeded')
+    search_paths = {repo.key: set() for repo in controller.repos}
+    for unit in location['units']:
+        for target in unit['targets']:
+            repo, relative = controller._owner(target['path'])
+            search_paths[repo.key].add(relative)
+    controller.record.update(stage='IMPACT_ANALYSIS', impact_analysis={'status': 'RUNNING'},
+                             model_execution='succeeded',
+                             source_search_paths={key: sorted(paths) for key, paths in search_paths.items()})
     controller._save()
     with budget.phase('IMPACT_ANALYSIS') if budget else nullcontext():
         controller._prepare_children(location, location_only=True)

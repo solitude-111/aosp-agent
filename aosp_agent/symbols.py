@@ -120,7 +120,8 @@ def locate_in_revision(repo_args: list[str], revision: str, name: str, limit: in
                            check=False, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return {'name': name, 'found': False, 'matches': [], 'status': 'READ_FAILED',
-                'scope': scope, 'error': type(exc).__name__ + ': ' + str(exc)[-400:]}
+                'scope': scope, 'error': type(exc).__name__ + ': ' + str(exc)[-400:],
+                'reason': 'TIMEOUT' if isinstance(exc, subprocess.TimeoutExpired) else 'GIT_READ_FAILED'}
     if result.returncode not in (0, 1):
         return {"name": name, "found": False, "matches": [], "error": result.stderr[-400:] or f'Git exited {result.returncode}',
                 'status': 'READ_FAILED', 'scope': scope}

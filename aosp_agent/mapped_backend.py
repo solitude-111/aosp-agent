@@ -1,10 +1,51 @@
 """Run's existing causal assessment, hunk ledger and verifier behind a mapping plan."""
+from contextlib import nullcontext
 from pathlib import Path
 import re
 
 from .agent_tools import _write_wrappers
 from .lifecycle import operation_lease, RecoveryBlocked
-from .retrieval import BudgetExceeded
+from .retrieval import BudgetExceeded, suspend_investigation_budget
+
+
+class SourceAuditUnverified(RecoveryBlocked):
+    kind = 'SOURCE_AUDIT_UNVERIFIED'
+
+
+def _error_details(exc):
+    return {'type': type(exc).__name__,
+            'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))}
+
+
+def _record_backend_error(controller, key, exc, *, handoff):
+    error = _error_details(exc)
+    timeout = handoff and getattr(exc, 'kind', None) == 'TIMEOUT'
+    if isinstance(exc, BudgetExceeded) or timeout:
+        reason = 'MODEL_TIMEOUT' if timeout else 'BUDGET_EXHAUSTED'
+        controller.record.setdefault('budget_interruption', {
+            'stage': controller.record['stage'], 'repository': key,
+            'reason': reason if timeout else str(exc)})
+        if handoff:
+            error['kind'] = reason
+            controller.record['completion_blocked_by'] = reason
+            if controller.record['impact_analysis']['status'] == 'RUNNING':
+                controller.record['impact_analysis'] = {'status': 'INTERRUPTED', 'reason': reason}
+    controller.record.setdefault('repository_errors', {})[key] = error
+    controller._save()
+    return error
+
+
+def _audit_backend(controller, key, before, *, block=True):
+    try:
+        controller._audit_peers(key, before)
+    except Exception as exc:
+        controller.record.setdefault('source_audit_errors', {})[key] = {
+            'status': 'UNVERIFIED', **_error_details(exc)}
+        controller._save()
+        if block:
+            raise SourceAuditUnverified('could not confirm source audit for ' + key) from exc
+        raise
+    controller.record.get('source_audit_errors', {}).pop(key, None)
 
 
 def configure_child(controller, key, child):
@@ -26,10 +67,24 @@ def configure_child(controller, key, child):
     original_turn = child._turn
     def audited_turn(*args, _original=original_turn, _key=key, **kwargs):
         before = controller._candidate_hashes(except_key=_key)
+        child._backend_turn_audit = None
+        failure = None
         try:
             return _original(*args, **kwargs)
+        except Exception as exc:
+            failure = exc
+            _record_backend_error(controller, _key, exc, handoff=child.location_handoff is not None)
+            raise
         finally:
-            controller._audit_peers(_key, before)
+            try:
+                # A model deadline must not prevent the bounded source check.
+                with suspend_investigation_budget() if failure else nullcontext():
+                    _audit_backend(controller, _key, before, block=False)
+            except Exception as exc:
+                child._backend_turn_audit = (exc, False)
+                raise
+            if failure is not None:
+                child._backend_turn_audit = (failure, True)
     child._turn = audited_turn
 
 
@@ -55,25 +110,23 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
         except Exception as exc:
             # Ordinary exhausted backend failures are local to this repository.
             # Unsafe source/plan/workspace mutations still stop the whole task.
+            checked = getattr(child, '_backend_turn_audit', None)
+            if checked and checked[0] is exc and not checked[1]:
+                raise SourceAuditUnverified('could not confirm source audit for ' + key) from exc
             if isinstance(exc, RecoveryBlocked):
                 child.record['status'] = 'BLOCKED'
                 child._write_record()
                 raise
-            controller._audit_peers(key, peers)
-            statuses[key] = 'FAILED'
-            error = controller.record.setdefault('repository_errors', {})[key] = {
-                'type': type(exc).__name__, 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))}
-            timeout = handoff and getattr(exc, 'kind', None) == 'TIMEOUT'
-            if isinstance(exc, BudgetExceeded) or timeout:
-                controller.record.setdefault('budget_interruption', {
-                    'stage': controller.record['stage'], 'repository': key,
-                    'reason': 'MODEL_TIMEOUT' if timeout else str(exc)})
-                if handoff:
-                    statuses[key] = 'INCONCLUSIVE'
-                    error['kind'] = 'MODEL_TIMEOUT' if timeout else 'BUDGET_EXHAUSTED'
-                    controller.record['completion_blocked_by'] = error['kind']
+            if checked and checked[0] is exc:
+                error = controller.record['repository_errors'][key]
+            else:
+                error = _record_backend_error(controller, key, exc, handoff=handoff is not None)
+                with suspend_investigation_budget():
+                    _audit_backend(controller, key, peers)
+            statuses[key] = 'INCONCLUSIVE' if error.get('kind') in ('MODEL_TIMEOUT', 'BUDGET_EXHAUSTED') else 'FAILED'
             continue
-        controller._audit_peers(key, peers)
+        controller.record.get('repository_errors', {}).pop(key, None)
+        _audit_backend(controller, key, peers)
         statuses[key] = result['status']
         if not handoff and result['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED'):
             # Mapping already established edit obligations. A backend cannot
@@ -162,7 +215,6 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
     if not impact_only and (not handoff or handoff.migration is not None):
         from .joint_validation import finish_joint
         if handoff:
-            from .retrieval import suspend_investigation_budget
             with suspend_investigation_budget():
                 finish_joint(controller, verify=verify, assessment=assessment, max_attempts=max_attempts)
         else:

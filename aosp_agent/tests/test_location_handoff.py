@@ -1,10 +1,14 @@
 """Exercise location-only handoff with actual pinned Git source and replay."""
 import json
 from pathlib import Path
+import subprocess
 import unittest
+from unittest.mock import patch
 
+from aosp_agent.diff_engine import DiffBackportAgent
 from aosp_agent.resume import resume_project
 from aosp_agent.runtime_batch import RuntimeBatch
+from aosp_agent.sdk_runtime import CodexRuntimeError
 from engine_fixtures import BASELINE, FIXED, GitFixture, git, write_counter
 from test_diff_workflow import QueueRuntime
 import test_project_first as routing_fixtures
@@ -81,6 +85,8 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertIn(response['impact']['reasoning'], calls[3]['prompt'])
             self.assertFalse(scopes[2][1])
             self.assertEqual([Path(path).name for path in scopes[3][1]], ['counter.py'])
+            round_record = json.loads(Path(outcome['final_round_record']).read_text())
+            self.assertEqual(round_record['source_search_paths'], {'repo': ['counter.py']})
 
     def test_unknown_impact_with_a_grounded_location_does_not_open_writes(self):
         with GitFixture() as fx:
@@ -91,6 +97,40 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertFalse(outcome['patches'])
             self.assertTrue(all(call['read_only'] for call in calls))
             self.assertTrue(all(not paths for _, paths in scopes))
+
+    def test_backend_timeout_is_persisted_before_single_source_audit(self):
+        for audit_fails in (False, True):
+            with self.subTest(audit_fails=audit_fails), GitFixture() as fx:
+                audits = []
+                original = DiffBackportAgent._audit_peers
+
+                def timeout(_workspace):
+                    raise CodexRuntimeError('Operation exceeded 900 seconds', kind='TIMEOUT')
+
+                def audit(controller, key, before):
+                    saved = json.loads((controller.run_dir / 'run.json').read_text())
+                    self.assertEqual(saved['repository_errors'][key]['kind'], 'MODEL_TIMEOUT')
+                    audits.append(key)
+                    if audit_fails:
+                        raise subprocess.TimeoutExpired(['git', 'status'], 45)
+                    return original(controller, key, before)
+
+                with patch.object(DiffBackportAgent, '_audit_peers', audit):
+                    outcome, calls, scopes = self.execute(fx, None, turns={
+                        'sdk-events.jsonl': [(None, timeout)],
+                    }, verify=True)
+                self.assertEqual(audits, ['repo'])
+                self.assertEqual(outcome['status'], 'BLOCKED' if audit_fails else 'INCONCLUSIVE', outcome)
+                self.assertEqual(outcome['completion_blocked_by'],
+                                 'SOURCE_AUDIT_UNVERIFIED' if audit_fails else 'MODEL_TIMEOUT')
+                self.assertEqual(outcome['repository_errors']['repo']['kind'], 'MODEL_TIMEOUT')
+                self.assertEqual(outcome['impact_analysis']['reason'], 'MODEL_TIMEOUT')
+                self.assertFalse(outcome.get('patches'))
+                self.assertTrue(all(call['read_only'] for call in calls))
+                self.assertTrue(all(not paths for _, paths in scopes))
+                if audit_fails:
+                    error = outcome['source_audit_errors']['repo']
+                    self.assertEqual((error['status'], error['type']), ('UNVERIFIED', 'TimeoutExpired'))
 
     def test_read_only_region_cannot_be_promoted_to_an_edit(self):
         with GitFixture() as fx:

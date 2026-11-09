@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import threading
 import time
 import uuid
@@ -25,6 +26,7 @@ from .tool_io import ACTIVE_TOOL_IO, ToolIO
 
 MAX_FILE = 32 * 1024 * 1024
 MAX_REPLY = 64 * 1024
+SCOPED_SEARCH_TIMEOUT = 30
 
 
 def spec(name, description, properties, required):
@@ -52,6 +54,7 @@ TOOLS = [
          ['path', 'expected_sha256', 'old', 'new']),
     spec('aosp_source', 'Bounded pinned Git source operations. Select target:<project>, donor:<source-step>, '
          'target, donor or dependency:<key> from run metadata. view/locate/search/paths need repo and ref. '
+         'For locate/search/paths, path can name a specific repository-relative file or directory. '
          'history needs hunk_id (and target_repo in multi-project runs); show needs sha and optional '
          'source_step/hunk_id/target_repo. No network, arbitrary refs or Git argv.',
          {'operation': {'enum': ['view', 'locate', 'search', 'paths', 'history', 'show']},
@@ -320,6 +323,7 @@ class ToolBroker:
         values = {k: args.get(k) for k in ('repo', 'ref', 'path', 'symbol', 'hunk_id', 'sha', 'target_repo', 'source_step')}
         values.update(start=args.get('start', 1), end=args.get('end', 200), language=None)
         options = argparse.Namespace(**values)
+        pathspecs = None
         if operation in ('history', 'show'):
             ctx.bind_history_target(args.get('target_repo'))
             ctx.bind_source(args.get('source_step'), args.get('hunk_id'))
@@ -340,29 +344,51 @@ class ToolBroker:
             ctx.check_ref(ref, repo)
             repo_args, cwd = ctx.repo_selection(repo)
             self._check_repo(cwd if cwd is not None else repo_args[1])
-            if operation in ('search', 'paths'):
+            if operation in ('search', 'paths', 'locate'):
                 path = args.get('path') or ''
-                if path: agent_tools.validate_relative_path(path)
+                paths = [agent_tools.validate_relative_path(path)] if path else None
+                defaults = ctx.record.get('source_search_paths') if not repo.startswith('donor') else None
+                if paths is None and defaults is not None:
+                    key = next(iter(ctx.target_repositories), None) if repo == 'target' else repo.split(':', 1)[1]
+                    paths = defaults.get(key, [])
+                    if not paths:
+                        return {'status': 'SEARCH_SCOPE_REQUIRED', 'returncode': 2, 'absence_proven': False,
+                                'error': 'No grounded paths for this project. Supply a specific file or directory.'}
+                if paths is not None:
+                    pathspecs = tuple(':(literal)' + p for p in paths)
+            if operation in ('search', 'paths'):
                 if operation == 'search':
                     if not args.get('query'): raise ToolDenied('search needs a nonempty literal query')
                     command = ['grep', '-n', '-I', '-F', '-e', args['query'], ref, '--']
                 else:
                     command = ['ls-tree', '-r', '--name-only', ref, '--']
-                if path: command.append(':(literal)' + path)
-                result = agent_tools._git(repo_args, *command, cwd=cwd, check=False)
+                scope = {'repo': repo, 'ref': ref, 'path_scope': path or ('grounded files' if pathspecs else 'admitted project'),
+                         'absence_proven': False}
+                if pathspecs:
+                    scope['searched_paths'] = paths
+                try:
+                    result = agent_tools._git(repo_args, *command, *(pathspecs or ()), cwd=cwd, check=False,
+                                              timeout=SCOPED_SEARCH_TIMEOUT if defaults is not None else 120)
+                except subprocess.TimeoutExpired:
+                    failure = {**scope, 'status': 'SEARCH_INCOMPLETE', 'reason': 'TIMEOUT', 'returncode': 3}
+                    self.log('broker_source_search', operation=operation, **failure)
+                    return failure
                 if result.returncode not in ((0, 1) if operation == 'search' else (0,)):
                     raise ToolDenied('READ_FAILED: ' + result.stderr[-1000:])
                 return {'status': 'NOT_FOUND_IN_SCOPE' if result.returncode == 1 else 'FOUND',
-                        'repo': repo, 'ref': ref, 'path_scope': path or 'admitted project',
-                        'text': result.stdout[:12000], 'truncated': len(result.stdout) > 12000,
-                        'absence_proven': False}
+                        **scope, 'text': result.stdout[:12000], 'truncated': len(result.stdout) > 12000}
         handler = {'view': agent_tools.cmd_view_code, 'locate': agent_tools.cmd_locate_symbol,
                    'history': agent_tools.cmd_hunk_history, 'show': agent_tools.cmd_show_commit}.get(operation)
         if handler is None: raise ToolDenied('unknown source operation')
         if operation == 'view' and not args.get('path'): raise ToolDenied('view needs path')
         if operation == 'locate' and not args.get('symbol'): raise ToolDenied('locate needs symbol')
-        code = (handler(ctx, options, cache=self._source_views)
-                if operation == 'view' else handler(ctx, options))
+        if operation == 'view':
+            code = handler(ctx, options, cache=self._source_views)
+        elif operation == 'locate' and pathspecs:
+            code = handler(ctx, options, pathspecs=pathspecs,
+                           timeout=SCOPED_SEARCH_TIMEOUT if defaults is not None else 45)
+        else:
+            code = handler(ctx, options)
         return {'returncode': code, 'results': output}
 
     def _dispatch(self, name, args):

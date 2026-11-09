@@ -133,6 +133,45 @@ class ToolBrokerTest(unittest.TestCase):
             self.assertTrue(search['success'], search)
             self.assertIn('counter.py', response(search)['text'])
 
+    def test_handoff_search_and_locate_use_grounded_paths_and_allow_explicit_expansion(self):
+        with GitFixture() as fx:
+            agent = AospBackportAgent(fx.source_root, fx.run_root, fx.case())
+            agent.prepare()
+            agent.inspect()
+            agent.record['tool_target_repositories'] = {'repo': {'root': str(fx.repo), 'head': fx.target}}
+            agent.record['source_search_paths'] = {'repo': ['counter.py']}
+            agent._write_record()
+            broker = self.broker(agent.run_dir, scope=agent.model_scope(), read_only=True)
+            args = dict(repo='target', ref=fx.target)
+            for operation, argument in (('search', 'query'), ('locate', 'symbol')):
+                scoped = dict(args, operation=operation, **{argument: 'normalize_count'})
+                default = call(broker, 'aosp_source', scoped, operation)
+                self.assertTrue(default['success'], default)
+                self.assertIn('counter.py', json.dumps(response(default)))
+                self.assertNotIn('verify_contract.py', json.dumps(response(default)))
+                explicit = call(broker, 'aosp_source', dict(scoped, path='verify_contract.py'), operation + '-path')
+                self.assertTrue(explicit['success'], explicit)
+                self.assertIn('verify_contract.py', json.dumps(response(explicit)))
+                self.assertNotIn('counter.py', json.dumps(response(explicit)))
+
+            with patch('aosp_agent.agent_tools._git', side_effect=subprocess.TimeoutExpired('git grep', 30)) as search_git:
+                expired = call(broker, 'aosp_source', dict(args, operation='search', query='normalize_count'), 'timeout')
+            self.assertFalse(expired['success'])
+            self.assertEqual(response(expired)['status'], 'SEARCH_INCOMPLETE')
+            self.assertEqual(response(expired)['searched_paths'], ['counter.py'])
+            self.assertFalse(response(expired)['absence_proven'])
+            self.assertEqual(search_git.call_args.args[-1], ':(literal)counter.py')
+            self.assertEqual(search_git.call_args.kwargs['timeout'], 30)
+            self.assertIsNone(broker.failure)
+            with patch('aosp_agent.symbols.local_git', side_effect=subprocess.TimeoutExpired('git grep', 30)):
+                expired = call(broker, 'aosp_source', dict(args, operation='locate', symbol='normalize_count'), 'locate-timeout')
+            self.assertFalse(expired['success'])
+            result = response(expired)['results'][0]
+            self.assertIn('SEARCH_INCOMPLETE', result['text'])
+            self.assertEqual(result['usage']['reason'], 'TIMEOUT')
+            self.assertEqual(result['usage']['search_scope']['pathspecs'], [':(literal)counter.py'])
+            self.assertIsNone(broker.failure)
+
     def test_source_views_reuse_large_pinned_blob_under_io_budget(self):
         with GitFixture() as fx:
             lines = [f'{n:04d} ' + 'x' * 96 for n in range(4096)]

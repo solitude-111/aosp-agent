@@ -829,6 +829,8 @@ class DiffBackportAgent:
                     {'status': 'INTERRUPTED', 'reason': type(exc).__name__})
             self.record.update(status='BLOCKED' if isinstance(exc, RecoveryBlocked) else 'FAILED', error={'type': type(exc).__name__, 'kind': getattr(exc, 'kind', 'DIFF_WORKFLOW_ERROR'),
                 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))})
+            if isinstance(exc, RecoveryBlocked) and getattr(exc, 'kind', None):
+                self.record['completion_blocked_by'] = exc.kind
             if self.record['model_execution'] == 'not_run' and not inspect_only:
                 self.record['model_execution'] = 'failed'
             self._save()

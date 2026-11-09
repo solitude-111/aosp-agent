@@ -51,10 +51,11 @@ DEEPEN_HINT = ("NOT_AVAILABLE: donor history does not cover the target..source_p
 
 
 def _git(repo_args: list[str], *args: str, cwd: Path | None = None,
-         check: bool = True) -> subprocess.CompletedProcess:
+         check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess:
     from .retrieval import ACTIVE_BUDGET
     budget = ACTIVE_BUDGET.get()
-    timeout = budget.command_timeout(120) if budget is not None else 120
+    if budget is not None:
+        timeout = budget.command_timeout(timeout)
     env = {**OFFLINE_GIT_ENV, "PATH": "/usr/bin:/bin",
            "HOME": str(Path.home()), 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null'}
     if sys.platform == 'darwin' and os.environ.get('AOSP_AGENT_GIT_LIBRARY_PATH'):
@@ -297,34 +298,43 @@ def _finish(ctx: RunContext, cmd: str, args, output: str, code: int = 0,
     return code
 
 
-def cmd_locate_symbol(ctx: RunContext, args) -> int:
+def cmd_locate_symbol(ctx: RunContext, args, *, pathspecs=None, timeout=45) -> int:
     ref = ctx.check_ref(args.ref, args.repo)
     validate_symbol = re.fullmatch(r"[A-Za-z_$][\w$]*", args.symbol or "")
     if not validate_symbol:
         raise ToolError("--symbol must be a plain identifier")
     repo_args, cwd = ctx.repo_selection(args.repo)
-    languages = getattr(args, 'language', None)
-    pathspecs = (tuple(dict.fromkeys(p for lang in languages for p in symbols.LANGUAGE_PATHSPECS[lang]))
-                 if languages else symbols.DEFAULT_PATHSPECS)
-    located = symbols.locate_in_revision(repo_args, ref, args.symbol, cwd=cwd, pathspecs=pathspecs)
+    scoped = pathspecs is not None
+    if not scoped:
+        languages = getattr(args, 'language', None)
+        pathspecs = (tuple(dict.fromkeys(p for lang in languages for p in symbols.LANGUAGE_PATHSPECS[lang]))
+                     if languages else symbols.DEFAULT_PATHSPECS)
+    located = symbols.locate_in_revision(repo_args, ref, args.symbol, cwd=cwd,
+                                         pathspecs=pathspecs, timeout=timeout)
     scope = 'Search scope: ' + ', '.join(pathspecs) + '; lexical identifiers at the pinned revision.\n'
     if located['status'] == 'READ_FAILED':
-        output = (f"READ_FAILED at {args.repo} {ref}:\n{located['error']}\n" + scope +
+        status = 'SEARCH_INCOMPLETE' if scoped and located.get('reason') == 'TIMEOUT' else 'READ_FAILED'
+        output = (f"{status} at {args.repo} {ref}:\n{located['error']}\n" + scope +
                   "Symbol and operation existence remain unknown.")
         return _finish(ctx, "locate-symbol", args, output, code=3,
-                       extra={'read_status': 'READ_FAILED', 'search_scope': located['scope']})
+                       extra={'read_status': 'READ_FAILED', 'reason': located.get('reason'),
+                              'search_scope': located['scope']})
     if located["found"]:
         output = (f"Symbol {args.symbol} at {args.repo}/{ref}:\n"
                   + "\n".join(located["matches"][:20])
                   + "\nUse view-code to read any of these locations before editing.\n")
     else:
+        output = (f"NOT_FOUND_IN_SCOPE: {args.symbol} at {args.repo}/{ref}.\n"
+                  "This is not proof that the symbol or equivalent operation is absent.\n")
+        if scoped:
+            output += 'If needed, use a specific wider directory or hunk-history.\n'
+            return _finish(ctx, "locate-symbol", args, output + scope, code=0,
+                           extra={'read_status': located['status'], 'search_scope': located['scope']})
         try:
             candidates = symbols._harvest_candidates(repo_args, ref, args.symbol, cwd=cwd, pathspecs=pathspecs)
         except (OSError, subprocess.SubprocessError):
             candidates = []  # Optional spelling hints do not change the primary lookup.
         nearest = symbols.nearest_symbols(args.symbol, candidates)
-        output = (f"NOT_FOUND_IN_SCOPE: {args.symbol} at {args.repo}/{ref}.\n"
-                  "This is not proof that the symbol or equivalent operation is absent.\n")
         if nearest:
             output += ("Nearest existing names (check carefully whether one is the "
                        f"renamed counterpart): {', '.join(nearest)}.\n")
