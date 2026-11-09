@@ -613,7 +613,7 @@ class DiffBackportAgent:
                 from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt, seed_context
                 from .exclusion_review import (ExclusionReviewError, ExclusionReviewUnresolved,
                                                review_exclusions, unresolved_exclusions)
-                from .mapped_impact import ImpactProofError, RepairContractError, PROOF_CONTEXT, check_impact_proofs
+                from .mapped_impact import ImpactProofError, PROOF_CONTEXT, check_impact_proofs
                 require_causality = (self.require_scope_closure or self.donor['status'] == 'VERIFIED_SEQUENCE'
                                      or bool(self.guarded_obligations))
                 runtime = None
@@ -668,17 +668,11 @@ class DiffBackportAgent:
                             return self._block_migration(assessment, raw, evidence, str(exc))
                         self.record['scope_evidence'] = scope
                         if scope['status'] in ('EXPANSION_REQUIRED', 'OPEN_QUESTIONS'):
-                            decision = 'UNKNOWN'
-                            if 'unresolved_questions' in scope:
-                                open_units = {row['unit_id'] for row in
-                                              scope['unresolved_questions'] + scope.get('requests', [])}
-                                closed_units = {unit['id'] for unit in self.units} - open_units
-                                if any(group['impact']['status'] == 'AFFECTED' and set(group['unit_ids']) <= closed_units
-                                       for group in assessment.get('proof_groups', [])):
-                                    self.record['causal_evidence'] = check_impact_proofs(
-                                        self, assessment, require_causality, closed_units=closed_units)
-                                    if self.record['causal_evidence']['groups']:
-                                        decision = 'AFFECTED'
+                            evidence = (self._independent_affected_proof(assessment)
+                                        if 'unresolved_questions' in scope else None)
+                            decision = 'AFFECTED' if evidence else 'UNKNOWN'
+                            if evidence:
+                                self.record['causal_evidence'] = evidence
                             self._record_assessment(assessment, decision, reason=scope['status'])
                             self.record.update(status='INCONCLUSIVE', replan_required=scope['status'],
                                 scope_requests=scope.get('requests', []))
@@ -690,7 +684,10 @@ class DiffBackportAgent:
                         try:
                             self.record['causal_evidence'] = check_impact_proofs(self, assessment, require_causality)
                         except ImpactProofError as exc:
-                            if scope['status'] == 'GROUNDED_MODEL_SCOPE' and not isinstance(exc, RepairContractError):
+                            evidence = self._independent_affected_proof(assessment)
+                            if evidence:
+                                return self._block_migration(assessment, raw, evidence, str(exc))
+                            if scope['status'] == 'GROUNDED_MODEL_SCOPE':
                                 self._remember_mapping_for_proof_repair(raw, attempt_path, exc)
                             raise
                         self.record.pop('grounded_mapping', None)
@@ -708,11 +705,6 @@ class DiffBackportAgent:
                     except AssessmentError as exc:
                         self.record.setdefault('assessment_rejections', []).append(str(exc))
                         self._save()
-                        if isinstance(exc, RepairContractError):
-                            evidence = check_impact_proofs(
-                                self, assessment, require_causality, closed_units={u['id'] for u in self.units})
-                            if evidence['groups']:
-                                return self._block_migration(assessment, raw, evidence, str(exc))
                         if isinstance(exc, ExclusionReviewUnresolved):
                             assessment = unresolved_exclusions(self, assessment, str(exc))
                             break

@@ -318,6 +318,29 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertIn(unit_id, result['migration_scope_error'])
             self.assertEqual(result['delivery_status'], 'BLOCKED')
 
+    def test_missing_whole_proof_coverage_keeps_the_independent_positive_proof(self):
+        with GitFixture() as fx:
+            assessment = self.assessment()
+            unit = assessment['units'][0]
+            dependency = 'repo/check_lower.py'
+            unit['targets'].append({
+                **unit['targets'][0], 'path': dependency, 'symbol': 'test input dependency',
+                'relationship': 'dependency', 'action': 'read_dependency', 'line_start': 1, 'line_end': 1})
+            unit['evidence'].append({
+                **unit['evidence'][0], 'path': dependency, 'line_start': 1, 'line_end': 1,
+                'excerpt': (fx.repo / 'check_lower.py').read_text().splitlines()[0]})
+            assessment['scope_closure'] = closure_for(assessment)
+            runtime = QueueRuntime([(assessment, None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, max_rounds=1)
+            result = agent.run()
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+            self.assertEqual(result['scope_evidence']['status'], 'GROUNDED_MODEL_SCOPE')
+            self.assertEqual(result['causal_evidence']['status'], 'GROUNDED_CLOSED_POSITIVE_GROUPS')
+            self.assertIn('every mapped target region', result['migration_scope_error'])
+            self.assertEqual(result['delivery_status'], 'BLOCKED')
+            self.assertFalse((agent.run_dir / 'rounds/r01/workspace').exists())
+
     def test_resume_only_requests_corrections_to_a_checked_pinned_assessment(self):
         from aosp_agent.assessment_repair import digest
         from aosp_agent.diff_prompts import ASSESSMENT_RESPONSE_SCHEMA
