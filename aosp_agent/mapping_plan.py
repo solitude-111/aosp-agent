@@ -143,7 +143,7 @@ class MappingPlanner:
             if excerpt.strip() != evidence['excerpt'].strip():
                 raise AssessmentError('source evidence mismatches supplied diff')
 
-    def _check_all_evidence(self, raw, expected):
+    def _check_all_evidence(self, raw, expected, *, excluded_unit_evidence=()):
         cache, java_sources, errors = {}, {}, []
         def read(path):
             if path not in cache:
@@ -161,6 +161,9 @@ class MappingPlanner:
             for j, target in enumerate(item['targets']):
                 check(f'/units/{i}/targets/{j}', lambda: self._check_target(item, target, read, java_sources))
             for j, evidence in enumerate(item['evidence']):
+                # Keep error pointers indexed against the original response.
+                if (i, j) in excluded_unit_evidence:
+                    continue
                 check(f'/units/{i}/evidence/{j}',
                       lambda: self._check_evidence(expected[item['id']], item, evidence, read))
         # Report repeated bad target quotations across sections together. Their

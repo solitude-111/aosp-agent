@@ -30,13 +30,28 @@ BACKEND_SCHEMA = obj({'impact': IMPACT_SCHEMA, **EDIT_FIELDS})
 EDIT_SCHEMA = obj(EDIT_FIELDS)
 
 
-def ground_locations(controller, raw):
+def ground_locations(controller, raw, *, unassociated=None):
     _shape(raw, LOCATION_SCHEMA)
     source = {unit['id']: unit for unit in controller.units}
-    units = raw['units']
-    if len(units) != len(source) or {unit['id'] for unit in units} != set(source):
+    if len(raw['units']) != len(source) or {unit['id'] for unit in raw['units']} != set(source):
         raise AssessmentError('location response must account for every donor unit exactly once')
-    controller.mapper._check_all_evidence(raw, source)
+    units, excluded = [], set()
+    for unit_index, unit in enumerate(raw['units']):
+        mapped_paths = {target['path'] for target in unit['targets']}
+        evidence = []
+        for index, citation in enumerate(unit['evidence']):
+            if citation['origin'] == 'target' and citation['path'] not in mapped_paths:
+                excluded.add((unit_index, index))
+                if unassociated is not None:
+                    unassociated.append({
+                        'unit_id': unit['id'], 'evidence_index': index,
+                        'reason': 'TARGET_PATH_NOT_MAPPED',
+                        **{key: citation[key] for key in ('path', 'line_start', 'line_end')},
+                    })
+                continue
+            evidence.append(citation)
+        units.append({**unit, 'evidence': evidence})
+    controller.mapper._check_all_evidence(raw, source, excluded_unit_evidence=excluded)
     scope = check_scope(controller, {'repository_requests': raw['repository_requests']})
     anchors, writable = set(), set()
     for unit in units:
@@ -75,7 +90,9 @@ Return every donor unit ID once. Map its counterpart, callers and dependencies t
 repository-prefixed paths, symbols and line ranges with short pinned target excerpts inside
 each range. Mark possible edits as edit and other evidence as read_dependency. This is a
 candidate scope for a later backend, not a required edit. For imports, fields, tests and
-configuration map the actual region. Report unmapped units with empty targets and a specific
+configuration map the actual region. Cite target files only when they are mapped in the same
+unit. For a required dependency, map its region as read_dependency and cite the pinned lines.
+Report unmapped units with empty targets and a specific
 location_notes. Use the write project's key as primary_repository, or a grounded read project
 when no edit is known. Leave it empty when no anchor exists. Request a missing project only
 with evidence from loaded pinned source or the supplied donor diff. Search bounded paths first.
@@ -90,7 +107,7 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
     if controller.location_seed:
         if not controller.location_feedback:
             grounded = ground_locations(controller, controller.location_seed)
-            save_location(controller, controller.location_seed)
+            save_location(controller, grounded)
             controller.record['location_reused'] = True
             return grounded
         prompt += '\nPrevious grounded locations to preserve: ' + json.dumps(
@@ -103,22 +120,29 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
         for attempt in range(1, min(max_attempts, 2) + 1):
             raw = controller._turn(runtime, prompt, LOCATION_SCHEMA, read_only=True)
             _write(controller.run_dir / f'location-attempt-{attempt}.json', raw)
+            unassociated = []
             try:
-                grounded = ground_locations(controller, raw)
+                grounded = ground_locations(controller, raw, unassociated=unassociated)
             except AssessmentError as exc:
+                grounded = None
                 controller.record.setdefault('location_rejections', []).append(str(exc))
-                controller._save()
                 prompt = ('Correct the previous location response. Preserve unaffected locations. '
                           'The controller rejected it for: ' + str(exc))
-                continue
-            save_location(controller, raw)
-            return grounded
+            if unassociated:
+                controller.record.setdefault('location_unassociated_evidence', []).extend(
+                    {**entry, 'attempt': attempt} for entry in unassociated)
+            if grounded is not None:
+                save_location(controller, grounded)
+                return grounded
+            controller._save()
     controller.record['location_handoff'] = {'status': 'UNRESOLVED', 'reason': 'LOCATION_EVIDENCE_REJECTED'}
     return None
 
 
-def save_location(controller, raw):
+def save_location(controller, grounded):
     from .diff_engine import _write
+    raw = {key: grounded[key] for key in LOCATION_SCHEMA['properties']}
+    raw['units'] = [{key: value for key, value in unit.items() if key != 'status'} for unit in raw['units']]
     path = controller.run_dir / 'grounded-location.json'
     _write(path, raw)
     controller._protect(path)

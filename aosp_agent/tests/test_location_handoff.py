@@ -27,6 +27,13 @@ def impact_reply(fx, decision, edits=None):
             'repository_requests': [], 'location_gaps': [], 'new_files': [], 'flag_cleanup_support': []}
 
 
+def unassociated_reference(fx):
+    path = 'verify_contract.py'
+    excerpt = (fx.repo / path).read_text().splitlines()[0]
+    return {'origin': 'target', 'path': 'repo/' + path, 'line_start': 1, 'line_end': 1,
+            'excerpt': excerpt, 'claim': 'An example call outside the mapped locations.'}
+
+
 class LocationHandoffTest(unittest.TestCase):
     def execute(self, fx, response, *, located=None, extras=(), turns=None, max_rounds=1,
                 resume=False, prepared_manifest=False, verify=False):
@@ -87,6 +94,47 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertEqual([Path(path).name for path in scopes[3][1]], ['counter.py'])
             round_record = json.loads(Path(outcome['final_round_record']).read_text())
             self.assertEqual(round_record['source_search_paths'], {'repo': ['counter.py']})
+
+    def test_unassociated_reference_is_logged_and_excluded_from_handoff(self):
+        with GitFixture() as fx:
+            candidate = location()
+            extra = unassociated_reference(fx)
+            candidate['units'][0]['evidence'].insert(0, extra)
+            outcome, calls, _ = self.execute(fx, impact_reply(fx, 'UNKNOWN'), located=candidate)
+            self.assertEqual(outcome['location_handoff']['status'], 'READY')
+            self.assertEqual(outcome['completion_blocked_by'], 'BACKEND_IMPACT_UNRESOLVED')
+            self.assertNotIn(extra['path'], calls[2]['prompt'])
+            round_path = Path(outcome['final_round_record'])
+            raw = json.loads((round_path.parent / 'location-attempt-1.json').read_text())
+            grounded = json.loads((round_path.parent / 'grounded-location.json').read_text())
+            record = json.loads(round_path.read_text())
+            self.assertEqual(raw, candidate)
+            self.assertEqual(grounded['units'][0]['targets'], candidate['units'][0]['targets'])
+            self.assertEqual(grounded['units'][0]['evidence'], candidate['units'][0]['evidence'][1:])
+            self.assertEqual(record['source_search_paths'], {'repo': ['counter.py']})
+            self.assertEqual(record['location_unassociated_evidence'], [{
+                'unit_id': 'f001-h001', 'evidence_index': 0, 'reason': 'TARGET_PATH_NOT_MAPPED',
+                'path': extra['path'], 'line_start': 1, 'line_end': 1, 'attempt': 1}])
+
+    def test_unassociated_reference_cannot_replace_required_source_evidence(self):
+        for missing in (True, False):
+            with self.subTest(missing=missing), GitFixture() as fx:
+                candidate = location()
+                unit = candidate['units'][0]
+                unit['evidence'].insert(0, unassociated_reference(fx))
+                index = next(i for i, e in enumerate(unit['evidence']) if e['path'] == 'repo/counter.py')
+                if missing:
+                    unit['evidence'].pop(index)
+                else:
+                    unit['evidence'][index]['excerpt'] = 'Incorrect pinned source.'
+                outcome, calls, _ = self.execute(fx, None, located=candidate)
+                self.assertEqual(outcome['completion_blocked_by'], 'LOCATION_UNRESOLVED', outcome)
+                self.assertEqual(outcome['impact_analysis']['status'], 'NOT_STARTED')
+                self.assertEqual(len(calls), 2)
+                record = json.loads(Path(outcome['final_round_record']).read_text())
+                expected = ('target mapping lacks an excerpt' if missing
+                            else f'/units/0/evidence/{index}')
+                self.assertIn(expected, record['location_rejections'][0])
 
     def test_unknown_impact_with_a_grounded_location_does_not_open_writes(self):
         with GitFixture() as fx:
