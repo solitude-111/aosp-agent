@@ -95,7 +95,7 @@ KNOWLEDGE = '''AOSP investigation guide (hypotheses, never reference answers):
 '''
 
 
-def assessment_prompt(diff, inventory, location):
+def compact_location(location):
     # Keep complete evidence on disk but bound repeated retrieval hints in model context.
     # The model can read any pinned target file; truncation never means absence.
     compact = {'units': [], 'issues': location['issues'][:40], 'issues_truncated': len(location['issues']) > 40,
@@ -115,6 +115,11 @@ def assessment_prompt(diff, inventory, location):
             {**{k: c[k] for k in ('workspace_path', 'score', 'signals', 'symbols')},
              'windows': [{k: w[k] for k in ('line_start', 'line_end', 'function')} for w in c['windows'][:2]]}
             for c in unit['candidates'][:6]]
+    return compact
+
+
+def assessment_prompt(diff, inventory, location):
+    compact = compact_location(location)
     return '''Locate the target implementation and independently assess this higher-version patch.
 The original diff and repositories are supplied, optionally with verified donor commit/parent
 and read-only history tools. No reference conclusion or migration recipe is provided.

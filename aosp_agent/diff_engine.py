@@ -40,7 +40,8 @@ class DiffBackportAgent:
                  lazy_reads=False, object_cache=None, assessment_context='', source_sequence=None,
                  require_scope_closure=False, read_denied_roots=(), max_output_bytes=256 * 1024 * 1024,
                  exclusion_corrections=None, assessment_seed=None, revalidate_assessment_seed=False,
-                 seed_pending_proof=False):
+                 seed_pending_proof=False, locate_first=False, location_feedback=None,
+                 location_seed=None, backend_impact_seed=None):
         self.patch_bytes = patch if isinstance(patch, bytes) else patch.read_bytes()
         self.diff = self.patch_bytes.decode('utf-8')
         self.units = diff_units(self.diff)
@@ -71,6 +72,9 @@ class DiffBackportAgent:
         self.assessment_seed, self.replan_assessment = assessment_seed, None
         self.revalidate_assessment_seed = revalidate_assessment_seed
         self.seed_pending_proof = seed_pending_proof
+        self.locate_first, self.location_feedback = locate_first, location_feedback
+        self.location_seed, self.backend_impact_seed = location_seed, backend_impact_seed
+        self.grounded_location = None
         self.guarded_obligations = []
         self.read_denied_roots = tuple(read_denied_roots)
         self._model_read_roots = None
@@ -348,7 +352,7 @@ class DiffBackportAgent:
         self._save()
         return self.record
 
-    def _runtime(self, name):
+    def _runtime(self, name, *, timeout=None):
         from .retrieval import ACTIVE_BUDGET
         budget = ACTIVE_BUDGET.get()
         if self.factory is None:
@@ -361,9 +365,10 @@ class DiffBackportAgent:
             from urllib.parse import unquote
             child = self.children[unquote(name[len('migration-'):])]
             writable = [child.worktree / p for p in child.case.files]
+        seconds = min(self.timeout, timeout) if timeout is not None else self.timeout
         return factory(events_path=self.run_dir / f'sdk-{name}.jsonl',
-                       model=self.mapping_model if name == 'assessment' or name.startswith('exclusion-review-') else self.model,
-                       model_provider=self.provider, turn_timeout=min(self.timeout, budget.remaining()) if budget else self.timeout,
+                       model=self.mapping_model if name in ('assessment', 'location-handoff') or name.startswith('exclusion-review-') else self.model,
+                       model_provider=self.provider, turn_timeout=min(seconds, budget.remaining()) if budget else seconds,
                        env=OFFLINE_GIT_ENV, read_scope=self.model_scope(writable))
 
     def model_scope(self, writable=()):
@@ -397,16 +402,57 @@ class DiffBackportAgent:
             output = json.loads(result['final_response'])
         return output
 
-    def _prepare_children(self, assessment, *, build_requested=True):
+    def _save_mapping_plan(self, assessment, name='mapping-plan.json'):
         repair_contract = [row for group in self.record.get('causal_evidence', {}).get('groups', [])
                            for row in group.get('repair_obligations', [])]
         self.mapping_plan = MappingPlan.create(assessment, self.repos, self.units, self.donor,
                                                repair_contract=repair_contract)
-        _write(self.run_dir / 'mapping-plan.json', self.mapping_plan.data())
-        self._protect(self.run_dir / 'mapping-plan.json')
-        self.record['mapping_plan_sha256'] = self.mapping_plan.sha256
-        # Read dependencies in the same workspace; only AFFECTED mappings/new files become writable.
-        selected = {self._owner(t['path'])[0].key for u in assessment['units'] for t in u['targets']}
+        _write(self.run_dir / name, self.mapping_plan.data())
+        self._protect(self.run_dir / name)
+        self.record[name.removesuffix('.json').replace('-', '_') + '_sha256'] = self.mapping_plan.sha256
+
+    def _local_validation(self, assessment, key, files, *, build_requested, multi=False, deferred=None):
+        repo = self.by_key[key]
+        mappings = {}
+        for unit in assessment['units']:
+            if unit['status'] != 'AFFECTED':
+                continue
+            edited = {t['path'] for t in unit['targets'] if t['action'] == 'edit'}
+            edited.update(a['path'] for a in assessment['new_files'] if a['anchor_path'] in edited)
+            mappings[unit['id']] = [self._owner(p)[1] for p in edited if self._owner(p)[0].key == key]
+        plan = make_plan(repo, self.units, mappings, files, self.diff,
+                         explicit=self.validation.get(key), auto=self.auto_validation,
+                         build_runner=self.build_runner, build_requested=build_requested)
+        local_checks = []
+        for check in plan['checks']:
+            if multi and files and check['stage'] == 'android_module_build':
+                deferred.append((key, check))
+            else:
+                local_checks.append(check)
+        plan['deferred_to_joint'] = ['android_module_build'] if len(local_checks) != len(plan['checks']) else []
+        path = self.run_dir / 'validation-plans' / key / 'plan.json'
+        _write(path, plan)
+        self._protect(path)
+        return Case.from_dict({'cve': 'CVE-2099-0000', 'project': 'validation contract',
+                               'repository': 'repo', 'source_commit': '0', 'source_parent': '0',
+                               'target_commit': repo.head, 'files': ['placeholder'], 'validation': local_checks})
+
+    def _save_child_case(self, child, key):
+        from dataclasses import asdict
+        _write(child.run_dir / 'runtime-case.json', asdict(child.case))
+        self._protect(child.run_dir / 'runtime-case.json')
+        for check in child.case.validation_checks:
+            self._freeze_check(check, child.worktree)
+        child.record['validation_plan'] = str(self.run_dir / 'validation-plans' / key / 'plan.json')
+        child._write_record()
+
+    def _prepare_children(self, assessment, *, build_requested=True, location_only=False):
+        self._save_mapping_plan(assessment, 'location-mapping.json' if location_only else 'mapping-plan.json')
+        # Location handoff reads dependency objects at their pins without
+        # checking out another full worktree for each dependency.
+        selected = ({assessment['primary_repository']} if location_only else
+                    {self._owner(t['path'])[0].key for u in assessment['units'] for t in u['targets']})
+        dependency_keys = set(self.by_key) if location_only else selected
         multi = sum(bool(self.mapping_plan.files(key)) for key in selected) > 1
         deferred = []
         source_root = (self.target_root.parent if any(r.root == self.target_root for r in self.repos)
@@ -414,37 +460,18 @@ class DiffBackportAgent:
         for key in sorted(selected):
             repo = self.by_key[key]
             files = self.mapping_plan.files(key)
-            mappings = {}
-            for unit in assessment['units']:
-                if unit['status'] != 'AFFECTED':
-                    continue
-                edited = {t['path'] for t in unit['targets'] if t['action'] == 'edit'}
-                edited.update(a['path'] for a in assessment['new_files'] if a['anchor_path'] in edited)
-                mappings[unit['id']] = [self._owner(p)[1] for p in edited if self._owner(p)[0].key == key]
-            plan = make_plan(repo, self.units, mappings, files, self.diff,
-                             explicit=self.validation.get(key), auto=self.auto_validation,
-                             build_runner=self.build_runner, build_requested=build_requested)
-            local_checks = []
-            for check in plan['checks']:
-                if multi and files and check['stage'] == 'android_module_build':
-                    deferred.append((key, check))
-                else:
-                    local_checks.append(check)
-            plan['deferred_to_joint'] = ['android_module_build'] if len(local_checks) != len(plan['checks']) else []
-            _write(self.run_dir / 'validation-plans' / key / 'plan.json', plan)
-            self._protect(self.run_dir / 'validation-plans' / key / 'plan.json')
-            validation_case = Case.from_dict({'cve': 'CVE-2099-0000', 'project': 'validation contract',
-                'repository': 'repo', 'source_commit': '0', 'source_parent': '0', 'target_commit': repo.head,
-                'files': ['placeholder'], 'validation': local_checks})
+            validation_case = None if location_only else self._local_validation(
+                assessment, key, files, build_requested=build_requested, multi=multi, deferred=deferred)
             dependencies = tuple({'path': self.by_key[k].root.relative_to(source_root).as_posix(),
                                   'role': 'read_only_dependency', 'files': [],
                                   'target_commit': self.by_key[k].head}
-                                 for k in sorted(selected - {key}))
+                                 for k in sorted(dependency_keys - {key}))
             case = Case(cve=self.task_id, project='AOSP mapped backport',
                         repository=repo.root.relative_to(source_root).as_posix(),
                         source_commit=self.donor.get('source_commit', ''),
                         source_parent=self.donor.get('source_parent', ''), target_commit=repo.head, files=files,
-                        validation=validation_case.validation, validation_checks=validation_case.validation_checks,
+                        validation=validation_case.validation if validation_case else (),
+                        validation_checks=validation_case.validation_checks if validation_case else (),
                         repositories=dependencies)
             child = AospBackportAgent(source_root, self.run_dir / 'exports', case,
                                       model=self.model, source_diff=self.diff,
@@ -462,15 +489,30 @@ class DiffBackportAgent:
             child.defer_post_fix = True
             self.children[key] = child
             child.prepare(_source_lease=operation_lease(self))
-            from dataclasses import asdict
-            _write(child.run_dir / 'runtime-case.json', asdict(case))
-            self._protect(child.run_dir / 'runtime-case.json')
-            for check in case.validation_checks:
-                self._freeze_check(check, child.worktree)
-            child.record['validation_plan'] = str(self.run_dir / 'validation-plans' / key / 'plan.json')
-            child._write_record()
+            if not location_only:
+                self._save_child_case(child, key)
+        if not location_only:
+            from .joint_validation import prepare_joint
+            prepare_joint(self, deferred)
+        self._audit()
+
+    def _activate_location_migration(self, assessment, key, *, build_requested):
+        from dataclasses import replace
         from .joint_validation import prepare_joint
-        prepare_joint(self, deferred)
+        self._save_mapping_plan(assessment)
+        for name, child in self.children.items():
+            child.mapping_plan = self.mapping_plan
+            child.record['mapping_plan_sha256'] = self.mapping_plan.sha256
+            files = self.mapping_plan.files(name)
+            if name == key:
+                checks = self._local_validation(assessment, name, files, build_requested=build_requested)
+                child.case = replace(child.case, files=files, validation=checks.validation,
+                                     validation_checks=checks.validation_checks)
+                child._artifact_paths = {p for c in checks.validation_checks for p in c.get('artifacts', [])}
+                self._save_child_case(child, name)
+            else:
+                child.case = replace(child.case, files=files)
+        prepare_joint(self, [])
         self._audit()
 
     def _coverage(self, raw, assessment):
@@ -594,10 +636,19 @@ class DiffBackportAgent:
             from .guarded_repair import discover_obligations
             with budget.phase('IMPACT_ANALYSIS') if budget else nullcontext():
                 self.guarded_obligations = discover_obligations(self)
-            obligation_context = ''
             if self.guarded_obligations:
                 self.record['guarded_source_obligations'] = self.guarded_obligations
                 self._save()
+            if self.locate_first and self.donor['status'] == 'VERIFIED':
+                from .location_handoff import run_location_handoff
+                result = run_location_handoff(self, inventory, location, verify=verify, impact_only=impact_only,
+                                              mechanical=mechanical, max_attempts=max_attempts)
+                if result is not None:
+                    return result
+            elif self.locate_first:
+                self.record['frontend_workflow'] = {'mode': 'legacy', 'reason': self.donor['status']}
+            obligation_context = ''
+            if self.guarded_obligations:
                 obligation_context = (
                     '\nRequired upstream behaviors extracted from fixed source. A weakened guard activates '
                     'all the enclosed statements, including unchanged ones. In each AFFECTED proof group '
@@ -769,6 +820,8 @@ class DiffBackportAgent:
                     return run_text_backends(self, assessment, verify=verify, max_attempts=max_attempts)
         except Exception as exc:
             from .lifecycle import RecoveryBlocked
+            if self.record.get('location_handoff', {}).get('status') == 'RUNNING':
+                self.record['location_handoff'] = {'status': 'INTERRUPTED', 'reason': type(exc).__name__}
             if self.record['impact_analysis']['status'] == 'RUNNING':
                 self.record['impact_analysis'] = (
                     {'status': 'EVIDENCE_INSUFFICIENT', 'reason': 'ASSESSMENT_REJECTED'}

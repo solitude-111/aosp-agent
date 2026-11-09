@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Callable
 
@@ -236,6 +237,8 @@ class AospBackportAgent(CausalityChecks):
         self._current_hunks: list[dict[str, Any]] = []
         self.mapping_plan, self.mapping_repository = None, None
         self.selected_hunk_ids = None
+        self.mechanical_hunk_ids = None
+        self.location_handoff = None
         self._last_audit: dict[str, Any] | None = None
         self._events_swept = 0
         self.record: dict[str, Any] = {"cve": case.cve, "status": "INITIALIZED", "backend": "codex_sdk",
@@ -367,8 +370,11 @@ class AospBackportAgent(CausalityChecks):
                 raise AssessmentError(f"case path resolves outside worktree: {relative}")
             files.append({"path": relative, "exists": path.is_file(),
                           "sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None})
-        source_diff = (self.input_diff if self.input_diff is not None else
-                       self._source_git("diff", "--no-ext-diff", self.case.source_parent, self.case.source_commit).stdout)
+        if self.location_handoff:
+            source_diff = self.location_handoff.controller.diff
+        else:
+            source_diff = (self.input_diff if self.input_diff is not None else
+                           self._source_git("diff", "--no-ext-diff", self.case.source_parent, self.case.source_commit).stdout)
         hunks = split_hunks(source_diff)
         if self.selected_hunk_ids is not None:
             hunks = [h for h in hunks if h['id'] in self.selected_hunk_ids]
@@ -378,14 +384,18 @@ class AospBackportAgent(CausalityChecks):
         review = review_groups(hunks)
         self._json('hunk-review-groups.json', review)
         for hunk in hunks:
-            hunk["application_check"] = (self._check_application(hunk["patch"])
-                                          if hunk["supported"] else {"status": "UNSUPPORTED"})
+            if self.location_handoff:
+                hunk["application_check"] = {"status": "DEFERRED_UNTIL_SCOPE"}
+            else:
+                hunk["application_check"] = (self._check_application(hunk["patch"])
+                                              if hunk["supported"] else {"status": "UNSUPPORTED"})
         result = {"target_files": files, "source_diff": source_diff, "source_commit": self.case.source_commit,
                   "target_commit": self.case.target_commit, "hunks": hunks, "review_groups": review,
                   "commit_message": self.commit_message,
-                  "whole_patch_application": self._check_application(source_diff),
+                  "whole_patch_application": ({"status": "SCOPED_MIGRATION_ONLY"} if self.location_handoff
+                                              else self._check_application(source_diff)),
                   "limitation": "Textual applicability does not establish impact or API compatibility."}
-        if self.input_diff is None:
+        if self.input_diff is None and not self.location_handoff:
             # Read-only existence pre-scan (R4); runs before any model turn so
             # the impact phase still sees a clean baseline (r2 revision 1).
             try:
@@ -427,7 +437,10 @@ class AospBackportAgent(CausalityChecks):
                 raise AssessmentError(f"source evidence path is not in the donor fix diff: {evidence['path']}")
             runner = self._git if evidence["revision"] == "target" else self._source_git
             try:
-                content = runner("show", f"{refs[evidence['revision']]}:{evidence['path']}").stdout
+                if self.location_handoff and evidence['revision'] == 'target':
+                    content = self.location_handoff.target_content(evidence['path'])
+                else:
+                    content = runner("show", f"{refs[evidence['revision']]}:{evidence['path']}").stdout
             except subprocess.CalledProcessError as exc:
                 raise AssessmentError(
                     f"evidence file does not exist in {evidence['revision']}:{evidence['path']}") from exc
@@ -441,7 +454,9 @@ class AospBackportAgent(CausalityChecks):
                        if "\n".join(lines[index:index + len(excerpt_lines)]).strip() == excerpt]
             if not matches:
                 raise AssessmentError(f"evidence excerpt does not exist in {evidence['revision']}:{evidence['path']}:{start}-{end}")
-            actual_start = matches[0] + 1
+            if self.location_handoff and start - 1 not in matches and len(matches) != 1:
+                raise AssessmentError(f"ambiguous pinned evidence range: {evidence['path']}:{start}-{end}")
+            actual_start = start if self.location_handoff and start - 1 in matches else matches[0] + 1
             actual_end = actual_start + len(excerpt_lines) - 1
             if actual_start != start or actual_end != end:
                 self.record.setdefault("evidence_corrections", []).append(
@@ -549,7 +564,9 @@ class AospBackportAgent(CausalityChecks):
         target_lines: dict[str, list[str] | None] = {}
         for hunk in inspection["hunks"]:
             entry = {"id": hunk["id"], "path": hunk.get("path")}
-            if not hunk.get("supported") or hunk.get("kind") != "hunk":
+            if self.mechanical_hunk_ids is not None and hunk['id'] not in self.mechanical_hunk_ids:
+                entry.update(status="skipped", reason="read_only_donor_context")
+            elif not hunk.get("supported") or hunk.get("kind") != "hunk":
                 entry.update(status="skipped", reason="unsupported_or_not_text_hunk")
             elif hunk.get("path") not in allowlist:
                 entry.update(status="skipped", reason="skipped_out_of_allowlist")
@@ -560,19 +577,21 @@ class AospBackportAgent(CausalityChecks):
                                      cwd=self.worktree, check=False)
                     target_lines[path] = blob.stdout.splitlines() if blob.returncode == 0 else None
                 lines = target_lines[path]
-                if lines is None:
+                if self.location_handoff and not self._mechanical_matches_location(hunk, path, lines):
+                    entry.update(status="skipped", reason="outside_grounded_location")
+                elif lines is None:
                     candidates = self._target_tree_files()
                     entry.update(status="failed", repair_applied=[],
                                  diagnosis=apply_diagnosis(hunk, "No such file", None, candidates))
                 else:
-                    patch_text, repairs = repair_hunk(hunk, lines)
+                    patch_text, repairs = (hunk['patch'], []) if self.location_handoff else repair_hunk(hunk, lines)
                     applied = self._git("apply", "-", cwd=self.worktree, check=False, input=patch_text)
                     if applied.returncode == 0:
                         entry.update(status="applied", repair_applied=repairs)
                     else:
                         # git apply is atomic per invocation; defensively undo
                         # any residue inside this disposable worktree only.
-                        if self._git("diff", "--quiet", "--", path, cwd=self.worktree,
+                        if not self.location_handoff and self._git("diff", "--quiet", "--", path, cwd=self.worktree,
                                      check=False).returncode != 0:
                             self._git("checkout", "--", path, cwd=self.worktree, check=False)
                         entry.update(status="failed", repair_applied=repairs,
@@ -594,6 +613,30 @@ class AospBackportAgent(CausalityChecks):
         self._event("mechanical_migration",
                     **{key: value for key, value in result.items() if key != "hunks"})
         return result
+
+    def _mechanical_matches_location(self, hunk, path, baseline):
+        if baseline is None:
+            return False
+        rows = text_hunks(hunk['patch'])[0]['lines']
+        old = [row['text'] for row in rows if row['marker'] != '+']
+        if not old:
+            return False
+        # A modified file or repeated context requires the writer to adapt the
+        # hunk. Git's offset search alone cannot choose a grounded edit site.
+        current = (self.worktree / path).read_text().splitlines()
+        if current != baseline:
+            return False
+        start = None
+        for index, line in enumerate(baseline):
+            if line == old[0] and baseline[index:index + len(old)] == old:
+                if start is not None:
+                    return False
+                start = index + 1
+        return start is not None and any(
+            region['action'] == 'edit' and region['path'] == path
+            and region['line_start'] <= start
+            and start + len(old) - 1 <= region['line_end']
+            for region in self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id']))
 
     def _target_tree_files(self) -> list[str]:
         """Bounded listing of source-suffix files at the target baseline."""
@@ -878,6 +921,12 @@ class AospBackportAgent(CausalityChecks):
                         "error": "metadata_only does not match the donor hunk"}
             return {"ok": True, "category": category, "tool_uids": []}
         if category == "no_target_counterpart":
+            if self.location_handoff:
+                receipt = self.location_handoff.flag_support.get(hunk['id'])
+                if receipt:
+                    return {'ok': True, 'category': category, 'tool_uids': [], 'controller_evidence': receipt}
+                return {'ok': False, 'category': category,
+                        'error': 'target absence has no controller evidence; missing mappings and donor history are insufficient'}
             targets = self._donor_targets(hunk.get("path", ""))
             if targets:
                 return {"ok": False, "category": category,
@@ -964,6 +1013,16 @@ class AospBackportAgent(CausalityChecks):
             return False
         command = record.get("cmd")
         arguments = record.get("args") or {}
+        if self.location_handoff:
+            scope = arguments.get('repo', '')
+            if command != 'view-code' or (scope != 'target' and not scope.startswith(('target:', 'dependency:'))):
+                return False
+            key = scope.split(':', 1)[1] if ':' in scope else self.mapping_repository
+            regions = self.mapping_plan.targets(key, unit_id=hunk['id'])
+            return any(arguments.get('path') == region['path']
+                       and type(arguments.get('start')) is int and type(arguments.get('end')) is int
+                       and arguments['start'] <= region['line_end'] and arguments['end'] >= region['line_start']
+                       for region in regions)
         if command == "hunk-history":
             return arguments.get("hunk_id") == hunk["id"]
         if command == "show-commit":
@@ -1027,7 +1086,7 @@ class AospBackportAgent(CausalityChecks):
             raise RecoveryBlocked('cannot read pinned target baseline for hunk evidence: ' + path)
         return blob.stdout.splitlines()
 
-    def _target_baseline_analysis(self, path: str) -> dict[str, Any] | None:
+    def _target_baseline_analysis(self, path: str, *, qualified=False) -> dict[str, Any] | None:
         """Comment-stripped lines, brace paths and a token-occurrence index.
 
         Cached per path: the target commit is immutable for the run, and the
@@ -1037,11 +1096,13 @@ class AospBackportAgent(CausalityChecks):
         cache = getattr(self, "_target_analysis_cache", None)
         if cache is None:
             cache = self._target_analysis_cache = {}
-        if path in cache:
-            return cache[path]
-        raw = self._target_baseline_lines(path)
+        key = (path, qualified)
+        if key in cache:
+            return cache[key]
+        raw = (self.location_handoff.target_content(path).splitlines() if qualified
+               else self._target_baseline_lines(path))
         if raw is None:
-            cache[path] = None
+            cache[key] = None
             return None
         code = [_strip_comments(line) for line in raw]
         analysis = {
@@ -1051,7 +1112,7 @@ class AospBackportAgent(CausalityChecks):
             "normalized": [_normalized_code_line(line) for line in code],
             "occurrences": {},
         }
-        cache[path] = analysis
+        cache[key] = analysis
         return analysis
 
     def _token_occurrences(self, analysis: dict[str, Any], token: str) -> list[int]:
@@ -1073,7 +1134,15 @@ class AospBackportAgent(CausalityChecks):
         claim must find the hunk's added lines in the target. Claims about code
         the target does not contain stay with the tool-UID evidence checks.
         """
-        targets = sorted(self._donor_targets(hunk.get("path", "")))
+        qualified = self.location_handoff is not None
+        regions = []
+        if qualified:
+            regions = [{**region, 'path': f"{key}/{region['path']}"}
+                       for key in self.location_handoff.controller.by_key
+                       for region in self.mapping_plan.targets(key, unit_id=hunk['id'])]
+            targets = sorted({region['path'] for region in regions})
+        else:
+            targets = sorted(self._donor_targets(hunk.get("path", "")))
         if not targets:
             return None
         patch = hunk.get("patch", "")
@@ -1098,15 +1167,15 @@ class AospBackportAgent(CausalityChecks):
                     from .hunk_sites import matches_additions, normalized
                     expected = _changed_diff_lines(patch, added=True)
                     for target in targets:
-                        analysis = self._target_baseline_analysis(target)
+                        analysis = self._target_baseline_analysis(target, qualified=qualified)
                         if analysis is None:
                             continue
                         # With no insertion context, a line elsewhere in the
                         # file is not the requested site. Whole-file identity
                         # or an independently grounded mapping is required.
-                        regions = (self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id'])
-                                   if self.mapping_plan is not None else [])
-                        if any(r['path'] == target and r['action'] == 'edit'
+                        if not qualified and self.mapping_plan is not None:
+                            regions = self.mapping_plan.targets(self.mapping_repository, unit_id=hunk['id'])
+                        if any(r['path'] == target and (qualified or r['action'] == 'edit')
                                and matches_additions(analysis['raw'][r['line_start']-1:r['line_end']], expected)
                                for r in regions):
                             return None
@@ -1129,7 +1198,7 @@ class AospBackportAgent(CausalityChecks):
                        'added': [_normalized_code_line(_strip_comments(line)) for line in b['added']
                                  if _strip_comments(line).strip()]} for b in blocks]
             for target in targets:
-                analysis = self._target_baseline_analysis(target)
+                analysis = self._target_baseline_analysis(target, qualified=qualified)
                 if analysis is None:
                     continue
                 normalized = analysis["normalized"]
@@ -1165,7 +1234,7 @@ class AospBackportAgent(CausalityChecks):
         mechanisms = _claim_mechanism_tokens(claim.get("reason", ""), patch)
         strongest: tuple[int, str] | None = None
         for target in targets:
-            analysis = self._target_baseline_analysis(target)
+            analysis = self._target_baseline_analysis(target, qualified=qualified)
             if analysis is None:
                 continue
             paths = analysis["paths"]
@@ -1254,9 +1323,24 @@ class AospBackportAgent(CausalityChecks):
                               "\nIdentifiers not found in the searched scope: " +
                               ", ".join(e["name"] for e in symbol_report.get("missing", []))
                               ) if symbol_report else None
-        with factory(events_path=self.run_dir / "sdk-events.jsonl", model=self.model,
-                     model_provider=self.model_provider, turn_timeout=self.turn_timeout,
-                     env=OFFLINE_GIT_ENV, read_scope=self.model_scope()) as runtime:
+        handoff = self.location_handoff
+        accepted_impact = None
+        impact_schema = IMPACT_SCHEMA
+        if handoff:
+            from .location_handoff import BACKEND_SCHEMA, EDIT_SCHEMA
+            if handoff.accepted_impact is not None:
+                accepted_impact = self._ground_assessment(handoff.accepted_impact)
+                self.record['backend_impact_reused'] = True
+            impact_schema = EDIT_SCHEMA if accepted_impact else BACKEND_SCHEMA
+        runtime_options = dict(events_path=self.run_dir / "sdk-events.jsonl", model=self.model,
+                               model_provider=self.model_provider, turn_timeout=self.turn_timeout, env=OFFLINE_GIT_ENV)
+        analysis_options = runtime_options
+        if handoff and handoff.budget:
+            analysis_options = {**runtime_options, 'turn_timeout': min(self.turn_timeout, handoff.budget.remaining())}
+        with ExitStack() as runtimes:
+            analysis_runtime = runtimes.enter_context(ExitStack())
+            runtime = analysis_runtime.enter_context(factory(**analysis_options,
+                read_scope=self.model_scope(read_only=bool(handoff))))
             self.record["thread_id"] = runtime.start(str(self.worktree), SYSTEM + context)
             # Diff 预处理：版本拷贝型 donor diff 提取安全修复 hunks +
             # 推断漏洞类别，为影响判断提供定向搜索策略
@@ -1277,22 +1361,37 @@ class AospBackportAgent(CausalityChecks):
                                            symbol_report_text,
                                            vulnerability_class=preprocessed.get("vulnerability_class"),
                                            preprocessed=preprocessed["preprocessed"]) + context
+            if accepted_impact:
+                impact_request = 'Resolve the migration scope using the accepted assessment. Work read-only.\n' + context
+            handoff_instructions = handoff.instructions(reused_impact=bool(accepted_impact)) if handoff else ''
+            impact_request += handoff_instructions
             assessment = None
             for impact_attempt in range(1, max_attempts + 1):
                 result = self._turn(runtime, impact_request, read_only=True,
                                     phase="impact" if impact_attempt == 1 else "impact_correction",
-                                    schema=IMPACT_SCHEMA)
+                                    schema=impact_schema)
                 self.record["impact_report"] = result.get("final_response", "")
                 try:
                     # Prefer the runtime's parsed (possibly tail-repaired) object;
                     # re-parsing the raw text would bypass that repair.
-                    assessment = self._ground_assessment(result.get("output",
-                                                                    result["final_response"]))
+                    response = result.get("output", result["final_response"])
+                    if handoff:
+                        from .mapping_plan import _shape
+                        if isinstance(response, str):
+                            try:
+                                response = json.loads(response)
+                            except ValueError as exc:
+                                raise AssessmentError('backend handoff response must be JSON') from exc
+                        _shape(response, impact_schema)
+                    assessment = accepted_impact or self._ground_assessment(response['impact'] if handoff else response)
                     break
                 except AssessmentError as exc:
                     self._event("impact_evidence_rejected", attempt=impact_attempt, error=str(exc))
                     if impact_attempt == max_attempts:
                         raise
+                    if accepted_impact:
+                        impact_request = ('Correct the scope response: ' + str(exc) + context + handoff_instructions)
+                        continue
                     impact_request = ("Your previous JSON assessment failed deterministic Git evidence "
                                       "grounding with this error:\n" + str(exc) +
                                       "\nRe-read the exact blobs and line ranges. Repair scope_contract and "
@@ -1309,13 +1408,25 @@ class AospBackportAgent(CausalityChecks):
                                       "UNKNOWN only when a material step is genuinely unresolved by available "
                                       "evidence; return NOT_AFFECTED only when the donor-defined faulty data "
                                       "flow is affirmatively absent and cleared by target evidence. "
-                                      "Do not edit files.\n" + context)
+                                      "Do not edit files.\n" + context + handoff_instructions)
             assert assessment is not None
             self.record["assessment"] = assessment
             self.record["impact_decision"] = assessment["status"].lower()
             self.record["model_execution"] = "succeeded"
             self._json("impact.json", assessment)
             self._event("impact_grounded", status=assessment["status"], evidence=len(assessment["evidence"]))
+            if handoff:
+                analysis_runtime.close()
+                migration_scope = handoff.accept(self, assessment, response, impact_only=impact_only)
+                if not migration_scope:
+                    return
+                from .retrieval import suspend_investigation_budget
+                if handoff.budget:
+                    runtimes.enter_context(handoff.budget.phase('MIGRATION'))
+                runtimes.enter_context(suspend_investigation_budget())
+                handoff.activate(migration_scope, verify=verify)
+                runtime = runtimes.enter_context(factory(**runtime_options, read_scope=self.model_scope()))
+                self.record['migration_thread_id'] = runtime.start(str(self.worktree), SYSTEM + context)
             if impact_only:
                 self.record["status"] = assessment["status"]
                 return
@@ -1364,6 +1475,14 @@ class AospBackportAgent(CausalityChecks):
                                     "during the entire hazardous period, including after a pending transition starts. "
                                     "Ground release and alternate cleanup paths.\n"
                                     + json.dumps(contract, ensure_ascii=False))
+            if handoff and handoff.flag_support:
+                base_prompt += ('\nThe controller verified these donor flag cleanups have no target counterpart. '
+                                'Use evidence=no_target_counterpart for the listed units if they require no edit.\n'
+                                + json.dumps(handoff.flag_support, ensure_ascii=False))
+            if handoff and handoff.location_gaps:
+                base_prompt += ('\nWrite a draft for the pinned edit obligations only. Do not guess at these '
+                                'unresolved locations: ' + json.dumps(handoff.location_gaps, ensure_ascii=False))
+                plan = plan[:1]
             obligation_failures = 0
             self.record["attempts"] = []
             self.record.setdefault("attempt_verifications", {})
@@ -1436,6 +1555,11 @@ class AospBackportAgent(CausalityChecks):
                 self.record["attempts"][-1]["turn_id"] = result.get("turn_id")
                 self.record["attempts"][-1]["patch_sha256"] = self.record["patch_sha256"]
                 previous_patch_shas.append(self.record["patch_sha256"])
+                if handoff and handoff.location_gaps and patch.strip():
+                    self.record.update(status='MIGRATION_INCOMPLETE', final_verification={
+                        'status': 'NOT_RUN', 'blocked_by': 'MIGRATION_SCOPE_UNRESOLVED',
+                        'patch_sha256': self.record['patch_sha256'], 'commands': []})
+                    return
                 if not patch.strip():
                     self.record["status"] = "VALIDATION_FAILED"
                     self._event("empty_patch", attempt=attempt,

@@ -106,7 +106,7 @@ class ProjectFirstAgent:
                  build_runner=None, cache_root=None, max_projects=12, max_rounds=3,
                  investigation_seconds=900, max_git_operations=2000, max_model_turns=48,
                  project_hints=None, read_budget=None, max_output_bytes=256 * 1024 * 1024,
-                 resumed_assessment=None):
+                 resumed_assessment=None, locate_first=False):
         self.patch = patch if isinstance(patch, bytes) else Path(patch).read_bytes()
         self.units = diff_units(self.patch.decode())
         self.target_root = Path(target_root).resolve()
@@ -137,7 +137,8 @@ class ProjectFirstAgent:
         self.source_sequence = source_sequence
         self.options = dict(model=model, mapping_model=mapping_model, model_provider=model_provider,
                             turn_timeout=turn_timeout, runtime_factory=self.factory, validation=validation,
-                            joint_validation=joint_validation, auto_validation=auto_validation, build_runner=build_runner)
+                            joint_validation=joint_validation, auto_validation=auto_validation, build_runner=build_runner,
+                            locate_first=locate_first)
         cache_path = Path(cache_root).resolve() if cache_root else self.run_dir.parent / '.object-cache'
         if cache_path.is_relative_to(self.target_root) or cache_path.is_relative_to(self.run_dir):
             raise ValueError('shared object cache must be outside source and task workspaces')
@@ -204,6 +205,14 @@ class ProjectFirstAgent:
 
     def _merge_round_impact(self, result, round_path):
         self.record['stage'] = result.get('stage', self.record['stage'])
+        if 'frontend_workflow' in result:
+            self.record['frontend_workflow'] = result['frontend_workflow']
+        if 'location_handoff' in result:
+            self.record['location_handoff'] = {**result['location_handoff'], 'round_record': str(round_path)}
+        if result.get('status') == 'MIGRATION_INCOMPLETE' and result.get('patches') and result.get('migration_scope_error'):
+            self.record.setdefault('draft_candidates', []).append({
+                'round_record': str(round_path), 'patches': result['patches'],
+                'location_gaps': result['migration_scope_error']})
         if result.get('grounded_mapping'):
             self.record['grounded_mapping'] = {**result['grounded_mapping'], 'round_record': str(round_path)}
         previous = self.record['impact_analysis']
@@ -331,6 +340,7 @@ class ProjectFirstAgent:
             with self.budget.active(), self.budget.phase('ROUTING'):
                 self._prepare()
                 feedback, assessment_seed, obligation_remaps = None, None, 0
+                location_feedback = location_seed = backend_impact_seed = None
                 revalidate_seed = seed_pending_proof = False
                 if self.resumed_assessment is not None and not inspect_only:
                     keys = list(self.resumed_assessment['targets'])
@@ -338,8 +348,11 @@ class ProjectFirstAgent:
                     if {key: self.catalog.pin(key)['head'] for key in keys} != self.resumed_assessment['targets']:
                         raise RecoveryBlocked('accepted assessment target pins changed before resumption')
                     plan = {'summary': 'Resume from a checked assessment on the same pinned projects', 'projects': keys}
-                    assessment_seed = self.resumed_assessment['assessment']
+                    assessment_seed = self.resumed_assessment.get('assessment')
                     feedback = self.resumed_assessment['feedback']
+                    location_seed = self.resumed_assessment.get('location')
+                    location_feedback = (feedback or None) if location_seed else None
+                    backend_impact_seed = self.resumed_assessment.get('backend_impact')
                     revalidate_seed = self.resumed_assessment['revalidate']
                     seed_pending_proof = self.resumed_assessment.get('pending_proof', False)
                 elif self.explicit_keys is not None:
@@ -405,6 +418,8 @@ class ProjectFirstAgent:
                             source_sequence=self.source_sequence, _source_lease=_source_lease,
                             exclusion_corrections=self.exclusion_corrections, assessment_seed=assessment_seed,
                             revalidate_assessment_seed=revalidate_seed, seed_pending_proof=seed_pending_proof,
+                            location_feedback=location_feedback, location_seed=location_seed,
+                            backend_impact_seed=backend_impact_seed,
                             **self.donor_options, **self.options)
                         self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
                         try:
@@ -436,6 +451,15 @@ class ProjectFirstAgent:
                     feedback = {k: result[k] for k in ('status', 'replan_required', 'scope_evidence', 'backend_conflicts',
                                 'causal_evidence', 'coverage_error', 'coverage_blockers', 'repository_errors',
                                 'verification', 'joint_verification', 'migration_scope_error') if k in result}
+                    location_seed = controller.grounded_location if self.options['locate_first'] else None
+                    location_feedback = ({**feedback, 'scope_requests': requests} if location_seed else None)
+                    backend_impact_seed = None
+                    confirmed = result.get('impact_analysis', {})
+                    if location_seed and confirmed.get('origin') == 'backend' and confirmed['decision'] == 'AFFECTED':
+                        path = controller.run_dir / confirmed['assessment_file']
+                        if hashlib.sha256(path.read_bytes()).hexdigest() != confirmed['assessment_sha256']:
+                            raise RecoveryBlocked('backend impact changed after grounding')
+                        backend_impact_seed = {'targets': confirmed['targets'], 'assessment': json.loads(path.read_text())}
                     assessment_seed = None
                     revalidate_seed = seed_pending_proof = False
                     if (not requests and (result.get('coverage_blockers')

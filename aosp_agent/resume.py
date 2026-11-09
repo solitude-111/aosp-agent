@@ -67,6 +67,8 @@ def checked_json(path, digest):
 
 
 def _accepted_assessment(root, record):
+    if record.get('frontend_workflow', {}).get('mode') == 'location_handoff':
+        return _accepted_location(root, record)
     impact = record.get('impact_analysis', {})
     confirmed = impact.get('status') == 'CONFIRMED' and impact.get('decision') == 'AFFECTED'
     pending = not confirmed and impact.get('status') not in ('CONFIRMED', 'CONFLICT')
@@ -110,6 +112,44 @@ def _accepted_assessment(root, record):
                            or feedback.get('scope_evidence', {}).get('status') == 'OPEN_QUESTIONS'))
     return {'targets': targets, 'assessment': assessment, 'feedback': feedback,
             'revalidate': revalidate, 'pending_proof': pending}
+
+
+def _accepted_location(root, record):
+    from .assessment_repair import MAX_REUSABLE_ASSESSMENT_BYTES
+    location = record.get('location_handoff', {})
+    targets = location.get('targets', {})
+    pins = record.get('pinned_targets', {})
+    if (location.get('status') != 'READY' or not targets
+            or set(targets) != set(record.get('selected_projects', []))
+            or any(pins.get(key, {}).get('head') != head for key, head in targets.items())):
+        return None
+
+    def artifact(field, checkpoint, name, digest):
+        round_path = Path(checkpoint['round_record']).resolve()
+        if not round_path.is_relative_to(root / 'rounds') or round_path.name != 'run.json':
+            raise RecoveryBlocked('handoff receipt round is outside the stopped task')
+        row = json.loads(round_path.read_text())
+        if (row.get('input_patch_sha256') != record['input_patch_sha256']
+                or row.get(field) != {k: v for k, v in checkpoint.items() if k != 'round_record'}):
+            raise RecoveryBlocked('handoff receipt does not match the stopped task')
+        path = round_path.parent / name
+        if path.is_symlink() or not path.resolve().is_relative_to(round_path.parent):
+            raise RecoveryBlocked('handoff artifact escapes its round')
+        return checked_json(path, digest) if path.stat().st_size <= MAX_REUSABLE_ASSESSMENT_BYTES else None
+
+    raw = artifact('location_handoff', location, 'grounded-location.json', location['sha256'])
+    if raw is None:
+        return None
+    impact = record.get('impact_analysis', {})
+    backend = None
+    if (impact.get('origin') == 'backend' and impact.get('status') == 'CONFIRMED'
+            and impact.get('decision') == 'AFFECTED' and impact.get('targets') == targets):
+        saved = artifact('impact_analysis', impact, impact['assessment_file'], impact['assessment_sha256'])
+        if saved is not None:
+            backend = {'targets': targets, 'assessment': saved}
+    feedback = {key: record[key] for key in ('coverage_blockers', 'migration_scope_error') if record.get(key)}
+    return {'targets': targets, 'location': raw, 'backend_impact': backend, 'feedback': feedback,
+            'revalidate': False}
 
 
 def verify_stopped_sources(root):

@@ -7,37 +7,46 @@ from .lifecycle import operation_lease, RecoveryBlocked
 from .retrieval import BudgetExceeded
 
 
-def run_backends(controller, assessment, *, verify, max_attempts, impact_only, mechanical):
+def configure_child(controller, key, child):
+    # Donor identity was checked against the complete input patch before any
+    # model call. Keep the original engine's blob grounding and history tools.
+    child.input_diff = None
+    child.donor_repo = Path(controller.donor['donor_git'])
+    child.donor_root = child.donor_repo.parent
+    child.commit_message = controller.donor.get('commit_message', '')
+    child.runtime_factory = controller.factory
+    child.model_provider, child.turn_timeout = controller.provider, controller.timeout
+    child.record.update(donor_git=str(child.donor_repo),
+                        commit_message=child.commit_message,
+                        mapping_plan_sha256=controller.mapping_plan.sha256)
+    child._write_record()
+    _write_wrappers(child.run_dir)
+    # Audit the immutable plan and other repositories after every backend
+    # model turn, not just after the complete per-repository run.
+    original_turn = child._turn
+    def audited_turn(*args, _original=original_turn, _key=key, **kwargs):
+        before = controller._candidate_hashes(except_key=_key)
+        try:
+            return _original(*args, **kwargs)
+        finally:
+            controller._audit_peers(_key, before)
+    child._turn = audited_turn
+
+
+def run_backends(controller, assessment, *, verify, max_attempts, impact_only, mechanical, handoff=None):
     patches, verification, statuses = {}, {}, {}
     for key, child in controller.children.items():
-        if not child.case.files:
-            continue
-        targets = controller.mapping_plan.targets(key)
-        child.selected_hunk_ids = {t['unit_id'] for t in targets
-                                   if t['status'] == 'AFFECTED' and t['action'] == 'edit'}
-        # Donor identity was checked against the complete input patch before any
-        # model call. Keep the original engine's blob grounding and history tools.
-        child.input_diff = None
-        child.donor_repo = Path(controller.donor['donor_git'])
-        child.donor_root = child.donor_repo.parent
-        child.commit_message = controller.donor.get('commit_message', '')
-        child.runtime_factory = controller.factory
-        child.model_provider, child.turn_timeout = controller.provider, controller.timeout
-        child.record.update(donor_git=str(child.donor_repo),
-                            commit_message=child.commit_message,
-                            mapping_plan_sha256=controller.mapping_plan.sha256)
-        child._write_record()
-        _write_wrappers(child.run_dir)
-        # Audit the immutable plan and other repositories after every backend
-        # model turn, not just after the complete per-repository run.
-        original_turn = child._turn
-        def audited_turn(*args, _original=original_turn, _key=key, **kwargs):
-            before = controller._candidate_hashes(except_key=_key)
-            try:
-                return _original(*args, **kwargs)
-            finally:
-                controller._audit_peers(_key, before)
-        child._turn = audited_turn
+        if handoff:
+            if key != handoff.primary:
+                continue
+            child.location_handoff = handoff
+        else:
+            if not child.case.files:
+                continue
+            targets = controller.mapping_plan.targets(key)
+            child.selected_hunk_ids = {t['unit_id'] for t in targets
+                                       if t['status'] == 'AFFECTED' and t['action'] == 'edit'}
+        configure_child(controller, key, child)
         peers = controller._candidate_hashes(except_key=key)
         try:
             result = child.run(verify=verify, max_attempts=max_attempts,
@@ -52,15 +61,21 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
                 raise
             controller._audit_peers(key, peers)
             statuses[key] = 'FAILED'
-            controller.record.setdefault('repository_errors', {})[key] = {
+            error = controller.record.setdefault('repository_errors', {})[key] = {
                 'type': type(exc).__name__, 'message': re.sub(r'sk-[A-Za-z0-9_-]{16,}', '[REDACTED]', str(exc))}
-            if isinstance(exc, BudgetExceeded):
+            timeout = handoff and getattr(exc, 'kind', None) == 'TIMEOUT'
+            if isinstance(exc, BudgetExceeded) or timeout:
                 controller.record.setdefault('budget_interruption', {
-                    'stage': controller.record['stage'], 'repository': key, 'reason': str(exc)})
+                    'stage': controller.record['stage'], 'repository': key,
+                    'reason': 'MODEL_TIMEOUT' if timeout else str(exc)})
+                if handoff:
+                    statuses[key] = 'INCONCLUSIVE'
+                    error['kind'] = 'MODEL_TIMEOUT' if timeout else 'BUDGET_EXHAUSTED'
+                    controller.record['completion_blocked_by'] = error['kind']
             continue
         controller._audit_peers(key, peers)
         statuses[key] = result['status']
-        if result['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED'):
+        if not handoff and result['status'] in ('NOT_AFFECTED', 'ALREADY_FIXED'):
             # Mapping already established edit obligations. A backend cannot
             # silently replace that conclusion with an unreviewed exclusion.
             controller.record.setdefault('backend_conflicts', {})[key] = {
@@ -93,14 +108,17 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
                         blockers.append({'unit_id': claim['id'], 'path': f"{key}/{mapping['path']}",
                             'line_start': mapping['line_start'], 'line_end': mapping['line_end'],
                             'symbol': mapping['symbol'], 'error': (region.get('error') or 'unresolved coverage')[:500]})
+    if handoff and handoff.migration is not None:
+        assessment = handoff.migration
     controller.record.update(patches=patches, verification=verification,
                              repository_statuses=statuses, execution_path='mapping_then_run_backend')
     ledger = []
     for unit in assessment['units']:
         expected = {controller._owner(t['path'])[0].key for t in unit['targets']
                     if unit['status'] == 'AFFECTED' and t['action'] == 'edit'}
+        checked = {handoff.primary} if handoff else expected
         claims = {key: next((c for c in controller.children[key].record.get('hunk_results', [])
-                            if c['id'] == unit['id']), None) for key in expected}
+                            if c['id'] == unit['id']), None) for key in checked}
         ledger.append({'id': unit['id'], 'mapping_status': unit['status'],
                        'expected_repositories': sorted(expected), 'backend_claims': claims,
                        'assessment_evidence': unit['evidence']})
@@ -110,9 +128,11 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
         status = 'FAILED'
     elif 'VALIDATION_FAILED' in outcomes:
         status = 'VALIDATION_FAILED'
+    elif handoff and 'MIGRATION_INCOMPLETE' in outcomes:
+        status = 'MIGRATION_INCOMPLETE'
     elif 'INCONCLUSIVE' in outcomes:
         status = 'INCONCLUSIVE'
-    elif impact_only:
+    elif impact_only and (not handoff or outcomes == {'AFFECTED'}):
         status = 'AFFECTED' if 'AFFECTED' in outcomes else 'INCONCLUSIVE'
     elif len(statuses) > 1:
         # Per-repository checks do not establish that the combined patch builds.
@@ -139,8 +159,13 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
     from .diff_engine import _write
     _write(controller.run_dir / 'patch-bundle.json', patches)
     _write(controller.run_dir / 'hunk-ledger.json', ledger)
-    if not impact_only:
+    if not impact_only and (not handoff or handoff.migration is not None):
         from .joint_validation import finish_joint
-        finish_joint(controller, verify=verify, assessment=assessment, max_attempts=max_attempts)
+        if handoff:
+            from .retrieval import suspend_investigation_budget
+            with suspend_investigation_budget():
+                finish_joint(controller, verify=verify, assessment=assessment, max_attempts=max_attempts)
+        else:
+            finish_joint(controller, verify=verify, assessment=assessment, max_attempts=max_attempts)
     controller._save()
     return controller.record

@@ -138,6 +138,34 @@ def check_impact_proofs(controller, assessment, required=False, *, closed_units=
         raise ImpactProofError(str(exc)) from exc
 
 
+def ground_repair_contract(controller, mapped, obligations, rows, pointer):
+    if len(rows) != len(obligations) or {r['id'] for r in rows} != set(obligations):
+        raise RepairContractError(f'{pointer} must cover every required upstream behavior exactly once: '
+                                  f'{list(obligations)}')
+    contract = []
+    for index, row in enumerate(rows):
+        origin = obligations[row['id']]
+        targets = mapped[origin['unit_id']]['targets']
+        indices = row['target_indices']
+        field = f'{pointer}/{index}'
+        if not indices or len(indices) != len(set(indices)) or any(not 1 <= i <= len(targets) for i in indices):
+            raise RepairContractError(field + ': target_indices must select grounded unit targets')
+        selected = [targets[i - 1] for i in indices]
+        edits = [t for t in selected if t['action'] == 'edit']
+        if row['disposition'] == 'edit':
+            if not any(t['relationship'] not in ('test', 'data_or_configuration') for t in edits):
+                raise RepairContractError(field + ': behavior requires a production edit mapping')
+        elif edits or not any(t['relationship'] not in ('test', 'data_or_configuration') for t in selected):
+            raise RepairContractError(field + ': existing protection needs read-only production mappings')
+        owners = {controller._owner(t['path'])[0].key for t in edits}
+        if len(owners) > 1:
+            raise RepairContractError(field + ': a single guarded behavior spanning multiple write projects '
+                                      'requires bundle-level coverage support')
+        contract.append({**origin, 'disposition': row['disposition'], 'reason': row['reason'],
+                         'targets': selected, 'write_repository': next(iter(owners), None)})
+    return contract
+
+
 def _check(controller, assessment, required, closed_units):
     groups = assessment.get('proof_groups') or []
     if not groups and not required:
@@ -257,31 +285,9 @@ def _check(controller, assessment, required, closed_units):
             continue
         obligations = {row['id']: row for row in getattr(controller, 'guarded_obligations', ())
                        if row['unit_id'] in members and proof['status'] == 'AFFECTED'}
-        rows = group.get('repair_obligations', [])
-        if len(rows) != len(obligations) or {r['id'] for r in rows} != set(obligations):
-            raise RepairContractError(f'/proof_groups/{group_index}/repair_obligations must cover every '
-                                   f'required upstream behavior exactly once: {list(obligations)}')
-        repair_contract = []
-        for row_index, row in enumerate(rows):
-            origin = obligations[row['id']]
-            targets = mapped[origin['unit_id']]['targets']
-            indices = row['target_indices']
-            pointer = f'/proof_groups/{group_index}/repair_obligations/{row_index}'
-            if not indices or len(indices) != len(set(indices)) or any(not 1 <= i <= len(targets) for i in indices):
-                raise RepairContractError(pointer + ': target_indices must select grounded unit targets')
-            selected = [targets[i - 1] for i in indices]
-            edits = [t for t in selected if t['action'] == 'edit']
-            if row['disposition'] == 'edit':
-                if not any(t['relationship'] not in ('test', 'data_or_configuration') for t in edits):
-                    raise RepairContractError(pointer + ': behavior requires a production edit mapping')
-            elif edits or not any(t['relationship'] not in ('test', 'data_or_configuration') for t in selected):
-                raise RepairContractError(pointer + ': existing protection needs read-only production mappings')
-            owners = {controller._owner(t['path'])[0].key for t in edits}
-            if len(owners) > 1:
-                raise RepairContractError(pointer + ': a single guarded behavior spanning multiple write projects '
-                                       'requires bundle-level coverage support')
-            repair_contract.append({**origin, 'disposition': row['disposition'], 'reason': row['reason'],
-                                    'targets': selected, 'write_repository': next(iter(owners), None)})
+        repair_contract = ground_repair_contract(controller, mapped, obligations,
+                                                 group.get('repair_obligations', []),
+                                                 f'/proof_groups/{group_index}/repair_obligations')
         if repair_contract:
             proof_receipt['repair_obligations'] = repair_contract
     if any(group.get('repair_obligations') for group in receipts):

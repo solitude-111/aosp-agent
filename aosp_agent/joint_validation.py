@@ -57,6 +57,9 @@ def prepare_joint(controller, deferred):
 
 def candidate_bundle(controller):
     entries, dependencies = [], []
+    if controller.record.get('frontend_workflow', {}).get('mode') == 'location_handoff':
+        dependencies = [{'key': key, 'target_repo': str(repo.root), 'target_commit': repo.head}
+                        for key, repo in sorted(controller.by_key.items()) if key not in controller.children]
     for key, child in sorted(controller.children.items()):
         if not child.case.files:
             dependencies.append({'key': key, 'target_repo': str(child.repo),

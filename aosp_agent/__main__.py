@@ -55,6 +55,8 @@ def _main() -> int:
     scope_options(diff)
     diff.add_argument('--target-revision', help='versioned repo manifest tag/commit; never falls back to checkout HEAD')
     diff.add_argument("--inspect-only", action="store_true")
+    diff.add_argument('--locate-first', action='store_true',
+                      help='hand off grounded locations to the existing backend for impact assessment')
     diff.add_argument("--model", default=None,
                       help="model id; default falls back to ~/.codex/config.toml (GLM via ZAI provider)")
     diff.add_argument("--model-provider")
@@ -109,6 +111,8 @@ def _main() -> int:
     batch.add_argument('--turn-timeout', type=float, default=900)
     batch.add_argument('--max-attempts', type=int, default=3)
     batch.add_argument('--inspect-only', action='store_true')
+    batch.add_argument('--locate-first', action='store_true',
+                       help='use the same location handoff as diff')
     batch.add_argument('--impact-only', action='store_true')
     batch.add_argument('--verify', action='store_true')
     batch.add_argument('--no-auto-validation', action='store_true')
@@ -190,6 +194,7 @@ def _main() -> int:
             runner = RuntimeBatch(args.input, args.target_root, args.run_root, args.donor_root,
                 donor_map=json.loads(args.donor_map.read_text()) if args.donor_map else None,
                 agent_options={**routing_options(args), 'model': args.model, 'mapping_model': args.mapping_model,
+                    'locate_first': args.locate_first,
                     'model_provider': args.model_provider, 'turn_timeout': args.turn_timeout,
                     'auto_validation': not args.no_auto_validation, 'build_runner': args.build_runner,
                     'validation': json.loads(args.validation.read_text()) if args.validation else None,
@@ -209,11 +214,11 @@ def _main() -> int:
         from .project_first import ProjectFirstAgent
         agent = None
         try:
-            if args.exhaustive_discovery and args.target_revision:
-                raise ValueError('--target-revision requires project-first routing')
+            if args.exhaustive_discovery and (args.target_revision or args.locate_first):
+                raise ValueError('--target-revision and --locate-first require project-first routing')
             controller = DiffBackportAgent if args.exhaustive_discovery else ProjectFirstAgent
             options = ({'max_output_bytes': args.max_output_bytes} if args.exhaustive_discovery else
-                       {**routing_options(args), 'target_revision': args.target_revision})
+                       {**routing_options(args), 'target_revision': args.target_revision, 'locate_first': args.locate_first})
             agent = controller(args.patch, args.target_root, args.run_root, model=args.model,
                 model_provider=args.model_provider, turn_timeout=args.turn_timeout,
                 validation=json.loads(args.validation.read_text()) if args.validation else None,
