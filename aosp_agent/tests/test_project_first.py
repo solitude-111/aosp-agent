@@ -282,6 +282,31 @@ class ProjectFirstTest(unittest.TestCase):
             self.assertEqual(result['completion_blocked_by'], 'REPLANNING_BUDGET_EXHAUSTED')
             self.assertEqual(result['impact_analysis']['status'], 'EVIDENCE_INSUFFICIENT')
 
+    def test_open_migration_questions_keep_grounded_mapping_and_specific_proof_error(self):
+        from aosp_agent.assessment_repair import digest
+        with GitFixture() as fx:
+            prior = self.assessment()
+            scope = prior['scope_closure']['units'][0]
+            scope['migration_questions'] = ['Which test target covers the change?']
+            proof = prior['proof_groups'][0]['impact']['causal_chain']
+            harm = proof['target_harm_evidence']
+            proof['target_harm_evidence'] = [999]
+            repair = {'base_sha256': digest(prior), 'replacements': [
+                {'path': '/proof_groups/0/impact/causal_chain/target_harm_evidence',
+                 'value_json': json.dumps(harm)},
+                {'path': '/scope_closure/units/0/migration_questions', 'value_json': '[]'}]}
+            runtime = QueueRuntime([(prior, None), (repair, None)])
+            agent = ProjectFirstAgent(self.source(), fx.source_root, fx.run_root, catalog=self.catalog(fx),
+                repository_keys=['repo'], runtime_factory=runtime.factory, max_rounds=2, auto_validation=False)
+            result = agent.run(impact_only=True, max_attempts=1)
+            first = json.loads((agent.run_dir / 'rounds/r01/run.json').read_text())
+            self.assertEqual(first['impact_decision'], 'UNKNOWN')
+            self.assertIn('target_harm_evidence contains an invalid evidence index',
+                          first['grounded_mapping']['proof_error'])
+            self.assertIn(first['grounded_mapping']['proof_error'], runtime.calls[-1]['prompt'])
+            self.assertIn(digest(prior), runtime.calls[-1]['prompt'])
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
+
     def test_confirmed_causal_path_does_not_wait_for_migration_scope(self):
         with GitFixture() as fx:
             assessment = self.assessment()

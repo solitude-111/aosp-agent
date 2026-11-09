@@ -313,7 +313,7 @@ class DiffBackportAgent:
             'file': attempt_path.name, 'sha256': self.protected[attempt_path],
             'targets': {repo.key: repo.head for repo in self.repos}, 'proof_error': str(error)}
 
-    def _independent_affected_proof(self, assessment):
+    def _independent_affected_proof(self, assessment, *, proof_errors=None):
         from .mapped_impact import check_impact_proofs
         from .scope_evidence import check_scope
         closure = assessment.get('scope_closure', {}).get('units', [])
@@ -334,8 +334,9 @@ class DiffBackportAgent:
                 evidence = check_impact_proofs(self, assessment, True, closed_units=units)
                 if evidence['groups']:
                     return evidence
-            except AssessmentError:
-                continue
+            except AssessmentError as exc:
+                if proof_errors is not None:
+                    proof_errors.append(f"{group['id']}: {exc}")
         return None
 
     def _block_migration(self, assessment, raw, evidence, reason):
@@ -668,7 +669,8 @@ class DiffBackportAgent:
                             return self._block_migration(assessment, raw, evidence, str(exc))
                         self.record['scope_evidence'] = scope
                         if scope['status'] in ('EXPANSION_REQUIRED', 'OPEN_QUESTIONS'):
-                            evidence = (self._independent_affected_proof(assessment)
+                            proof_errors = []
+                            evidence = (self._independent_affected_proof(assessment, proof_errors=proof_errors)
                                         if 'unresolved_questions' in scope else None)
                             decision = 'AFFECTED' if evidence else 'UNKNOWN'
                             if evidence:
@@ -679,6 +681,11 @@ class DiffBackportAgent:
                             if decision == 'AFFECTED':
                                 self.record['completion_blocked_by'] = 'MIGRATION_SCOPE_UNRESOLVED'
                                 self.replan_assessment = raw
+                            elif scope['status'] == 'OPEN_QUESTIONS' and not scope['unresolved_questions']:
+                                reason = '\n'.join(proof_errors) or 'Complete the causal proof using the grounded scope.'
+                                self._remember_mapping_for_proof_repair(raw, attempt_path, reason)
+                                self.record['completion_blocked_by'] = 'CAUSAL_EVIDENCE_UNRESOLVED'
+                                self.record['causal_evidence'] = {'status': 'UNRESOLVED', 'reason': reason}
                             self._save()
                             return self.record
                         try:
