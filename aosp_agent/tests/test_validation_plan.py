@@ -74,7 +74,14 @@ class ValidationPlanTest(unittest.TestCase):
                 self.assertEqual(result['modules'][0]['role'], 'test')
                 if production:
                     self.assertEqual(result['unresolved_consumers'][0]['module'], 'production')
-                self.assertEqual(make_plan(repo, [], {}, ['A.java'], '', build_runner='/trusted/build')['checks'], [])
+                checks = make_plan(repo, [], {}, ['A.java'], '', build_runner='/trusted/build')['checks']
+                if production:
+                    self.assertEqual(checks[0]['coverage'], 'partial')
+                    command = {**checks[0], 'returncode': 0, 'covers': ['repo'],
+                               'build_receipt_verified': True}
+                    self.assertFalse(validation_policy([command], ['repo'], expected_checks=1)['satisfied'])
+                else:
+                    self.assertEqual(checks, [])
 
     def test_unresolved_possible_consumer_cannot_be_hidden_by_resolved_one(self):
         repo = Blobs({'Android.bp': 'java_library {name: "simple", srcs: ["A.java"]}\n'

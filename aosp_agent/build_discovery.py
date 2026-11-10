@@ -47,24 +47,31 @@ def discover_build(repo, paths, limit=2000):
         if not isinstance(items, list) or not all(isinstance(s, str) for s in items):
             raise ValueError('non-literal ' + field)
         return items
-    def owns(module, path, seen):
+    def default_sources(name, seen, allow_conditions):
+        candidates = by_name.get(name, [])
+        if name in seen or len(candidates) != 1:
+            raise ValueError('cyclic or unresolved defaults: ' + name)
+        props = candidates[0]['properties']
+        if any(key in props for key in ('exclude_srcs', 'enabled', 'manifest')):
+            raise ValueError('source-bearing or conditional defaults: ' + name)
+        if not allow_conditions and any(conditional_sources(props[key]) for key in CONDITIONAL.intersection(props)):
+            raise ValueError('conditional source configuration: ' + name)
+        sources = list(literals(props, 'srcs'))
+        for inherited in literals(props, 'defaults'):
+            sources.extend(default_sources(inherited, seen | {name}, allow_conditions))
+        return sources
+
+    def owns(module, path, seen, *, allow_conditions=False):
         name, p = module['name'], module['properties']
         if name in seen or len(by_name[name]) != 1:
             raise ValueError('cyclic or ambiguous module: ' + name)
-        if any(conditional_sources(p[key]) for key in CONDITIONAL.intersection(p)):
+        if not allow_conditions and any(conditional_sources(p[key]) for key in CONDITIONAL.intersection(p)):
             raise ValueError('conditional source configuration: ' + name)
         if p.get('enabled', True) is not True:
             return False
-        default_sources = []
+        inherited_sources = []
         for default in literals(p, 'defaults'):
-            candidates = by_name.get(default, [])
-            if len(candidates) != 1:
-                raise ValueError('unresolved defaults: ' + default)
-            props = candidates[0]['properties']
-            if (any(k in props for k in ('exclude_srcs', 'defaults', 'enabled', 'manifest'))
-                    or any(conditional_sources(props[key]) for key in CONDITIONAL.intersection(props))):
-                raise ValueError('source-bearing or conditional defaults: ' + default)
-            default_sources.extend(literals(props, 'srcs'))
+            inherited_sources.extend(default_sources(default, seen | {name}, allow_conditions))
         directory = str(PurePosixPath(module['path']).parent)
         relative = path if directory == '.' else path.removeprefix(directory + '/')
         inside = directory == '.' or relative != path
@@ -75,12 +82,12 @@ def discover_build(repo, paths, limit=2000):
             groups = by_name.get(source[1:], [])
             if len(groups) != 1 or groups[0]['kind'] != 'filegroup':
                 raise ValueError('unresolved filegroup: ' + source)
-            return owns(groups[0], path, seen | {name})
+            return owns(groups[0], path, seen | {name}, allow_conditions=allow_conditions)
 
         if any(matches(source) for source in literals(p, 'exclude_srcs')):
             return False
         found, unresolved_source = False, None
-        sources = literals(p, 'srcs') + default_sources
+        sources = literals(p, 'srcs') + inherited_sources
         if module['kind'] in ('android_app', 'android_test', 'android_library'):
             manifest = p.get('manifest', 'AndroidManifest.xml')
             if not isinstance(manifest, str):
@@ -156,20 +163,30 @@ def discover_build(repo, paths, limit=2000):
                 continue
             if module['kind'] not in BUILDABLE or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', module['name']):
                 raise ValueError('unsupported consumer kind or module name: ' + module['kind'])
-            matched = []
+            matched, conditional_paths = [], set()
             for path in paths:
                 try:
                     if owns(module, path, set()):
                         matched.append(path)
                 except ValueError as exc:
                     report_issue(module, exc)
+                    # A partial build can ask Soong to evaluate this variant.
+                    # Keep its literal edge outside confirmed production coverage.
+                    if str(exc).startswith('conditional source configuration:'):
+                        try:
+                            if owns(module, path, set(), allow_conditions=True):
+                                matched.append(path)
+                                conditional_paths.add(path)
+                        except ValueError as source_error:
+                            report_issue(module, source_error)
             if matched:
                 targets.append({'name': module['name'], 'build_file': module['path'],
                                 'kind': module['kind'], 'sources': sorted(matched),
+                                **({'conditional_sources': sorted(conditional_paths)} if conditional_paths else {}),
                                 'role': 'test' if module['kind'] in TEST_MODULES else 'production'})
                 covered.update(matched)
                 if module['kind'] not in TEST_MODULES:
-                    production_covered.update(matched)
+                    production_covered.update(set(matched) - conditional_paths)
         except ValueError as exc:
             report_issue(module, exc)
     return {'status': 'RESOLVED' if paths and production_covered == set(paths) and not unresolved else 'UNRESOLVED',
