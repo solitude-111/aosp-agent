@@ -17,6 +17,28 @@ class Blobs:
 
 
 class ValidationPlanTest(unittest.TestCase):
+    def test_default_sources_and_link_conditions_preserve_direct_source_ownership(self):
+        repo = Blobs({
+            'Android.bp': 'cc_defaults {name: "base", srcs: ["Helper.cpp"], target: {vendor: {shared_libs: ["other"]}}}',
+            'app/Android.bp': 'cc_binary {name: "app", defaults: ["base"], srcs: ["main.cpp"], arch: {arm64: {cflags: ["-DARM"]}}}',
+        })
+        for path in ('app/main.cpp', 'app/Helper.cpp'):
+            with self.subTest(path=path):
+                plan = make_plan(repo, [], {}, [path], '', build_runner='/trusted/build')
+                self.assertEqual(plan['checks'][0]['argv'], ['/trusted/build', 'app'])
+        repo.files['app/Android.bp'] = repo.files['app/Android.bp'].replace('cflags: ["-DARM"]', 'exclude_srcs: ["main.cpp"]')
+        self.assertEqual(discover_build(repo, ['app/main.cpp'])['status'], 'UNRESOLVED')
+
+    def test_app_manifest_and_production_plus_test_sources_generate_complete_command(self):
+        repo = Blobs({'Android.bp': 'android_app {name: "app", srcs: ["A.java", ":generated"]}\n'
+                      'cc_test {name: "unit_test", srcs: ["test.cpp"]}\n'
+                      'genrule {name: "generated", out: ["Generated.java"]}\n'
+                      'custom_consumer {name: "unresolved", srcs: [":external"]}'})
+        plan = make_plan(repo, [], {}, ['AndroidManifest.xml', 'A.java', 'test.cpp'], '', build_runner='/trusted/build')
+        self.assertEqual(plan['checks'][0]['argv'], ['/trusted/build', 'app', 'unit_test'])
+        self.assertEqual(plan['checks'][0]['coverage'], 'partial')
+        self.assertEqual(plan['build']['uncovered'], [])
+
     def test_known_source_with_other_unresolved_consumers_can_compile_without_delivery_credit(self):
         repo = Blobs({
             'Android.bp': '''
@@ -102,7 +124,7 @@ class ValidationPlanTest(unittest.TestCase):
         inputs = [
             'java_library {name: "client", srcs: shared_sources + ["A.java"]}',
             'java_library {name: "client", srcs: ["A.java"], arch: {arm64: {srcs: ["B.java"]}}}',
-            'java_defaults {name: "base", srcs: ["A.java"]}\njava_library {name: "client", defaults: ["base"]}',
+            'java_defaults {name: "base", exclude_srcs: ["A.java"]}\njava_library {name: "client", defaults: ["base"], srcs: ["A.java"]}',
             'java_library {name: "client", srcs: ["A.java"]}\njava_library {name: "client", srcs: ["A.java"]}',
             'filegroup {name: "a", srcs: [":b"]}\nfilegroup {name: "b", srcs: [":a"]}\njava_library {name: "client", srcs: [":a"]}',
             'java_library {name: "client", srcs: ["A.java"], exclude_srcs: [":excluded"]}',

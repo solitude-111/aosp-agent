@@ -16,6 +16,13 @@ BUILDABLE = {'java_library', 'java_library_static', 'java_library_host', 'java_t
              'cc_library_shared', 'cc_binary', 'cc_test', 'rust_library', 'rust_binary'}
 TEST_MODULES = {'java_test', 'java_test_host', 'android_test', 'cc_test'}
 CONDITIONAL = {'arch', 'target', 'product_variables', 'soong_config_variables'}
+SOURCE_PROPERTIES = {'srcs', 'exclude_srcs', 'defaults', 'enabled', 'manifest'}
+
+
+def conditional_sources(properties):
+    """Ignore compile/link flags only when no branch changes source membership."""
+    return not isinstance(properties, dict) or bool(SOURCE_PROPERTIES.intersection(properties) or any(
+        conditional_sources(value) for value in properties.values() if isinstance(value, dict)))
 
 
 def parse_modules(text, path):
@@ -44,17 +51,20 @@ def discover_build(repo, paths, limit=2000):
         name, p = module['name'], module['properties']
         if name in seen or len(by_name[name]) != 1:
             raise ValueError('cyclic or ambiguous module: ' + name)
-        if CONDITIONAL.intersection(p):
+        if any(conditional_sources(p[key]) for key in CONDITIONAL.intersection(p)):
             raise ValueError('conditional source configuration: ' + name)
         if p.get('enabled', True) is not True:
             return False
+        default_sources = []
         for default in literals(p, 'defaults'):
             candidates = by_name.get(default, [])
             if len(candidates) != 1:
                 raise ValueError('unresolved defaults: ' + default)
             props = candidates[0]['properties']
-            if any(k in props for k in ('srcs', 'exclude_srcs', 'defaults', 'enabled', *CONDITIONAL)):
+            if (any(k in props for k in ('exclude_srcs', 'defaults', 'enabled', 'manifest'))
+                    or any(conditional_sources(props[key]) for key in CONDITIONAL.intersection(props))):
                 raise ValueError('source-bearing or conditional defaults: ' + default)
+            default_sources.extend(literals(props, 'srcs'))
         directory = str(PurePosixPath(module['path']).parent)
         relative = path if directory == '.' else path.removeprefix(directory + '/')
         inside = directory == '.' or relative != path
@@ -70,7 +80,13 @@ def discover_build(repo, paths, limit=2000):
         if any(matches(source) for source in literals(p, 'exclude_srcs')):
             return False
         found, unresolved_source = False, None
-        for source in literals(p, 'srcs'):
+        sources = literals(p, 'srcs') + default_sources
+        if module['kind'] in ('android_app', 'android_test', 'android_library'):
+            manifest = p.get('manifest', 'AndroidManifest.xml')
+            if not isinstance(manifest, str):
+                raise ValueError('non-literal manifest: ' + name)
+            sources.append(manifest)
+        for source in sources:
             try:
                 found |= matches(source)
             except ValueError as exc:
@@ -99,6 +115,10 @@ def discover_build(repo, paths, limit=2000):
             if not isinstance(props, dict):
                 continue
             pending.extend(v for v in props.values() if isinstance(v, dict))
+            if module['kind'] in ('android_app', 'android_test', 'android_library'):
+                manifest = props.get('manifest', 'AndroidManifest.xml')
+                if not isinstance(manifest, str) or inside and glob_matches(manifest, relative):
+                    return True
             for field in ('srcs', 'defaults'):
                 values = props.get(field, [])
                 if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
@@ -107,6 +127,8 @@ def discover_build(repo, paths, limit=2000):
                     if field == 'defaults' or value.startswith(':'):
                         reference = value if field == 'defaults' else value[1:]
                         candidates = by_name.get(reference, [])
+                        if field == 'defaults' and any(c['properties'].get('srcs') for c in candidates):
+                            return True  # Defaults' relative paths belong to the consuming module.
                         if len(candidates) != 1 or could_consume(candidates[0], path, seen | {identity}):
                             return True
                     elif glob_matches(value, relative) and inside:
@@ -119,6 +141,13 @@ def discover_build(repo, paths, limit=2000):
     unresolved = [dict(issue) for issue in issues if 'kind' not in issue
                   or issue['kind'] in BUILDABLE | {'filegroup'} or issue['kind'].endswith('_defaults')
                   or issue.get('source_bearing')]
+    def report_issue(module, exc):
+        issue = {'path': module['path'], 'module': module['name'], 'reason': str(exc)}
+        if issue not in issues:
+            issues.append(issue)
+            if module['kind'] not in TEST_MODULES:
+                unresolved.append(issue)
+
     for module in modules:
         if module['kind'] == 'filegroup' or module['kind'].endswith('_defaults'):
             continue
@@ -127,7 +156,13 @@ def discover_build(repo, paths, limit=2000):
                 continue
             if module['kind'] not in BUILDABLE or not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.+-]*', module['name']):
                 raise ValueError('unsupported consumer kind or module name: ' + module['kind'])
-            matched = [path for path in paths if owns(module, path, set())]
+            matched = []
+            for path in paths:
+                try:
+                    if owns(module, path, set()):
+                        matched.append(path)
+                except ValueError as exc:
+                    report_issue(module, exc)
             if matched:
                 targets.append({'name': module['name'], 'build_file': module['path'],
                                 'kind': module['kind'], 'sources': sorted(matched),
@@ -136,10 +171,7 @@ def discover_build(repo, paths, limit=2000):
                 if module['kind'] not in TEST_MODULES:
                     production_covered.update(matched)
         except ValueError as exc:
-            issue = {'path': module['path'], 'module': module['name'], 'reason': str(exc)}
-            issues.append(issue)
-            if module['kind'] not in TEST_MODULES:
-                unresolved.append(issue)
+            report_issue(module, exc)
     return {'status': 'RESOLVED' if paths and production_covered == set(paths) and not unresolved else 'UNRESOLVED',
             'modules': targets, 'uncovered': sorted(set(paths) - covered), 'issues': issues,
             'production_uncovered': sorted(set(paths) - production_covered),

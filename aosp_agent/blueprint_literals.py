@@ -154,7 +154,7 @@ class LiteralParser:
                     self.take('+')
                 self.take('=')
                 value = self.expression()
-                if name in ('subdirs', 'optional_subdirs') or name == 'build' and build_includes is None:
+                if name in ('subdirs', 'optional_subdirs', 'build') and build_includes is None:
                     raise ValueError('Blueprint file include directive requires external evaluation: ' + name)
                 if append:
                     if name not in self.local:
@@ -166,6 +166,13 @@ class LiteralParser:
                     if name in self.local or name in self.inherited:
                         raise ValueError('Blueprint variable already assigned: ' + name)
                     self.local[name] = value
+        # The Android.bp index comes from the complete pinned file list,
+        # matching Soong's finder. Legacy subdirs do not select that file list
+        # and must not propagate into child file scopes.
+        for directive in ('subdirs', 'optional_subdirs'):
+            directories = self.local.pop(directive, [])
+            if not isinstance(directories, list) or not all(isinstance(name, str) for name in directories):
+                raise ValueError('Blueprint directory directive must evaluate to a list of strings')
         includes = self.local.pop('build', [])
         if not isinstance(includes, list) or not all(isinstance(name, str) for name in includes):
             raise ValueError('Blueprint build directive must evaluate to a list of strings')

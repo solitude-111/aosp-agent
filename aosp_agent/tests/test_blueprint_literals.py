@@ -115,7 +115,7 @@ class BlueprintLiteralsTest(unittest.TestCase):
     def test_product_conditions_defaults_namespaces_and_includes_remain_unresolved(self):
         cases = [
             'sources = ["A.java"]\njava_library {name: "main", srcs: sources, product_variables: {debuggable: {enabled: true}}}',
-            'sources = ["A.java"]\njava_defaults {name: "base", srcs: sources}\njava_library {name: "main", defaults: ["base"]}',
+            'sources = ["A.java"]\njava_defaults {name: "base", exclude_srcs: sources}\njava_library {name: "main", defaults: ["base"], srcs: sources}',
             'soong_namespace {imports: ["other"]}\njava_library {name: "main", srcs: ["A.java"]}',
             'build = ["extra.bp"]\njava_library {name: "main", srcs: ["A.java"]}',
         ]
@@ -140,6 +140,17 @@ class BlueprintLiteralsTest(unittest.TestCase):
                          [{'reason': 'build file scan limit exceeded'}])
         repo.files['app/Android.bp'] += '\nother = fragment_sources'
         self.assertEqual(discover_build(repo, ['src/A.java'])['status'], 'UNRESOLVED')
+
+    def test_complete_index_handles_legacy_subdirs_and_keeps_child_scopes_local(self):
+        repo = Blobs({
+            'Android.bp': 'subdirs = ["src/*"]\noptional_subdirs = ["optional"]\n',
+            'src/app/Android.bp': 'subdirs = []\ncc_binary {name: "tool", srcs: ["main.cpp"]}',
+        })
+        result = discover_build(repo, ['src/app/main.cpp'])
+        self.assertEqual(result['status'], 'RESOLVED')
+        self.assertEqual([module['name'] for module in result['modules']], ['tool'])
+        repo.files['Android.bp'] = 'subdirs = unknown_paths'
+        self.assertEqual(discover_build(repo, ['src/app/main.cpp'])['status'], 'UNRESOLVED')
 
     def test_invalid_includes_cannot_create_a_build_command(self):
         for root, fragment in (

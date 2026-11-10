@@ -75,10 +75,11 @@ def make_plan(repo, units, mappings, files, diff, *, explicit=None, auto=True, b
         # edges can remain unresolved, but an unreadable build file can hide
         # duplicate definitions, so it prevents even a partial build plan.
         partial = (build['status'] == 'UNRESOLVED' and build['modules']
-                   and not build['production_uncovered']
+                   and not build['uncovered']
+                   and any(module['role'] == 'production' for module in build['modules'])
                    and all('module' in issue for issue in build['unresolved_consumers']))
         if build_runner and (build['status'] == 'RESOLVED' or partial):
-            names = sorted({m['name'] for m in build['modules'] if not partial or m['role'] == 'production'})
+            names = sorted({m['name'] for m in build['modules']})
             generated.append({'stage': 'android_module_build',
                               'argv': [str(build_runner), *names], 'artifacts': [],
                               **({'coverage': 'partial'} if partial else {})})
