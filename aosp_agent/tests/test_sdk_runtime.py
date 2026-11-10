@@ -100,7 +100,8 @@ class FakeCodex:
 
 
 class RuntimeTest(unittest.TestCase):
-    def run_fake(self, mode, *, schema=None, timeout=1, model=None, model_provider=None):
+    def run_fake(self, mode, *, schema=None, timeout=1, model=None, model_provider=None,
+                 defer_schema_errors=False):
         fake = None
 
         def factory(config):
@@ -115,6 +116,7 @@ class RuntimeTest(unittest.TestCase):
                                        model=model,
                                        model_provider=model_provider,
                                        env={"TEST_API_KEY": "example-secret-value"})
+                runtime.defer_schema_errors = defer_schema_errors
                 try:
                     with runtime:
                         runtime.start(root, "defensive patch review")
@@ -236,6 +238,22 @@ class RuntimeTest(unittest.TestCase):
     def test_invalid_structured_output_is_rejected(self):
         result, _, _ = self.run_fake("completed", schema={"type": "object", "required": ["missing"]})
         self.assertEqual(result.kind, "INVALID_OUTPUT")
+
+    def test_parsed_schema_error_is_deferred_without_full_report_retry(self):
+        result, fake, events = self.run_fake('completed', defer_schema_errors=True,
+            schema={'type': 'object', 'properties': {'verdict': {'type': 'integer'}}})
+        self.assertEqual(result.kind, 'INVALID_OUTPUT')
+        self.assertEqual(result.details['parsed_output'], {'verdict': 'ready'})
+        self.assertEqual(result.details['output_diagnostic']['path'], '/verdict')
+        self.assertEqual(result.details['output_diagnostic']['category'], 'REPORT_SCHEMA')
+        self.assertEqual(len(fake.thread.calls), 1)
+        self.assertNotIn('output_retry', [event['event'] for event in events])
+
+    def test_deferred_schema_mode_keeps_bounded_syntax_retry(self):
+        result, fake, _ = self.run_fake('broken_json', defer_schema_errors=True,
+                                       schema={'type': 'object'})
+        self.assertEqual(result.details['output_diagnostic']['category'], 'JSON_SYNTAX')
+        self.assertEqual(len(fake.thread.calls), 2)
 
     def test_malformed_json_gets_exactly_one_corrective_retry(self):
         # First reply has a JSON syntax slip (unclosed object); the corrective

@@ -80,18 +80,40 @@ def candidate_bundle(controller):
 
 
 def verify_joint(controller):
+    from .controlled_build import controlled_build_session
+    from .build_environment import BuildEnvironmentBlocked
     from .diff_engine import _write
-    checks = controller.joint_plan['checks']
+    try:
+        with controlled_build_session(controller) as build:
+            return _verify_joint(controller, build)
+    except BuildEnvironmentBlocked as exc:
+        result = {'status': 'BLOCKED', 'blocked_by': exc.kind, 'reason': str(exc),
+                  'sufficient_for_validated': False, 'commands': [], 'runtime_security_proven': False,
+                  'pause_batch': exc.pause_batch}
+        controller.record['completion_blocked_by'] = exc.kind
+        controller.record['pause_batch'] = exc.pause_batch
+        _write(controller.run_dir / 'joint-verification.json', result)
+        return result
+
+
+def _verify_joint(controller, build=None):
+    from .diff_engine import _write
+    audit = build.audit if build is not None else controller._audit
+    checks = (build.refine_checks(controller.joint_plan['checks']) if build is not None
+              else controller.joint_plan['checks'])
+    if build is not None:
+        _write(controller.run_dir / 'runtime-joint-validation-plan.json', {'checks': checks,
+            'environment_id': build.identity['environment_id'], 'scope': 'generated_build_graph'})
     if not checks:
         policy = validation_policy([], controller.joint_plan['required_repositories'], expected_checks=0)
         return {'status': 'NOT_CONFIGURED', 'sufficient_for_validated': False, 'commands': [],
                 'policy': policy, 'uncovered_repositories': policy['missing_build_repositories']}
-    controller._audit()
+    audit()
     bundle = candidate_bundle(controller)
     identity = hashlib.sha256(json.dumps(bundle, sort_keys=True).encode()).hexdigest()
     controller.record['candidate_bundle_sha256'] = identity
     path = controller.run_dir / 'joint-patch-bundle.json'
-    _write(path, bundle)
+    _write(path, build.validation_bundle(bundle) if build is not None else bundle)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     controller._protect(path)
     attempt = controller.record.get('joint_attempt', 0) + 1
@@ -108,7 +130,7 @@ def verify_joint(controller):
         child.record['final_verification'] = local
         child._write_record()
         controller.record.setdefault('verification', {})[key] = local
-        controller._audit()
+        audit()
         if candidate_bundle(controller) != bundle:
             raise RuntimeError('local validation mutated another candidate in the bundle')
         if local['status'] == 'FAIL':
@@ -119,14 +141,28 @@ def verify_joint(controller):
     for number, check in enumerate(checks, 1):
         from .output_budget import require_output_record
         require_output_record(controller.run_dir / 'run.json')
-        controller._audit()
+        audit()
         if candidate_bundle(controller) != bundle:
             raise RuntimeError('candidate changed before joint verification')
         artifact_root = controller.run_dir / 'joint-artifacts'
         if artifact_root.is_symlink() or artifact_root.resolve() != artifact_root:
             raise RuntimeError('unsafe joint artifact directory')
         artifact_root.mkdir(exist_ok=True)
-        env = _safe_env()
+        baseline, checkpoint = None, None
+        if build is not None and check['stage'] == 'android_module_build':
+            baseline, checkpoint, env = build.prepare_check(check)
+            if baseline['returncode']:
+                classification = baseline['classification']
+                result = {'status': 'BLOCKED', 'blocked_by': classification['status'],
+                    'baseline': baseline, 'bundle_sha256': digest, 'candidate_bundle_sha256': identity,
+                    'sufficient_for_validated': False, 'commands': results,
+                    'pause_batch': classification['pause_batch']}
+                controller.record.update(completion_blocked_by=classification['status'],
+                                         pause_batch=classification['pause_batch'])
+                _write(controller.run_dir / 'joint-verification.json', result)
+                return result
+        else:
+            env = _safe_env()
         nonce = f'{digest}:{attempt}:{number}'
         env.update(AOSP_AGENT_PATCH_BUNDLE=str(path), AOSP_AGENT_BUNDLE_SHA256=digest,
                    AOSP_AGENT_WORKTREE=str(controller.workspace), AOSP_AGENT_RUN_DIR=str(controller.run_dir),
@@ -147,11 +183,12 @@ def verify_joint(controller):
                 artifact.rename(archive)
         started = time.monotonic()
         try:
-            stdout, stderr, code = run_check(check['argv'], controller.workspace, env)
+            stdout, stderr, code = run_check(check['argv'], controller.workspace, env,
+                **({'timeout': build.config['baseline_timeout']} if baseline is not None else {}))
         except OSError as exc:
             stdout, stderr, code = '', str(exc), 127
-        build_receipt_verified = False
-        if check['stage'] == 'android_module_build' and code == 0:
+        build_receipt_verified, evidence = False, {}
+        if check['stage'] == 'android_module_build':
             receipt = controller.run_dir / 'module-build-restore/bundle.json'
             try:
                 evidence = json.loads(receipt.read_text())
@@ -159,7 +196,7 @@ def verify_joint(controller):
                 evidence = {}
             build_receipt_verified = (evidence.get('bundle_sha256') == digest and evidence.get('validation_id') == nonce
                     and evidence.get('restore') == 'PASS' and evidence.get('build_returncode') == 0)
-            if not build_receipt_verified:
+            if code == 0 and not build_receipt_verified:
                 code = 125
                 stderr += '\nmissing fresh successful build/apply/restore receipt for this exact bundle'
         artifacts = []
@@ -175,13 +212,20 @@ def verify_joint(controller):
         from .output_budget import write_text
         write_text(controller.run_dir / (stem + '.stdout'), stdout)
         write_text(controller.run_dir / (stem + '.stderr'), stderr)
-        results.append({'stage': check['stage'], 'argv': check['argv'], 'covers': check['covers'],
+        command_result = {'stage': check['stage'], 'argv': check['argv'], 'covers': check['covers'],
                         'returncode': code, 'stdout': stdout[-10000:], 'stderr': stderr[-10000:],
                         'stdout_log': stem + '.stdout', 'stderr_log': stem + '.stderr',
                         'elapsed_seconds': round(time.monotonic() - started, 3), 'artifacts': artifacts,
                         'build_receipt_verified': build_receipt_verified,
-                        **({'coverage': 'partial'} if check.get('coverage') == 'partial' else {})})
-        controller._audit()
+                        'validation_id': nonce, 'bundle_sha256': digest,
+                        **({'coverage': 'partial'} if check.get('coverage') == 'partial' else {})}
+        if baseline is not None:
+            # Stale receipts cannot establish restoration for a failed invocation.
+            if evidence.get('validation_id') != nonce or evidence.get('bundle_sha256') != digest:
+                evidence = {}
+            command_result = build.finish_check(check, command_result, baseline, checkpoint, evidence)
+        results.append(command_result)
+        audit()
         if candidate_bundle(controller) != bundle:
             raise RuntimeError('joint validation mutated the candidate bundle')
         if code:
@@ -193,13 +237,26 @@ def verify_joint(controller):
               'sufficient_for_validated': policy['satisfied'], 'policy': policy,
               'uncovered_repositories': policy['missing_build_repositories'],
               'scope': controller.joint_plan['scope'], 'runtime_security_proven': False}
+    blocked = next((c['classification'] for c in results if c['returncode']
+                    and c.get('classification') and not c['classification']['repair_candidate']), None)
+    if blocked:
+        result.update(status='BLOCKED', blocked_by=blocked['status'], pause_batch=blocked['pause_batch'])
+        controller.record.update(completion_blocked_by=blocked['status'], pause_batch=blocked['pause_batch'])
+    if build is not None:
+        derived = bool(build.identity['differences'])
+        controller.record['build_environment'].update(candidate_build_status=result['status'],
+            coverage='complete' if policy['satisfied'] else 'partial',
+            original_manifest_validated=bool(policy['satisfied'] and not derived),
+            derived_manifest_validated=bool(policy['satisfied'] and derived))
     _write(controller.run_dir / 'joint-verification.json', result)
     return result
 
 
 def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
+    from .candidate_store import archive_controller_candidates
     # This does not turn a partial migration or a failed independent gate green.
     if controller.record['status'] not in CANDIDATE_STATUSES:
+        archive_controller_candidates(controller, final=True)
         return
     count = len(controller.joint_plan['required_repositories'])
     if count > 1:
@@ -233,7 +290,9 @@ def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
         if checks:
             covered = {key for c in checks if not c['returncode'] for key in c['covers']}
             controller.record[layer] = ('FAIL' if any(c['returncode'] for c in checks) else
-                                         'PASS' if covered == required else 'PARTIAL')
+                'PASS' if covered == required and not any(c.get('coverage') == 'partial' for c in checks) else 'PARTIAL')
+    if result['status'] == 'BLOCKED':
+        controller.record['android_module_build'] = 'BLOCKED'
     if result['status'] == 'FAIL':
         if controller.record['status'] in CANDIDATE_STATUSES:
             controller.record['status'] = 'VALIDATION_FAILED'
@@ -244,6 +303,7 @@ def finish_joint(controller, *, verify, assessment=None, max_attempts=1):
     elif not verify:
         controller.record['post_fix_review'] = {'status': 'NOT_REQUESTED'}
     update_delivery(controller.record)
+    archive_controller_candidates(controller, final=True)
 
 
 def assess_joint_impact(controller):

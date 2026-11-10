@@ -509,6 +509,12 @@ Fix-defined causal chain (required for every AFFECTED conclusion):
   provide api, behavior, relied_at_evidence (target causal call sites) and
   implementation_evidence (separate target-version source excerpts containing the actual
   API definition and executable body). Include package/class context for JVM definitions.
+  Use one qualified API identity per entry, e.g. java.io.File for a constructor or
+  java.lang.Integer.parseInt for a method. When distinguishing overloads, retain the exact
+  parameter types as java.io.File(String,String), and cite the matching declaration and an
+  explicit call binding; never strip a signature to pass validation. Unsupported or ambiguous
+  bindings remain unresolved. Repository APIs such as android::Parcel belong in ordinary
+  pinned-source evidence and the causal explanation, not the platform API category.
   Request a bounded read-only dependency expansion when the implementation is in another
   project; do not add dependency files to the edit allowlist just to cite them. If decisive
   implementation or binding cannot be established, answer UNKNOWN with the missing premise.

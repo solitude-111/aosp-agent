@@ -23,13 +23,27 @@ def scope_options(parser, *, exhaustive=True):
     parser.add_argument('--max-git-operations', type=int, default=2000,
                         help='investigation budget for controller Git and SDK tool invocations')
     parser.add_argument('--max-model-turns', type=int, default=48)
+    parser.add_argument('--max-read-bytes', type=int, default=64 * 1024 * 1024,
+                        help='case-wide model tool I/O limit, separate from log/artifact bytes')
+    parser.add_argument('--case-timeout', type=float, default=7200,
+                        help='cumulative active execution seconds, including migration and builds')
+    parser.add_argument('--candidate-attempts', type=int, default=None,
+                        help='case-wide write-model turns; explicit value overrides --max-attempts (default 6)')
+    parser.add_argument('--location-attempts', type=int, default=None)
+    parser.add_argument('--impact-attempts', type=int, default=None)
+    parser.add_argument('--report-corrections', type=int, default=6)
+    parser.add_argument('--max-stage-extensions', type=int, default=1)
+    parser.add_argument('--extension-seconds', type=float, default=300)
     parser.add_argument('--max-output-bytes', type=int, default=256 * 1024 * 1024,
                         help='cumulative controller output budget shared by all task/batch children')
 
 
 def routing_options(args):
     return {key: getattr(args, key) for key in ('repository_keys', 'cache_root', 'max_projects', 'max_rounds',
-                                               'investigation_seconds', 'max_git_operations', 'max_model_turns', 'max_output_bytes')}
+                                               'investigation_seconds', 'max_git_operations', 'max_model_turns', 'max_output_bytes',
+                                               'max_read_bytes', 'case_timeout', 'candidate_attempts', 'location_attempts',
+                                               'impact_attempts', 'report_corrections',
+                                               'max_stage_extensions', 'extension_seconds')}
 
 
 def exit_status(status):
@@ -62,7 +76,8 @@ def _main() -> int:
     diff.add_argument("--model-provider")
     diff.add_argument("--mapping-model", help="independent read-only mapping session model; defaults to --model")
     diff.add_argument("--turn-timeout", type=float, default=900)
-    diff.add_argument("--max-attempts", type=int, default=3)
+    diff.add_argument("--max-attempts", type=int, default=None,
+                      help='legacy stage limit; explicit per-stage options take precedence')
     diff.add_argument("--verify", action="store_true")
     diff.add_argument("--validation", type=Path, help="optional independent checks JSON keyed by discovered repository key")
     diff.add_argument("--joint-validation", type=Path, help="fixed checks for the assembled final candidate workspace")
@@ -95,7 +110,7 @@ def _main() -> int:
     run.add_argument("--impact-only", action="store_true",
                      help="stop after the grounded impact decision without migrating a patch")
     run.add_argument("--verify", action="store_true")
-    run.add_argument("--max-attempts", type=int, default=6,
+    run.add_argument("--max-attempts", type=int, default=None,
                      help="maximum turns per assessment/backport phase, including the initial turn")
     run.add_argument("--turn-timeout", type=float, default=900,
                      help="timeout in seconds for each SDK turn")
@@ -109,7 +124,7 @@ def _main() -> int:
     batch.add_argument('--mapping-model')
     batch.add_argument('--model-provider')
     batch.add_argument('--turn-timeout', type=float, default=900)
-    batch.add_argument('--max-attempts', type=int, default=3)
+    batch.add_argument('--max-attempts', type=int, default=None)
     batch.add_argument('--inspect-only', action='store_true')
     batch.add_argument('--locate-first', action='store_true',
                        help='use the same location handoff as diff')
@@ -153,21 +168,33 @@ def _main() -> int:
             record = {}
         from .delivery import update_delivery
         saved_status = record.get('status')
+        live_state = process_state(args.record.parent)
+        interrupted_states = {'PREPARED', 'PREPARING', 'RUNNING', 'INVESTIGATING', 'REPLANNING'}
+        if saved_status in interrupted_states and live_state == 'NO_ACTIVE_LEASE':
+            record.update(status='INTERRUPTED', completion_blocked_by='EXECUTION_OWNER_EXITED')
         if record.get('execution') != 'serial_project_first':
             update_delivery(record)
         if output_error is not None:
             record.update(status='BLOCKED', delivery_status='BLOCKED', completion_blocked_by=output_error.kind)
-        result_fields = ('impact_decision', 'impact_analysis', 'migration', 'budget_interruption')
+        result_fields = ('impact_decision', 'impact_analysis', 'migration', 'budget_interruption',
+                         'candidate_history', 'build_environment', 'runtime_build_discovery',
+                         'dependency_evidence_revalidation', 'preparation_receipt', 'batch_budget',
+                         'effective_stage_limits')
         compacted = isinstance(output_error, OutputBudgetExceeded) and record.get('record_compacted')
         phases = ({key: record[key] for key in result_fields if key in record}
                   if output_error is None or compacted else {})
+        if isinstance(record.get('execution_budget'), dict):
+            phases['execution_budget'] = {key: record['execution_budget'][key] for key in
+                ('path', 'lineage_id', 'limits', 'consumed', 'execution_ms', 'investigation_ms',
+                 'io_consumed', 'io_reserved', 'io_limit', 'io_by_boundary', 'by_stage', 'extensions')
+                if key in record['execution_budget']}
         print(json.dumps({'record': str(args.record.resolve()), 'saved_status': saved_status,
                           'effective_status': record.get('status'),
                           'delivery_status': record.get('delivery_status'),
                           'completion_blocked_by': record.get('completion_blocked_by'),
                           'build_validation': record.get('build_validation'),
                           'review_status': record.get('review_status'),
-                          'process_state': process_state(args.record.parent),
+                          'process_state': live_state,
                           'active_round_record': record.get('active_round_record'),
                           'counts': record.get('counts'), **phases}, ensure_ascii=False, indent=2))
         return 0
@@ -226,7 +253,9 @@ def _main() -> int:
                 donor_repo=args.donor_repo, source_commit=args.source_commit,
                 source_parent=args.source_parent, auto_validation=not args.no_auto_validation,
                 build_runner=args.build_runner, mapping_model=args.mapping_model, **options)
-            result = agent.run(inspect_only=args.inspect_only, max_attempts=args.max_attempts, verify=args.verify)
+            result = agent.run(inspect_only=args.inspect_only,
+                               max_attempts=(args.max_attempts or 3) if args.exhaustive_discovery else args.max_attempts,
+                               verify=args.verify)
         except Exception as exc:
             result = {"status": "BLOCKED" if isinstance(exc, (LeaseBusy, RecoveryBlocked)) else "FAILED",
                       "error": {"type": type(exc).__name__, "message": str(exc)}}
@@ -273,7 +302,8 @@ def _main() -> int:
             joint_validation=json.loads(args.joint_validation.read_text()) if args.joint_validation else None,
             validation=json.loads(args.validation.read_text()) if args.validation else None,
             **({'max_output_bytes': args.max_output_bytes} if args.exhaustive_discovery else routing_options(args)))
-        result = agent.run(inspect_only=args.no_codex, verify=args.verify, max_attempts=args.max_attempts,
+        result = agent.run(inspect_only=args.no_codex, verify=args.verify,
+            max_attempts=(args.max_attempts or 6) if args.exhaustive_discovery else args.max_attempts,
             mechanical=not args.no_mechanical, impact_only=args.impact_only)
     except Exception as exc:
         status = 'BLOCKED' if isinstance(exc, (LeaseBusy, RecoveryBlocked)) else 'FAILED'

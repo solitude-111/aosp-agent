@@ -212,6 +212,8 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
     from .diff_engine import _write
     _write(controller.run_dir / 'patch-bundle.json', patches)
     _write(controller.run_dir / 'hunk-ledger.json', ledger)
+    from .candidate_store import archive_controller_candidates
+    archive_controller_candidates(controller)
     if not impact_only and (not handoff or handoff.migration is not None):
         from .joint_validation import finish_joint
         if handoff:

@@ -113,8 +113,12 @@ class MappingPipelineTest(unittest.TestCase):
                 write_counter(FIXED)(worktree)
                 (agent.run_dir / 'mapping-plan.json').write_text('{}')
             self.wire(agent, fx, edit=edit)
-            with self.assertRaisesRegex(RuntimeError, 'controller-owned plan'):
+            from aosp_agent.mapped_backend import SourceAuditUnverified
+            with self.assertRaises(SourceAuditUnverified) as blocked:
                 agent.run(max_attempts=1)
+            self.assertIsInstance(blocked.exception.__cause__, RuntimeError)
+            self.assertIn('controller-owned plan', str(blocked.exception.__cause__))
+            self.assertEqual(agent.record['source_audit_errors']['repo']['status'], 'UNVERIFIED')
 
     def test_case_may_omit_answer_paths_and_inspection_never_starts_model(self):
         with GitFixture() as fx:

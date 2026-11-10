@@ -1,0 +1,7 @@
+#!/bin/sh
+set -eu
+agent_root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+agent_python=${AOSP_AGENT_PYTHON:-"$agent_root/.venv-sdk/bin/python"}
+if [ ! -x "$agent_python" ]; then agent_python=python3; fi
+export PYTHONPATH="$agent_root${PYTHONPATH:+:$PYTHONPATH}"
+exec "$agent_python" -m aosp_agent.unattended "$@"

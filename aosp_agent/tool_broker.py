@@ -21,12 +21,14 @@ import uuid
 from jsonschema import validate, ValidationError
 from . import agent_tools
 from .retrieval import ACTIVE_READ_PHASE, ReadBudget, BudgetExceeded, record_read_activity
-from .tool_io import ACTIVE_TOOL_IO, ToolIO
+from .lifecycle import RecoveryBlocked
+from .tool_io import ACTIVE_TOOL_IO, ToolIO, QueryOutputLimit
 
 
 MAX_FILE = 32 * 1024 * 1024
 MAX_REPLY = 64 * 1024
 SCOPED_SEARCH_TIMEOUT = 30
+MAX_QUERY_OUTPUT = 4 * 1024 * 1024
 
 
 def spec(name, description, properties, required):
@@ -55,6 +57,8 @@ TOOLS = [
     spec('aosp_source', 'Bounded pinned Git source operations. Select target:<project>, donor:<source-step>, '
          'target, donor or dependency:<key> from run metadata. view/locate/search/paths need repo and ref. '
          'For locate/search/paths, path can name a specific repository-relative file or directory. '
+         'Without path donor queries start in this source step\'s changed files; '
+         'expand explicitly to a related directory if needed. Incomplete searches never prove absence. '
          'history needs hunk_id (and target_repo in multi-project runs); show needs sha and optional '
          'source_step/hunk_id/target_repo. No network, arbitrary refs or Git argv.',
          {'operation': {'enum': ['view', 'locate', 'search', 'paths', 'history', 'show']},
@@ -78,7 +82,9 @@ def _permitted(path, grants, denied):
 class ToolBroker:
     def __init__(self, scope, events, *, seconds=900, budget=None):
         self.scope, self.log = scope, events
-        self.fallback = budget or ReadBudget(seconds=seconds)
+        # An active investigation supplies its own budget at begin(). The
+        # fallback shares case tools/bytes/time but never restarts that clock.
+        self.fallback = budget or ReadBudget(seconds=seconds, tracks_investigation=False)
         self.schemas = {t['name']: t['inputSchema'] for t in TOOLS}
         self.lock = threading.RLock()
         self.idle = threading.Event(); self.idle.set()
@@ -145,6 +151,13 @@ class ToolBroker:
                 return self._reply(False, {'error': 'inactive, duplicate, concurrent or foreign tool request'})
             self.turn_id = params['turnId']; self.seen.add(ident); self.idle.clear()
         success = False
+        reply_reservation = None
+        reply_bytes = 0
+        def reply(ok, value):
+            nonlocal reply_bytes
+            result = self._reply(ok, value)
+            reply_bytes = len(result['contentItems'][0]['text'].encode())
+            return result
         phase_token = ACTIVE_READ_PHASE.set(self.read_phase)
         try:
             self.io.check()
@@ -154,10 +167,10 @@ class ToolBroker:
             args = params.get('arguments')
             validate(args, self.schemas[name])
             # Count input before a model-controlled large string is processed.
-            self.budget.claim_bytes(len(json.dumps(args, ensure_ascii=False).encode()))
+            self.budget.claim_bytes(len(json.dumps(args, ensure_ascii=False).encode()), 'tool_request')
             # Reserve the entire possible result before reads or edits. Error
             # control messages remain small even after the data budget ends.
-            self.budget.claim_bytes(MAX_REPLY)
+            reply_reservation = self.budget.reserve_bytes(MAX_REPLY, 'model_reply')
             token = ACTIVE_TOOL_IO.set(self.io)
             try:
                 with self.budget.active():
@@ -166,23 +179,39 @@ class ToolBroker:
                 ACTIVE_TOOL_IO.reset(token)
             self.io.check()
             success = not result.get('returncode', 0)
-            reply = self._reply(success, result)
-            success = reply['success']
-            return reply
+            response = reply(success, result)
+            success = response['success']
+            return response
         except BudgetExceeded as exc:
             self.failure = exc
-            return self._reply(False, {'error': str(exc), 'status': 'BUDGET_EXHAUSTED'})
+            return reply(False, {'error': str(exc), 'status': 'BUDGET_EXHAUSTED',
+                                 'limit_scope': getattr(exc, 'limit_scope', 'case')})
+        except RecoveryBlocked as exc:
+            self.failure = exc
+            self.cancelled.set()
+            return reply(False, {'error': str(exc), 'status': 'RECOVERY_BLOCKED'})
+        except QueryOutputLimit as exc:
+            return reply(False, {'status': 'OUTPUT_LIMIT', 'limit_scope': 'query',
+                                 'reason': exc.kind, 'error': 'Use a smaller range or narrower path.'})
         except (ToolDenied, ValidationError, ValueError, OSError, agent_tools.ToolError) as exc:
-            return self._reply(False, {'error': str(exc)[:2000], 'status': 'TOOL_DENIED_OR_READ_FAILED'})
+            return reply(False, {'error': str(exc)[:2000], 'status': 'TOOL_DENIED_OR_READ_FAILED'})
         except Exception as exc:
             # Unexpected subprocess/parser failures do not provide partial source evidence.
-            return self._reply(False, {'error': type(exc).__name__ + ': ' + str(exc)[:1000], 'status': 'READ_FAILED'})
+            return reply(False, {'error': type(exc).__name__ + ': ' + str(exc)[:1000], 'status': 'READ_FAILED'})
         finally:
-            ACTIVE_READ_PHASE.reset(phase_token)
             try:
-                self.log('broker_tool', tool=name, call_id=ident, success=success, budget=self.budget.data())
+                if reply_reservation is not None:
+                    self.budget.settle_bytes(reply_reservation, reply_bytes)
+            except BaseException as exc:
+                self.failure = exc
+                self.cancelled.set()
+                raise
             finally:
-                self.idle.set()
+                ACTIVE_READ_PHASE.reset(phase_token)
+                try:
+                    self.log('broker_tool', tool=name, call_id=ident, success=success, budget=self.budget.data())
+                finally:
+                    self.idle.set()
 
     @staticmethod
     def _reply(success, result):
@@ -235,9 +264,12 @@ class ToolBroker:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_FILE:
                     raise ToolDenied('file is not regular or exceeds the per-file read limit')
-                self.budget.claim_bytes(info.st_size + 1)
-                data = stream.read(info.st_size + 1)
-                record_read_activity(broker_file_read_bytes=len(data))
+                receipt = self.budget.reserve_bytes(info.st_size + 1, 'broker_file_read')
+                data = b''
+                try:
+                    data = stream.read(info.st_size + 1)
+                finally:
+                    self.budget.settle_bytes(receipt, len(data))
                 if len(data) != info.st_size:
                     raise ToolDenied('file size changed during read')
                 self.io.check()
@@ -263,7 +295,6 @@ class ToolBroker:
             content = args['content'].encode()
         if len(content) > MAX_FILE:
             raise ToolDenied('candidate exceeds the per-file write limit')
-        self.budget.claim_bytes(len(content))
         self.io.check()
         parent = self._parent(path, create=not delete)
         temporary = '.aosp-broker-' + uuid.uuid4().hex
@@ -277,10 +308,22 @@ class ToolBroker:
                 self.io.check(); os.unlink(path.name, dir_fd=parent)
             else:
                 mode = (os.stat(path.name, dir_fd=parent, follow_symlinks=False).st_mode & 0o777) if current is not None else 0o644
-                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
-                with os.fdopen(fd, 'wb') as stream:
-                    os.fchmod(stream.fileno(), mode)
-                    stream.write(content); stream.flush()
+                receipt = self.budget.reserve_bytes(len(content), 'candidate_write')
+                written = 0
+                fd = None
+                try:
+                    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+                    os.fchmod(fd, mode)
+                    while written < len(content):
+                        self.io.check()
+                        count = os.write(fd, memoryview(content)[written:])
+                        if not count:
+                            raise OSError('candidate write made no progress')
+                        written += count
+                finally:
+                    if fd is not None:
+                        os.close(fd)
+                    self.budget.settle_bytes(receipt, written)
                 self.io.check()
                 os.replace(temporary, path.name, src_dir_fd=parent, dst_dir_fd=parent)
             return {'path': str(path), 'sha256': 'ABSENT' if delete else hashlib.sha256(content).hexdigest()}
@@ -318,6 +361,29 @@ class ToolBroker:
             raise ToolDenied('repository is outside admitted read scope')
 
     def _source(self, args):
+        query = args['operation'] in ('search', 'paths', 'locate')
+        scope = {'repo': args.get('repo'), 'ref': args.get('ref'),
+                 'requested_paths': [args['path']] if args.get('path') else [],
+                 'absence_proven': False}
+        old_limit = self.io.max_output
+        if query:
+            self.io.max_output = min(old_limit, MAX_QUERY_OUTPUT)
+        try:
+            return self._source_impl(args, scope)
+        except (QueryOutputLimit, subprocess.TimeoutExpired) as exc:
+            if not query:
+                raise
+            failure = {**scope, 'status': 'SEARCH_INCOMPLETE', 'returncode': 3,
+                       'limit_scope': 'query', 'completed_paths': [], 'completed_scope_known': False,
+                       'unfinished_paths': scope['requested_paths'],
+                       'reason': 'OUTPUT_LIMIT' if isinstance(exc, QueryOutputLimit) else 'TIMEOUT',
+                       'next_action': 'Supply a narrower file or directory path; verify hits using a pinned source view.'}
+            self.log('broker_source_search', operation=args['operation'], **failure)
+            return failure
+        finally:
+            self.io.max_output = old_limit
+
+    def _source_impl(self, args, query_scope):
         ctx, output = self._context()
         operation = args['operation']
         values = {k: args.get(k) for k in ('repo', 'ref', 'path', 'symbol', 'hunk_id', 'sha', 'target_repo', 'source_step')}
@@ -348,14 +414,22 @@ class ToolBroker:
                 path = args.get('path') or ''
                 paths = [agent_tools.validate_relative_path(path)] if path else None
                 defaults = ctx.record.get('source_search_paths') if not repo.startswith('donor') else None
+                related = []
+                if repo.startswith('donor') and paths is None:
+                    paths, related = ctx.donor_search_paths(repo, ref)
+                    defaults = {'donor': paths}
                 if paths is None and defaults is not None:
                     key = next(iter(ctx.target_repositories), None) if repo == 'target' else repo.split(':', 1)[1]
                     paths = defaults.get(key, [])
-                    if not paths:
-                        return {'status': 'SEARCH_SCOPE_REQUIRED', 'returncode': 2, 'absence_proven': False,
-                                'error': 'No grounded paths for this project. Supply a specific file or directory.'}
+                if paths == []:
+                    return {'status': 'SEARCH_SCOPE_REQUIRED', 'returncode': 2, 'absence_proven': False,
+                            'related_directories': related,
+                            'error': 'No default files at this pin. Supply a specific file or directory.'}
                 if paths is not None:
                     pathspecs = tuple(':(literal)' + p for p in paths)
+                query_scope.update(requested_paths=paths or [], related_directories=related,
+                                   scope_origin='explicit' if path else 'donor_changed_files' if repo.startswith('donor')
+                                   else 'grounded_files' if paths else 'admitted_project')
             if operation in ('search', 'paths'):
                 if operation == 'search':
                     if not args.get('query'): raise ToolDenied('search needs a nonempty literal query')
@@ -363,20 +437,32 @@ class ToolBroker:
                 else:
                     command = ['ls-tree', '-r', '--name-only', ref, '--']
                 scope = {'repo': repo, 'ref': ref, 'path_scope': path or ('grounded files' if pathspecs else 'admitted project'),
-                         'absence_proven': False}
+                         'absence_proven': False, **query_scope}
                 if pathspecs:
                     scope['searched_paths'] = paths
-                try:
-                    result = agent_tools._git(repo_args, *command, *(pathspecs or ()), cwd=cwd, check=False,
-                                              timeout=SCOPED_SEARCH_TIMEOUT if defaults is not None else 120)
-                except subprocess.TimeoutExpired:
-                    failure = {**scope, 'status': 'SEARCH_INCOMPLETE', 'reason': 'TIMEOUT', 'returncode': 3}
-                    self.log('broker_source_search', operation=operation, **failure)
-                    return failure
+                query_args = [*command, *(pathspecs or ())]
+                execute = lambda: agent_tools._git(repo_args, *query_args, cwd=cwd, check=False,
+                                                   timeout=SCOPED_SEARCH_TIMEOUT)
+                cache = getattr(self.budget.ledger, 'object_cache', None)
+                result = (cache.query(cwd if cwd is not None else repo_args[1], ref, query_args, execute)
+                          if cache is not None else execute())
+                captured = len(result.stdout.encode()) + len(result.stderr.encode())
+                if captured > self.io.max_output:
+                    raise QueryOutputLimit(self.io.max_output, captured)
                 if result.returncode not in ((0, 1) if operation == 'search' else (0,)):
                     raise ToolDenied('READ_FAILED: ' + result.stderr[-1000:])
-                return {'status': 'NOT_FOUND_IN_SCOPE' if result.returncode == 1 else 'FOUND',
-                        **scope, 'text': result.stdout[:12000], 'truncated': len(result.stdout) > 12000}
+                text = result.stdout
+                truncated = len(text) > 12000
+                if truncated:
+                    # Do not expose a cut-off grep hit as a complete source line.
+                    text = text[:12000].rsplit('\n', 1)[0] + '\n' if '\n' in text[:12000] else ''
+                return {'status': 'SEARCH_INCOMPLETE' if truncated else
+                        'NOT_FOUND_IN_SCOPE' if result.returncode == 1 else 'FOUND',
+                        **scope, 'text': text, 'truncated': truncated,
+                        'completed_paths': paths or [], 'completed_scope_known': True,
+                        **({'returncode': 3, 'reason': 'REPLY_LIMIT', 'limit_scope': 'query',
+                            'next_action': 'Use a narrower path. Complete returned hits still require pinned source views.'}
+                           if truncated else {})}
         handler = {'view': agent_tools.cmd_view_code, 'locate': agent_tools.cmd_locate_symbol,
                    'history': agent_tools.cmd_hunk_history, 'show': agent_tools.cmd_show_commit}.get(operation)
         if handler is None: raise ToolDenied('unknown source operation')
@@ -411,8 +497,9 @@ class ToolBroker:
             with os.scandir(parent) as entries:
                 for item in entries:
                     self.io.check()
-                    self.budget.claim_bytes(len(item.name.encode()) + 128)
-                    items.append({'name': item.name, 'symlink': item.is_symlink(), 'directory': item.is_dir(follow_symlinks=False)})
+                    entry = {'name': item.name, 'symlink': item.is_symlink(), 'directory': item.is_dir(follow_symlinks=False)}
+                    self.budget.claim_bytes(len(json.dumps(entry, ensure_ascii=False).encode()), 'directory_entry')
+                    items.append(entry)
                     if len(items) >= 200: break
             return {'path': str(path), 'entries': items, 'possibly_truncated': len(items) == 200}
         finally:

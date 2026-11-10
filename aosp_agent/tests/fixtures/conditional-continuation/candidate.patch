@@ -1,0 +1,60 @@
+diff --git a/src/com/android/settings/homepage/SettingsHomepageActivity.java b/src/com/android/settings/homepage/SettingsHomepageActivity.java
+index 1d7b5dc14b..a5005e0da2 100644
+--- a/src/com/android/settings/homepage/SettingsHomepageActivity.java
++++ b/src/com/android/settings/homepage/SettingsHomepageActivity.java
+@@ -74,6 +74,16 @@ public class SettingsHomepageActivity extends FragmentActivity implements
+     @Override
+     protected void onCreate(Bundle savedInstanceState) {
+         super.onCreate(savedInstanceState);
++
++        // Ensure device is provisioned in order to access Settings home
++        // TODO(b/331254029): This should later be replaced in favor of an allowlist
++        boolean unprovisioned = android.provider.Settings.Global.getInt(getContentResolver(),
++                android.provider.Settings.Global.DEVICE_PROVISIONED, 0) == 0;
++        if (unprovisioned) {
++            Log.e(TAG, "Device is not provisioned, exiting Settings");
++            finish();
++        }
++
+         setContentView(R.layout.settings_homepage_container);
+ 
+         final View appBar = findViewById(R.id.app_bar_container);
+diff --git a/tests/robotests/src/com/android/settings/homepage/SettingsHomepageActivityTest.java b/tests/robotests/src/com/android/settings/homepage/SettingsHomepageActivityTest.java
+index 4d203a8a6b..1c8bd23093 100644
+--- a/tests/robotests/src/com/android/settings/homepage/SettingsHomepageActivityTest.java
++++ b/tests/robotests/src/com/android/settings/homepage/SettingsHomepageActivityTest.java
+@@ -27,12 +27,14 @@ import static org.mockito.Mockito.when;
+ 
+ import android.app.ActivityManager;
+ import android.os.Build;
++import android.provider.Settings;
+ import android.view.View;
+ import android.view.Window;
+ import android.view.WindowManager;
+ import android.widget.FrameLayout;
+ 
+ import androidx.fragment.app.Fragment;
++import androidx.test.core.app.ApplicationProvider;
+ 
+ import com.android.settings.R;
+ import com.android.settings.dashboard.suggestions.SuggestionFeatureProviderImpl;
+@@ -64,6 +66,19 @@ public class SettingsHomepageActivityTest {
+     @Before
+     public void setUp() {
+         MockitoAnnotations.initMocks(this);
++        Settings.Global.putInt(ApplicationProvider.getApplicationContext().getContentResolver(),
++                Settings.Global.DEVICE_PROVISIONED, 1);
++    }
++
++    @Test
++    public void launch_deviceUnprovisioned_finish() {
++        Settings.Global.putInt(ApplicationProvider.getApplicationContext().getContentResolver(),
++                Settings.Global.DEVICE_PROVISIONED, 0);
++
++        SettingsHomepageActivity activity = Robolectric.buildActivity(
++                SettingsHomepageActivity.class).create().get();
++
++        assertThat(activity.isFinishing()).isTrue();
+     }
+ 
+     @Test

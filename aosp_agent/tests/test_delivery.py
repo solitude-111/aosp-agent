@@ -87,12 +87,17 @@ class DeliveryTest(unittest.TestCase):
     def test_new_candidate_invalidates_old_build_and_review(self):
         with GitFixture() as fx:
             agent, result = self.run_single(fx, review())
+            previous_hash = result['patch_sha256']
             (agent.worktree / 'counter.py').write_text(FIXED.replace('max(0, min(value, 10))', 'min(10, max(value, 0))'))
             agent.export_patch(2)
             agent._write_record()
             self.assertEqual(result['status'], 'PATCH_UNVERIFIED')
             self.assertFalse(result['build_validation']['candidate_bound'])
             self.assertEqual(result['review_status']['status'], 'STALE')
+            self.assertEqual(result['post_fix_review']['patch_sha256'], previous_hash)
+            self.assertNotEqual(result['patch_sha256'], previous_hash)
+            self.assertEqual(result['final_verification']['status'], 'NOT_RUN')
+            self.assertNotIn('patch_sha256', result['final_verification'])
             self.assertEqual(result['delivery_status'], 'UNVERIFIED')
 
     def test_failed_scope_or_lifecycle_cannot_be_promoted_by_good_evidence(self):

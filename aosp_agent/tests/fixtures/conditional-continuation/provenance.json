@@ -1,0 +1,14 @@
+{
+  "source_commit": "70a5a0fd353cc6203d2926627de93786155ae5bc",
+  "source_parent": "6263205fa8ef724645359410def090946d46f97d",
+  "target_commit": "952dbb9aa3be805fab5f3700029659933c698f0e",
+  "path": "src/com/android/settings/homepage/SettingsHomepageActivity.java",
+  "candidate_sha256": "0c480895e1f75d4c2a47641fb7c384efdfbeccf90555992596bcff2015eff936",
+  "scope": "historical model candidate and pinned donor/target only; no reference-answer input",
+  "sha256": {
+    "donor-parent.java": "fe156e8362fe607b611195e2031cefe13ab34b96fb87cb5c94adc6a6e85e4148",
+    "donor-fix.java": "38541205581fa8b7856048de847e3e09cc14f84414fc3962d118947f9adf9d60",
+    "target.java": "725df639752f1382b0e70789903f98b4efa17cda5835c9f548850678c1392163",
+    "candidate.patch": "0c480895e1f75d4c2a47641fb7c384efdfbeccf90555992596bcff2015eff936"
+  }
+}

@@ -31,7 +31,9 @@ _LIBC_SYMBOLS = frozenset({
 
 def _is_platform_semantic_api(api: str) -> bool:
     """Syntactic category only, not API existence or behavioral verification."""
-    name = (api or "").strip()
+    from .platform_evidence import api_identity
+    identity = api_identity(api)
+    name = identity['name'] if identity else ''
     return bool(_PLATFORM_FQCN_RE.fullmatch(name)) or name in _LIBC_SYMBOLS
 
 def _is_repo_implemented_platform_api(api: str, repository_roots: set[str]) -> bool:
@@ -50,6 +52,49 @@ class AssessmentError(ValueError):
     """The model's assessment could not be grounded in immutable Git blobs."""
 
     kind = "ASSESSMENT_INVALID"
+
+
+def evidence_error(message, index, field=None):
+    """Preserve the actual rejected entry instead of inferring it from prose."""
+    error = AssessmentError(message)
+    error.diagnostic = {'category': 'EVIDENCE_UNGROUNDED',
+        'path': f'/evidence/{index}' + ('/' + field if field else ''), 'message': message[:1200]}
+    return error
+
+
+def assessment_diagnostic(error, raw=None, *, wrapped=False):
+    """Typed, field-addressed feedback for the existing local repair protocol."""
+    from .sdk_runtime import report_diagnostic
+    if getattr(error, 'validator', None):
+        return report_diagnostic(error)
+    if getattr(error, 'diagnostic', None):
+        result = dict(error.diagnostic)
+    else:
+        text = str(error)
+        result = {'category': 'EVIDENCE_UNGROUNDED' if isinstance(error, AssessmentError)
+                  else 'REPORT_SCHEMA', 'path': '/', 'message': text[:1200]}
+        impact = raw.get('impact', raw) if isinstance(raw, dict) else {}
+        for field in ('causal_chain', 'scope_contract', 'proof_steps'):
+            if field in text:
+                result['path'] = '/' + field
+                break
+        else:
+            if any(isinstance(entry, dict) and entry.get('path') and entry['path'] in text
+                   for entry in impact.get('evidence', [])):
+                # Compatibility errors without a typed location cannot identify
+                # an array entry by filename: the same file/revision can recur.
+                result['path'] = '/evidence'
+    if wrapped and result['path'] != '/':
+        result['path'] = '/impact' + result['path']
+    return result
+
+
+def _api_error(message, index, category, field='api'):
+    error = AssessmentError(message)
+    error.diagnostic = {'category': category,
+                        'path': f'/causal_chain/platform_semantics/{index}/{field}',
+                        'message': message}
+    return error
 
 PROOF_STEP_REQUIREMENTS = {
     "authorization_boundary": (
@@ -264,13 +309,17 @@ class CausalityChecks:
         repository_roots = getattr(self, '_causality_repository_roots', {repository.split("/", 1)[0]} - {""})
         causal_anchor_indices = (set(causal.get("target_fault_evidence") or [])
                                  | set(causal.get("target_harm_evidence") or []))
-        for item in causal.get("platform_semantics") or []:
+        for item_index, item in enumerate(causal.get("platform_semantics") or []):
             api = str(item.get("api", ""))
             if not _is_platform_semantic_api(api):
-                raise AssessmentError(
+                raise _api_error(
                     f"platform_semantics entry {api!r} is not a standard-library/platform "
-                    "API; repository-defined behavior must be cited as evidence or "
-                    "declared in external_behavior_assumptions")
+                    "API identity. Use one qualified class constructor or method, optionally "
+                    "with an exact parameter-type signature. Repository-defined behavior requires "
+                    "ordinary pinned-source evidence and causal references; do not delete the "
+                    "claim or put it in external_behavior_assumptions to retain AFFECTED. "
+                    "A material unresolved behavior requires UNKNOWN.", item_index,
+                    'API_REPRESENTATION' if api.startswith(_PLATFORM_API_PREFIXES) else 'API_CLASSIFICATION')
             if _is_repo_implemented_platform_api(api, repository_roots) and not item.get('implementation_evidence'):
                 raise AssessmentError(
                     f"platform_semantics entry {api!r} is implemented by the repository "
@@ -295,12 +344,18 @@ class CausalityChecks:
                 raise AssessmentError(
                     "platform_semantics must cite an executable target call site "
                     "(comments or declarations alone are not reliance)")
-            simple_name = api.rsplit(".", 1)[-1]
+            from .platform_evidence import api_identity, signature_call_present
+            simple_name = api_identity(api)['name'].rsplit('.', 1)[-1]
             if not any(re.search(rf"\b{re.escape(simple_name)}\b",
                                  evidence[index - 1]["excerpt"]) for index in indices):
-                raise AssessmentError(
+                raise _api_error(
                     f"platform_semantics entry {api!r} must be cited at a target call "
-                    "site whose excerpt mentions the API")
+                    "site whose excerpt mentions the API", item_index, 'EVIDENCE_MISSING', 'relied_at_evidence')
+            if not any(signature_call_present(api, evidence[index - 1]) for index in indices):
+                raise _api_error('The supplied API overload is not established by the target call. '
+                                 'Preserve its signature; provide an explicit supported call binding '
+                                 'or retain the unresolved premise, rather than dropping parameters.',
+                                 item_index, 'EVIDENCE_MISSING', 'relied_at_evidence')
             implementation = item.get('implementation_evidence') or []
             if (not implementation or any(type(i) is not int or not 1 <= i <= len(evidence)
                                           for i in implementation)):
@@ -321,5 +376,7 @@ class CausalityChecks:
                 if any(entry.get('unit_id') != evidence[i - 1].get('unit_id') for i in indices):
                     raise AssessmentError('platform implementation evidence must belong to the relying source unit')
                 if not definition_present(api, entry):
-                    raise AssessmentError('platform implementation evidence must contain the named API definition '
-                                          'and executable body; unsupported definitions remain unresolved')
+                    raise _api_error('platform implementation evidence must contain the named API definition '
+                                     'and executable body, matching every supplied parameter type; '
+                                     'unsupported or different overloads remain unresolved', item_index,
+                                     'EVIDENCE_MISSING', 'implementation_evidence')

@@ -263,6 +263,33 @@ class RunContext:
     def hunk_paths(self) -> set[str]:
         return {hunk.get("path") for hunk in self.hunks.values() if hunk.get("path")}
 
+    def donor_search_paths(self, repo, ref):
+        """Default to this source step's changed files at the requested pin.
+
+        These are search hints, not an authorization ceiling. Explicit paths
+        can expand the search without mixing another donor step's filenames.
+        """
+        step = repo.split(':', 1)[1] if repo.startswith('donor:') else None
+        identity = self.source_repositories.get(step, {}) if step else self.record
+        key = ('old_path' if ref == identity.get('source_parent') else
+               'new_path' if ref == identity.get('source_commit') else None)
+        paths, related = set(), set()
+        for hunk in self.hunks.values():
+            if step is not None and hunk.get('source_id') != step:
+                continue
+            values = [hunk.get(field) for field in ('old_path', 'new_path')]
+            if not any(field in hunk for field in ('old_path', 'new_path')):
+                values = [hunk.get('path')]
+            for path in values:
+                if path:
+                    path = validate_relative_path(path)
+                    directory = Path(path).parent.as_posix()
+                    if directory != '.':
+                        related.add(directory)
+            selected = [hunk.get(key)] if key and key in hunk else values
+            paths.update(validate_relative_path(path) for path in selected if path)
+        return sorted(paths), sorted(related)
+
 
 def _truncate_head(text: str, limit: int = MAX_OUTPUT_BYTES) -> str:
     if len(text) <= limit:
@@ -447,7 +474,13 @@ def cmd_view_code(ctx: RunContext, args, *, cache: SourceViewCache | None = None
 
 def _read_view_blob(ctx, args, repo_args, cwd, ref, path) -> str | int:
     try:
-        blob = _git(repo_args, "show", f"{ref}:{path}", cwd=cwd, check=False)
+        from .tool_io import ACTIVE_TOOL_IO
+        io = ACTIVE_TOOL_IO.get()
+        cache = getattr(io.budget.ledger, 'object_cache', None) if io is not None else None
+        query = ('show', f'{ref}:{path}')
+        execute = lambda: _git(repo_args, *query, cwd=cwd, check=False)
+        blob = (cache.query(cwd if cwd is not None else repo_args[1], ref, query, execute)
+                if cache is not None else execute())
     except (OSError, subprocess.SubprocessError) as exc:
         return _finish(ctx, 'view-code', args, 'READ_FAILED: ' + type(exc).__name__
                        + '; file existence and affectedness remain unknown.', 3,

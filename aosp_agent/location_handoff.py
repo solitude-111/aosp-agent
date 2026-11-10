@@ -31,6 +31,31 @@ BACKEND_SCHEMA = obj({'impact': IMPACT_SCHEMA, **EDIT_FIELDS})
 EDIT_SCHEMA = obj(EDIT_FIELDS)
 
 
+class BackendEditSelectionError(AssessmentError):
+    """An invalid selection table does not itself invalidate grounded locations."""
+    kind = 'BACKEND_EDIT_SELECTION_INVALID'
+
+    def __init__(self, message, path):
+        super().__init__(message)
+        self.diagnostic = {'category': self.kind, 'path': path, 'message': message}
+
+
+def backend_scope_feedback(record, location, handoff, targets):
+    """Admit only a selection-only retry bound to the same checked location/pins."""
+    from .assessment_repair import digest
+    retry = record.get('backend_scope_retry')
+    if (not isinstance(retry, dict) or retry.get('kind') != BackendEditSelectionError.kind
+            or not location or handoff.get('status') != 'READY'
+            or handoff.get('scope') == 'READ_ONLY_WITH_GAPS' or handoff.get('unmapped_units')
+            or handoff.get('targets') != targets or retry.get('targets') != targets
+            or retry.get('location_digest') != digest(location)
+            or record.get('location_gaps') or record.get('scope_requests')
+            or record.get('backend_conflicts') or retry.get('report', {}).get('location_gaps')
+            or retry.get('report', {}).get('repository_requests')):
+        return None
+    return {'diagnostic': retry['diagnostic'], 'previous_scope_report': retry['report']}
+
+
 def ground_locations(controller, raw, *, unassociated=None):
     _shape(raw, LOCATION_SCHEMA)
     source = {unit['id']: unit for unit in controller.units}
@@ -177,12 +202,17 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
     raw, errors = None, []
     with controller._runtime('location-handoff', timeout=budget.remaining() / 2 if budget else None) as runtime:
         runtime.start(controller.run_dir, 'Resolve source locations. Read pinned objects only.')
-        for attempt in range(1, min(max_attempts, 2) + 1):
+        from .execution_budget import ACTIVE_EXECUTION
+        execution = ACTIVE_EXECUTION.get()
+        limit = execution.phase_limit('location_attempts', max_attempts) if execution else min(max_attempts, 2)
+        for attempt in range(1, limit + 1):
             unassociated = []
             try:
                 if raw is None:
                     raw = controller._turn(runtime, prompt, LOCATION_SCHEMA, read_only=True)
                 else:
+                    if execution is not None:
+                        execution.charge('report_corrections', phase='LOCATION')
                     correction = controller._turn(runtime, prompt, REPAIR_SCHEMA, read_only=True)
                     _write(controller.run_dir / f'location-repair-{attempt}.json', correction)
                     raw = apply_repair(raw, correction, schema=LOCATION_SCHEMA)
@@ -196,6 +226,11 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
                     errors = exc.errors
                 if raw is not None:
                     prompt = repair_prompt(raw, str(exc))
+                if execution is not None and execution.repeated_error('LOCATION', type(exc).__name__,
+                        errors or [str(exc)]):
+                    controller.record['completion_blocked_by'] = 'REPEATED_ERROR_NO_PROGRESS'
+                    controller._save()
+                    break
             except CodexRuntimeError as exc:
                 if raw is None or exc.kind != 'INVALID_OUTPUT':
                     raise
@@ -238,6 +273,16 @@ def save_location(controller, grounded):
         'targets': {repo.key: repo.head for repo in controller.repos},
         'unmapped_units': [row['id'] for row in raw['units'] if not row['targets']]}
     controller.grounded_location = raw
+    from .execution_budget import ACTIVE_EXECUTION
+    execution = ACTIVE_EXECUTION.get()
+    if execution is not None:
+        # These citations have passed _check_all_evidence against fixed blobs;
+        # neither model notes nor changed report wording grant extra time.
+        execution.record_progress('LOCATION', [
+            {'targets': controller.record['location_handoff']['targets'],
+             'unit': unit['id'], 'citation': {key: citation[key] for key in
+                 ('origin', 'path', 'line_start', 'line_end', 'excerpt') if key in citation}}
+            for unit in grounded['units'] for citation in unit['evidence']])
 
 
 def select_edits(location, response):
@@ -245,12 +290,21 @@ def select_edits(location, response):
     assessment = deepcopy(location)
     units = {row['id']: row for row in assessment['units']}
     selected = {}
-    for row in response['edits']:
+    for row_index, row in enumerate(response['edits']):
         ident, indices = row['unit_id'], row['target_indices']
-        if ident in selected or ident not in units or not indices or len(indices) != len(set(indices)):
-            raise AssessmentError('edits require unique grounded unit IDs and target indices')
+        pointer = f'/edits/{row_index}'
+        if ident in selected or ident not in units:
+            raise BackendEditSelectionError('edits require unique grounded unit IDs', pointer + '/unit_id')
+        if not indices:
+            raise BackendEditSelectionError('edits require nonempty target indices', pointer + '/target_indices')
         targets = units[ident]['targets']
-        if any(i > len(targets) or targets[i - 1]['action'] != 'edit' for i in indices):
+        for index, value in enumerate(indices):
+            if type(value) is not int or value < 1 or value > len(targets):
+                raise BackendEditSelectionError('backend edit index is outside grounded targets: ' + ident,
+                                                pointer + f'/target_indices/{index}')
+        if len(indices) != len(set(indices)):
+            raise BackendEditSelectionError('edits require unique target indices', pointer + '/target_indices')
+        if any(targets[i - 1]['action'] != 'edit' for i in indices):
             raise AssessmentError('backend edit exceeds grounded location scope: ' + ident)
         selected[ident] = set(indices)
     writable = set()
@@ -303,6 +357,7 @@ class BackendHandoff:
         seed = controller.backend_impact_seed
         targets = {repo.key: repo.head for repo in controller.repos}
         self.accepted_impact = seed['assessment'] if seed and seed['targets'] == targets else None
+        self.scope_feedback = seed.get('scope_feedback') if self.accepted_impact is not None else None
 
     def target_content(self, path):
         # Preserve local paths used by the original backend. Fully qualified
@@ -320,6 +375,10 @@ class BackendHandoff:
                       'scope and obligations requested by the schema.\n'
                       + json.dumps(self.accepted_impact, ensure_ascii=False)
                       if reused_impact else 'Use your usual impact analysis in the impact field.')
+        scope_feedback = ('\nCorrect the rejected backend edit selection below within the unchanged '
+                          'grounded locations. A read-only unit needs no edits entry. Return the '
+                          'requested scope schema; do not invent an edit or change the accepted impact.\n'
+                          + json.dumps(self.scope_feedback, ensure_ascii=False) if self.scope_feedback else '')
         return ('''
 The locations below are pinned candidate anchors, not a verdict. Qualify cross-project target evidence with its
 repository key. To read an admitted dependency, use target:<repository-key> and its pinned ref.
@@ -341,7 +400,7 @@ the donor delta and target flag references. Return an empty array for either fie
 when it does not apply.
 Select a member_insertion only if a new target member is required. Its insertion_lines
 name the permitted boundary; the wider quoted range is context.
-''' + '\n' + assessment + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
+''' + '\n' + assessment + scope_feedback + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
                 + '\nUnverified location gaps: ' + json.dumps(self.controller.record.get('location_gaps', []), ensure_ascii=False)
                 + '\nGuarded obligations: ' + json.dumps(self.controller.guarded_obligations, ensure_ascii=False))
 
@@ -390,6 +449,20 @@ name the permitted boundary; the wider quoted range is context.
             repair = ground_repair_contract(controller, {row['id']: row for row in assessment['units']},
                                             obligations, response['repair_obligations'], '/repair_obligations')
             self.flag_support = ground_flag_support(controller, response.get('flag_cleanup_support', []), ids)
+        except BackendEditSelectionError as exc:
+            from .assessment_repair import digest
+            controller.record['migration_scope_diagnostic'] = exc.diagnostic
+            controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
+            location = controller.record.get('location_handoff', {})
+            if (location.get('status') == 'READY' and not location.get('unmapped_units')
+                    and location.get('scope') != 'READ_ONLY_WITH_GAPS'
+                    and not controller.record.get('location_gaps') and not response['location_gaps']):
+                controller.record['backend_scope_retry'] = {
+                    'kind': exc.kind, 'diagnostic': exc.diagnostic,
+                    'targets': location['targets'], 'location_digest': digest(controller.grounded_location),
+                    'report': {key: deepcopy(response[key]) for key in EDIT_FIELDS}}
+                controller.record['replan_required'] = 'BACKEND_SCOPE_CORRECTION_REQUIRED'
+            return self.unresolved(child, 'MIGRATION_SCOPE_UNRESOLVED', str(exc))
         except AssessmentError as exc:
             controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
             return self.unresolved(child, 'MIGRATION_SCOPE_UNRESOLVED', str(exc))
@@ -427,6 +500,11 @@ name the permitted boundary; the wider quoted range is context.
             'assessment_sha256': controller.protected[path],
             'targets': {repo.key: repo.head for repo in controller.repos}})
         controller._save()
+        from .execution_budget import ACTIVE_EXECUTION
+        execution = ACTIVE_EXECUTION.get()
+        if execution is not None:
+            execution.record_progress('IMPACT', [{'verified_decision': decision,
+                'targets': controller.record['impact_analysis']['targets']}])
 
     def unresolved(self, child, reason, detail=None):
         controller = self.controller

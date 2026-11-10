@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from aosp_agent.artifact_roles import nearby_test_consumer
 from aosp_agent.blueprint_glob import glob_matches, _compile
 from aosp_agent.build_discovery import discover_build
-from aosp_agent.validation_plan import make_plan
+from aosp_agent.validation_plan import make_plan, normalize_checks
+from aosp_agent.verification_evidence import validation_policy
 
 
 def repository(metadata):
@@ -71,7 +72,24 @@ class BlueprintGlobTest(unittest.TestCase):
         build = discover_build(repo, ['A.java'])
         self.assertEqual(build['status'], 'UNRESOLVED')
         self.assertEqual(build['unresolved_consumers'][0]['module'], 'conditional')
-        self.assertEqual(make_plan(repo, [], {}, ['A.java'], '', build_runner='/trusted/build')['checks'], [])
+        owners = {module['name']: module for module in build['modules']}
+        self.assertEqual(owners['main']['sources'], ['A.java'])
+        self.assertNotIn('conditional_sources', owners['main'])
+        self.assertEqual(owners['conditional']['conditional_sources'], ['A.java'])
+        plan = make_plan(repo, [], {}, ['A.java'], '', build_runner='/trusted/build')
+        self.assertEqual(plan['build']['status'], 'UNRESOLVED')
+        self.assertEqual(plan['build']['unresolved_consumers'], build['unresolved_consumers'])
+        # A literal conditional edge can be handed to Soong, but remains outside
+        # confirmed coverage even when that partial build succeeds.
+        check, = normalize_checks(plan['checks'])
+        self.assertEqual(check['argv'], ['/trusted/build', 'conditional', 'main'])
+        self.assertEqual(check['coverage'], 'partial')
+        policy = validation_policy([{**check, 'covers': ['repo'], 'returncode': 0,
+                                     'build_receipt_verified': True}], ['repo'], expected_checks=1)
+        self.assertTrue(policy['all_configured_checks_passed'])
+        self.assertEqual(policy['build_covered_repositories'], [])
+        self.assertEqual(policy['missing_build_repositories'], ['repo'])
+        self.assertFalse(policy['satisfied'])
 
     def test_invalid_source_or_exclusion_prevents_build_credit(self):
         for properties in ('srcs: ["**.java"]', 'srcs: ["*.java"], exclude_srcs: ["[A-"]',

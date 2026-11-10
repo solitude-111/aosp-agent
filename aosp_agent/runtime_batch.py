@@ -1,5 +1,6 @@
 """Serial four-field JSONL execution with per-row, answer-free provenance."""
 from collections import Counter
+from contextlib import nullcontext
 import hashlib
 import json
 from pathlib import Path
@@ -11,11 +12,14 @@ from .retrieval import ReadBudget, BudgetExceeded
 from .runtime_input import RuntimeInput, resolve_sources
 from .lifecycle import run_lease, source_lease, LeaseBusy, RecoveryBlocked
 from .delivery import update_delivery
+from .failure_policy import classify_failure
 
 
 class RuntimeBatch:
     def __init__(self, input_file, target_root, run_root, donor_root, *, donor_map=None,
-                 task_id=None, agent_options=None, runtime_factory=None, _resume_rows=None, _resume_leases=None):
+                 task_id=None, agent_options=None, runtime_factory=None, _resume_rows=None, _resume_leases=None,
+                 case_output_bytes=None, batch_output_bytes=None, preparer=None, frozen_receipt=None,
+                 batch_budget_root=None):
         self.input_file, self.target_root = Path(input_file).resolve(), Path(target_root).resolve()
         self.input_bytes = self.input_file.read_bytes()
         # Every nonblank line keeps its original number, including invalid rows.
@@ -33,21 +37,36 @@ class RuntimeBatch:
             raise ValueError('donor map must map origin strings to local path strings')
         self.options = dict(agent_options or {})
         forbidden = {'task_id', 'target_revision', 'source_sequence', 'donor_repo', 'source_commit', 'source_parent',
-                     'read_budget', 'catalog', 'pinned_heads', 'project_hints'} & set(self.options)
+                     'read_budget', 'catalog', 'pinned_heads', 'project_hints', 'prepared_case', 'execution_budget'} & set(self.options)
         if forbidden:
             raise ValueError('runtime input identities cannot be overridden: ' + ', '.join(sorted(forbidden)))
         self.runtime_factory = runtime_factory
         self.resume_rows = _resume_rows or {}
         self.resume_leases = _resume_leases or {}
+        self.case_output_bytes = case_output_bytes
+        self.preparer, self.frozen_receipt = preparer, frozen_receipt
         self.run_dir.mkdir(parents=True, exist_ok=False)
+        from .batch_budget import BatchBudget
+        shared = dict(preparer.config.get('batch_limits', {})) if preparer else {}
+        shared.setdefault('max_output_bytes', batch_output_bytes or self.options.get('max_output_bytes', 256 * 1024 * 1024))
         from .output_budget import create_budget, write_bytes
-        self.output_budget = create_budget(self.run_dir, self.options.get('max_output_bytes', 256 * 1024 * 1024))
+        self.output_budget = create_budget(self.run_dir, shared['max_output_bytes'])
+        self.batch_budget = BatchBudget(batch_budget_root or self.run_dir, limits=shared,
+            output_root=self.output_budget.root, existing=batch_budget_root is not None)
+        self._resumed_preparation = batch_budget_root is not None
         write_bytes(self.run_dir / 'input.jsonl', self.input_bytes)
         self.record = {'task_id': self.task_id, 'status': 'PREPARED', 'input_sha256': digest,
                        'execution': 'serial_project_first', 'row_count': len(self.lines), 'rows': [],
+                       'batch_budget_root': str(self.batch_budget.root),
                        'runtime_security_proven': False}
+        from .checkpoint import checkpoint_metadata
+        self.record.update(checkpoint_metadata())
         spec = {'target_root': str(self.target_root), 'donor_root': str(self.donor_root),
-                'donor_map': self.donor_map, 'agent_options': self.options}
+                'donor_map': self.donor_map, 'agent_options': self.options,
+                'case_output_bytes': case_output_bytes, 'batch_output_bytes': batch_output_bytes}
+        if preparer:
+            spec['preparation_config'] = preparer.serialized_config()
+            self.record['preparation_accounting'] = str(self.batch_budget.root / 'preparation-budget.json')
         _write(self.run_dir / 'resume-input.json', json.loads(json.dumps(spec, default=str)))
         self.record['resume_input_sha256'] = hashlib.sha256((self.run_dir / 'resume-input.json').read_bytes()).hexdigest()
         self._save()
@@ -57,6 +76,7 @@ class RuntimeBatch:
         self.record['delivery_counts'] = dict(Counter(row.get('delivery_status', 'PENDING') for row in self.record['rows']))
         self.record['remaining_rows'] = self.record['row_count'] - len(self.record['rows'])
         self.record['output_budget'] = self.output_budget.data()
+        self.record['batch_budget'] = self.batch_budget.snapshot()
         _write(self.run_dir / 'batch-status.json', self.record, control=True)
 
     def run(self, *, _source_lease=None, **run_options):
@@ -64,9 +84,16 @@ class RuntimeBatch:
             self.record['run_options'] = run_options; self._save()
             try:
                 with source_lease(self.target_root, _source_lease) as lease:
+                    if self.preparer:
+                        frozen = self.preparer.freeze_inputs(self.lines, self.run_dir,
+                            frozen_receipt=self.frozen_receipt, accounting_root=self.batch_budget.root,
+                            require_existing=self._resumed_preparation)
+                        self.record.update(preparation_frozen_receipt=frozen,
+                            preparation_frozen_sha256=hashlib.sha256(Path(frozen).read_bytes()).hexdigest())
+                        self._save()
                     return self._run(lease, **run_options)
             except (LeaseBusy, RecoveryBlocked) as exc:
-                self.record.update(status='BLOCKED', completion_blocked_by='EXECUTION_OR_RECOVERY_BARRIER',
+                self.record.update(status='BLOCKED', completion_blocked_by=getattr(exc, 'kind', 'EXECUTION_OR_RECOVERY_BARRIER'),
                                    error={'type': type(exc).__name__, 'message': str(exc)})
                 self._save()
                 return self.record
@@ -78,9 +105,13 @@ class RuntimeBatch:
     def _run(self, lease, **run_options):
         self.record['status'] = 'RUNNING'; self._save()
         for number, line in self.lines:
+            self.batch_budget.check()
             self.output_budget.check()
             row_dir = self.run_dir / f'row-{number:04}'
             row_dir.mkdir()
+            if self.case_output_bytes is not None:
+                from .output_budget import create_budget
+                create_budget(row_dir, self.case_output_bytes, independent=True)
             from .output_budget import write_text
             write_text(row_dir / 'input.json', line + '\n')
             result = {'line': number, 'status': 'PREPARING', 'impact_decision': 'UNKNOWN',
@@ -88,31 +119,50 @@ class RuntimeBatch:
             self.record['rows'].append(result)
             _write(row_dir / 'run.json', update_delivery(result), control=True); self._save()
             previous = self.resume_rows.get(number)
-            if previous and previous['status'] not in ('PREPARING', 'CANCELLED', 'BLOCKED'):
+            if previous and previous.get('terminal_retry_count'):
+                result['terminal_retry_count'] = previous['terminal_retry_count']
+            if previous and not previous.get('retry_terminal') and previous['status'] not in ('PREPARING', 'CANCELLED', 'BLOCKED'):
                 previous_record = previous['record']
                 result.update({k: v for k, v in previous.items() if k != 'record'})
                 result['reused_terminal_record'] = previous_record
                 _write(row_dir / 'run.json', update_delivery(result), control=True); self._save()
                 continue
-            budget = ReadBudget(self.options.get('investigation_seconds', 900), self.options.get('max_git_operations', 2000))
+            budget = ReadBudget(self.options.get('investigation_seconds', 900), self.options.get('max_git_operations', 2000),
+                                output_bytes=self.options.get('max_read_bytes', 64 * 1024 * 1024))
+            prepared = None
             try:
                 if previous and previous.get('execution_record'):
                     from .resume import resume_project
-                    outcome = resume_project(previous['execution_record'], runtime_factory=self.runtime_factory,
-                        run_root=row_dir, task_id='execution', _source_lease=lease,
-                        _previous_lease=self.resume_leases.get(number),
-                        _on_prepared=lambda path: self._prepared_execution(row_dir, result, path))
+                    receipt = previous.get('preparation_receipt')
+                    if receipt and self.preparer is None:
+                        raise RecoveryBlocked('isolated rows must resume through run-patches --resume')
+                    with self.preparer.activate_receipt(receipt) if receipt else nullcontext(None) as resumed:
+                        if receipt: result['preparation_receipt'] = receipt
+                        outcome = resume_project(previous['execution_record'], runtime_factory=self.runtime_factory,
+                            run_root=row_dir, task_id='execution', _source_lease=lease,
+                            _previous_lease=self.resume_leases.get(number), prepared_case=resumed,
+                            batch_budget=self.batch_budget,
+                            _on_prepared=lambda path: self._prepared_execution(row_dir, result, path))
                     result.update({k: v for k, v in outcome.items() if k not in ('task_id', 'record')})
                     result['execution_record'] = outcome['record']
+                    classification = classify_failure(result)
+                    result['failure_policy'] = classification
+                    if classification['scope'] == 'shared':
+                        result.update(status='BLOCKED', completion_blocked_by=classification['kind'])
                     _write(row_dir / 'run.json', update_delivery(result), control=True); self._save()
-                    if result['status'] in ('CANCELLED', 'BLOCKED'):
+                    if result['status'] == 'CANCELLED' or classification['scope'] == 'shared':
                         self.record['status'] = result['status']; self._save()
                         return self.record
                     continue
                 with budget.active():
                     task = RuntimeInput.parse(json.loads(line))
                     result['input_task_id'] = task.task_id
-                    resolution = resolve_sources(task, self.donor_root, donor_map=self.donor_map)
+                    if self.preparer:
+                        prepared = self.preparer.prepare(task, row_dir)
+                        result['preparation_receipt'] = str(prepared.receipt_path)
+                        _write(row_dir / 'run.json', update_delivery(result), control=True); self._save()
+                    resolution = resolve_sources(task, self.donor_root,
+                                                 donor_map=prepared.donor_map if prepared else self.donor_map)
                     _write(row_dir / 'source-resolution.json', resolution)
                     if resolution['status'] != 'READY':
                         result.update(status='INPUT_UNRESOLVED', problems=resolution['problems'])
@@ -130,14 +180,21 @@ class RuntimeBatch:
                             identity = {'source_sequence': sources}
                         agent = ProjectFirstAgent(data, self.target_root, row_dir, task_id='execution',
                             target_revision=task.target_revision, read_budget=budget,
+                            **({'catalog': prepared.catalog, 'prepared_case': prepared} if prepared else {}),
                             runtime_factory=self.runtime_factory, **identity, **options)
+                        agent.execution.batch_budget = self.batch_budget
+                        if prepared:
+                            agent.record['preparation_receipt'] = str(prepared.receipt_path)
                         result['execution_record'] = str(agent.run_dir / 'run.json')
                         _write(row_dir / 'run.json', update_delivery(result), control=True); self._save()
                         outcome = agent.run(_source_lease=lease, **run_options)
                         result.update({k: v for k, v in outcome.items() if k not in ('task_id', 'record')})
                         result['execution_record'] = str(agent.run_dir / 'run.json')
             except (LeaseBusy, RecoveryBlocked) as exc:
-                result.update(status='BLOCKED', completion_blocked_by='EXECUTION_OR_RECOVERY_BARRIER',
+                policy = classify_failure(exc)
+                result.update(status='INCONCLUSIVE' if policy['scope'] == 'case' else 'BLOCKED',
+                              completion_blocked_by=policy['kind'],
+                              failure_policy=policy,
                               error={'type': type(exc).__name__, 'message': str(exc)})
             except BudgetExceeded as exc:
                 result.update(status='INCONCLUSIVE', completion_blocked_by='BUDGET_EXHAUSTED',
@@ -148,14 +205,33 @@ class RuntimeBatch:
             except Exception as exc:
                 # A failed resume preflight/creation is not an independent case
                 # failure: stopped-source and checkpoint safety are unresolved.
-                blocked = bool(previous and previous.get('execution_record'))
+                classification = classify_failure(exc)
+                blocked = bool(previous and previous.get('execution_record')) or classification['scope'] == 'shared'
                 result.update(status='BLOCKED' if blocked else 'FAILED',
-                              error={'type': type(exc).__name__, 'message': str(exc)[:2000]})
+                              error={'type': type(exc).__name__, 'kind': getattr(exc, 'kind', None),
+                                     'message': str(exc)[:2000]}, failure_policy=classification)
                 if blocked:
                     result['completion_blocked_by'] = 'RESUMPTION_PRECONDITION_FAILED'
+                    result['failure_policy'] = {'scope': 'shared', 'action': 'PAUSE_BATCH',
+                                                'kind': 'RESUMPTION_PRECONDITION_FAILED'}
+            finally:
+                if prepared is not None:
+                    try:
+                        self.preparer.release(prepared)
+                    except BaseException as exc:
+                        result.update(status='BLOCKED', completion_blocked_by='ISOLATION_RESTORE_UNVERIFIED',
+                                      failure_policy={'scope': 'shared', 'action': 'PAUSE_BATCH',
+                                                      'kind': 'ISOLATION_RESTORE_UNVERIFIED'},
+                                      error={'type': type(exc).__name__, 'message': str(exc)[:1000]})
             result['investigation_budget'] = budget.data()
+            classification = result.get('failure_policy') or classify_failure(result)
+            result['failure_policy'] = classification
+            if classification['scope'] == 'shared':
+                result.update(status='BLOCKED', completion_blocked_by=classification['kind'])
+            elif classification['kind'] == 'CASE_OUTPUT_BUDGET_EXHAUSTED':
+                result['status'] = 'INCONCLUSIVE'
             _write(row_dir / 'run.json', update_delivery(result), control=True); self._save()
-            if result['status'] in ('CANCELLED', 'BLOCKED'):
+            if result['status'] == 'CANCELLED' or classification['scope'] == 'shared':
                 self.record['status'] = result['status']; self._save()
                 return self.record
         self.record['status'] = 'COMPLETED'; self._save()

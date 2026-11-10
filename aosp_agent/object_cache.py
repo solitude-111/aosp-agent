@@ -168,7 +168,15 @@ class ObjectCache:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > self.max_entry_bytes:
                     raise ValueError('oversized or non-regular cache entry')
-                raw = stream.read(self.max_entry_bytes + 1)
+                from .tool_io import ACTIVE_TOOL_IO
+                io = ACTIVE_TOOL_IO.get()
+                receipt = io.budget.reserve_bytes(info.st_size + 1, 'cache_file_read') if io else None
+                raw = b''
+                try:
+                    raw = stream.read(info.st_size + 1)
+                finally:
+                    if receipt is not None:
+                        io.budget.settle_bytes(receipt, len(raw))
                 if len(raw) != info.st_size:
                     raise ValueError('cache entry changed during read')
             row = json.loads(raw)

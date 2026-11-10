@@ -24,6 +24,37 @@ def interrupt(_):
 
 
 class LifecycleTest(unittest.TestCase):
+    def test_candidate_salvage_cannot_follow_an_unverified_accounting_root(self):
+        with GitFixture() as fx:
+            old = self.cancelled(fx)
+            path = old.run_dir / 'run.json'
+            record = json.loads(path.read_text())
+            record['execution_budget']['root'] = str(fx.root / 'unrelated-task')
+            path.write_text(json.dumps(record))
+            with patch('aosp_agent.candidate_store.recover_stopped_candidates') as recover:
+                with self.assertRaisesRegex(RecoveryBlocked, 'accounting root'):
+                    resume_project(path)
+                recover.assert_not_called()
+
+    def test_completed_batch_timeout_retry_keeps_shared_identity_and_stops_after_one_retry(self):
+        from aosp_agent.sdk_runtime import CodexRuntimeError
+        with GitFixture() as fx:
+            entry.manifest(fx)
+            path = fx.root / 'input.jsonl'; path.write_text(json.dumps(entry.row(fx)))
+            runner = RuntimeBatch(path, fx.source_root, fx.run_root, fx.root / 'donors',
+                donor_map={entry.ORIGIN: str(fx.repo)})
+            with patch.object(ProjectFirstAgent, '_prepare', side_effect=CodexRuntimeError('timed out', kind='TIMEOUT')):
+                initial = runner.run(inspect_only=True)
+                self.assertEqual(initial['status'], 'COMPLETED', initial)
+                self.assertEqual(initial['rows'][0]['completion_blocked_by'], 'MODEL_TIMEOUT')
+                outcome = resume_batch(runner.run_dir / 'batch-status.json')
+            self.assertEqual(outcome['rows'][0]['terminal_retry_count'], 1)
+            self.assertEqual(outcome['batch_budget_root'], initial['batch_budget_root'])
+            self.assertEqual(outcome['rows'][0]['execution_budget']['lineage_id'],
+                             initial['rows'][0]['execution_budget']['lineage_id'])
+            with self.assertRaisesRegex(RecoveryBlocked, 'no interrupted or policy-retryable'):
+                resume_batch(outcome['record'])
+
     def test_damaged_restore_receipt_blocks_before_a_fresh_attempt(self):
         with GitFixture() as fx:
             old = self.cancelled(fx)
@@ -182,7 +213,7 @@ class LifecycleTest(unittest.TestCase):
                 if process.poll() is None:
                     process.kill(); process.communicate()
 
-    def cancelled(self, fx, during_migration=False):
+    def cancelled(self, fx, during_migration=False, candidate_attempts=2):
         replies = [(routing.ProjectFirstTest().assessment(), None if during_migration else interrupt)]
         if during_migration:
             def edit_and_stop(cwd):
@@ -192,7 +223,8 @@ class LifecycleTest(unittest.TestCase):
         runtime = QueueRuntime(replies)
         agent = ProjectFirstAgent(diff('counter.py', BASELINE, FIXED).encode(), fx.source_root, fx.run_root,
             catalog=routing.ProjectFirstTest().catalog(fx), repository_keys=['repo'], runtime_factory=runtime.factory,
-            auto_validation=False, validation={'repo': [[sys.executable, '-B', 'verify_contract.py']]})
+            auto_validation=False, candidate_attempts=candidate_attempts,
+            validation={'repo': [[sys.executable, '-B', 'verify_contract.py']]})
         result = agent.run(max_attempts=1, verify=True, impact_only=not during_migration)
         self.assertEqual(result['status'], 'CANCELLED')
         self.assertEqual(result['cancellation_source_guard'], 'PASS')
@@ -230,6 +262,16 @@ class LifecycleTest(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, 'already active'):
                     resume_project(old.run_dir / 'run.json')
             self.assertEqual(process_state(old.run_dir), 'NO_ACTIVE_LEASE')
+
+    def test_cancelled_write_consumes_the_last_case_candidate_turn(self):
+        with GitFixture() as fx:
+            old = self.cancelled(fx, during_migration=True, candidate_attempts=1)
+            runtime = QueueRuntime([])
+            result = resume_project(old.run_dir / 'run.json', runtime_factory=runtime.factory)
+            self.assertEqual(runtime.calls, [])
+            self.assertEqual(result['execution_budget']['consumed']['candidate_turns'], 1)
+            self.assertEqual(result['status'], 'INCONCLUSIVE')
+            self.assertEqual(result['impact_decision'], 'AFFECTED')
 
     def test_changed_original_or_pending_restore_blocks_resume(self):
         for changed_source in (True, False):

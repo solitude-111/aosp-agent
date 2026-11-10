@@ -51,6 +51,16 @@ def stop_group(process, grace=10):
 
 
 def run_check(argv, cwd, env, timeout=1800, grace=30, *, output_limit=64 * 1024 * 1024):
+    from .execution_budget import ACTIVE_EXECUTION
+    execution = ACTIVE_EXECUTION.get()
+    if execution is None:
+        return _run_check(argv, cwd, env, timeout, grace, output_limit=output_limit)
+    timeout = min(timeout, execution.remaining_seconds())
+    with execution.operation('verification', phase='VERIFY', timeout=timeout):
+        return _run_check(argv, cwd, env, timeout, grace, output_limit=output_limit)
+
+
+def _run_check(argv, cwd, env, timeout=1800, grace=30, *, output_limit=64 * 1024 * 1024):
     """Return only after the verifier's process group has stopped.
 
     Capture retains bounded in-memory diagnostics, with a combined stdout/stderr

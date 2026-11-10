@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .case import Case, validate_relative_path
 from .impact_proof import AssessmentError, CausalityChecks
 from .lifecycle import source_guard
+from .execution_budget import controller_audit
 from .git_policy import OFFLINE_GIT_ENV, offline_git_env
 from .diagnosis import apply_diagnosis, verification_diagnosis
 from .ladder import ladder_plan, strategy_prompt
@@ -75,6 +76,13 @@ def _context_diff_lines(patch: str) -> list[str]:
 
 def _strip_comments(line: str) -> str:
     return _BLOCK_COMMENT_RE.sub(" ", _LINE_COMMENT_RE.sub("", line))
+
+
+def _coverage_code_line(line: str) -> str:
+    code = _strip_comments(line).strip()
+    if code.startswith(('/*', '*', '*/', '<!--', '-->')) or not re.search(r'[\w$]', code):
+        return ''
+    return _normalized_code_line(code)
 
 
 def _added_code_lines(patch: str) -> list[str]:
@@ -424,17 +432,19 @@ class AospBackportAgent(CausalityChecks):
                 "returncode": check.returncode, "stderr": check.stderr[-5000:]}
 
     def _ground_assessment(self, text: str) -> dict[str, Any]:
+        from .impact_proof import evidence_error
         assessment = parse_impact_response(text)
         if assessment["status"] != "UNKNOWN" and not any(e["revision"] in ("source_parent", "source_fix")
                                                           for e in assessment["evidence"]):
             raise AssessmentError("determinate assessment requires donor evidence")
         refs = {"target": self.case.target_commit, "source_parent": self.case.source_parent,
                 "source_fix": self.case.source_commit}
-        for evidence in assessment["evidence"]:
+        for evidence_index, evidence in enumerate(assessment["evidence"]):
             if (evidence["revision"] != "target"
                     and evidence["path"] not in self.case.files
                     and evidence["path"] not in getattr(self, "_source_changed_paths", set())):
-                raise AssessmentError(f"source evidence path is not in the donor fix diff: {evidence['path']}")
+                raise evidence_error(f"source evidence path is not in the donor fix diff: {evidence['path']}",
+                                     evidence_index, 'path')
             runner = self._git if evidence["revision"] == "target" else self._source_git
             try:
                 if self.location_handoff and evidence['revision'] == 'target':
@@ -442,20 +452,24 @@ class AospBackportAgent(CausalityChecks):
                 else:
                     content = runner("show", f"{refs[evidence['revision']]}:{evidence['path']}").stdout
             except subprocess.CalledProcessError as exc:
-                raise AssessmentError(
-                    f"evidence file does not exist in {evidence['revision']}:{evidence['path']}") from exc
+                raise evidence_error(
+                    f"evidence file does not exist in {evidence['revision']}:{evidence['path']}",
+                    evidence_index, 'path') from exc
             lines = content.splitlines()
             start, end = evidence["line_start"], evidence["line_end"]
             if end > len(lines):
-                raise AssessmentError(f"evidence line range exceeds {evidence['revision']}:{evidence['path']}")
+                raise evidence_error(f"evidence line range exceeds {evidence['revision']}:{evidence['path']}",
+                                     evidence_index, 'line_end')
             excerpt = evidence["excerpt"].strip()
             excerpt_lines = excerpt.splitlines()
             matches = [index for index in range(len(lines) - len(excerpt_lines) + 1)
                        if "\n".join(lines[index:index + len(excerpt_lines)]).strip() == excerpt]
             if not matches:
-                raise AssessmentError(f"evidence excerpt does not exist in {evidence['revision']}:{evidence['path']}:{start}-{end}")
+                raise evidence_error(f"evidence excerpt does not exist in {evidence['revision']}:{evidence['path']}:{start}-{end}",
+                                     evidence_index, 'excerpt')
             if self.location_handoff and start - 1 not in matches and len(matches) != 1:
-                raise AssessmentError(f"ambiguous pinned evidence range: {evidence['path']}:{start}-{end}")
+                raise evidence_error(f"ambiguous pinned evidence range: {evidence['path']}:{start}-{end}",
+                                     evidence_index, 'line_start')
             actual_start = start if self.location_handoff and start - 1 in matches else matches[0] + 1
             actual_end = actual_start + len(excerpt_lines) - 1
             if actual_start != start or actual_end != end:
@@ -470,7 +484,9 @@ class AospBackportAgent(CausalityChecks):
 
 
     def _turn(self, runtime, prompt: str, *, read_only: bool, phase: str, schema=None) -> dict:
-        result = runtime.run(prompt, read_only=read_only, output_schema=schema)
+        from .execution_budget import model_context
+        with model_context(phase, self.case.repository):
+            result = runtime.run(prompt, read_only=read_only, output_schema=schema)
         if result.get("status") != "completed":
             raise RuntimeError(f"SDK turn did not complete: {result.get('status')}")
         self._event("codex_turn", phase=phase, thread_id=result.get("thread_id"), turn_id=result.get("turn_id"),
@@ -821,6 +837,24 @@ class AospBackportAgent(CausalityChecks):
             target_hunks = by_path.get(target, [])
             if not target_hunks:
                 continue
+            if target.endswith('.java') and site is None:
+                from .continuation_proof import introduced_effects, coverage_gate
+                effects = introduced_effects(hunk.get('patch', ''))
+                if any(not effect['source_excludes_continuation'] for effect in effects):
+                    baseline_text = self._artifact_baseline_text(target)
+                    candidate_file = self.worktree / target
+                    if (baseline_text is None or candidate_file.is_symlink() or not candidate_file.is_file()
+                            or candidate_file.stat().st_size > 4 * 1024 * 1024):
+                        flow = {'status': 'UNRESOLVED', 'reason': 'bounded source for conditional continuation is unavailable'}
+                    else:
+                        flow = coverage_gate(hunk['patch'], baseline_text, candidate_file.read_text(),
+                            start=scope['line_start'] if scope else 1, end=scope['line_end'] if scope else None)
+                    self.__dict__.setdefault('record', {}).setdefault('continuation_obligations', {})[hunk['id'] + ':' + target] = flow
+                    if flow['status'] == 'UNRESOLVED':
+                        result.update(control_flow_obligations=flow,
+                            error='conditional effects require a grounded continuation postcondition; '
+                                  'calls, matching comments and hunk tokens are not a control-flow proof')
+                        return result
             if site is None:
                 analysis = self._target_baseline_analysis(target)
                 if analysis is not None:
@@ -861,11 +895,11 @@ class AospBackportAgent(CausalityChecks):
                 return result
 
             normalized_target = {
-                _normalized_code_line(line) for line in target_lines
+                _coverage_code_line(line) for line in target_lines if _coverage_code_line(line)
             }
             exact = sorted(
                 line for line in expected_lines
-                if _normalized_code_line(line) in normalized_target
+                if _coverage_code_line(line) and _coverage_code_line(line) in normalized_target
             )
             if exact:
                 result.update(
@@ -1022,9 +1056,22 @@ class AospBackportAgent(CausalityChecks):
                 return False
             key = scope.split(':', 1)[1] if ':' in scope else self.mapping_repository
             regions = self.mapping_plan.targets(key, unit_id=hunk['id'])
+            def receipt_line(value):
+                if type(value) is int:
+                    return value if value > 0 else None
+                # agent_tools._finish serializes argv values with str(). Admit
+                # only that canonical positive integer spelling, not coercions.
+                if isinstance(value, str) and re.fullmatch(r'[1-9][0-9]*', value):
+                    try:
+                        return int(value)
+                    except ValueError:
+                        pass
+                return None
+            start, end = receipt_line(arguments.get('start')), receipt_line(arguments.get('end'))
+            if start is None or end is None or start > end:
+                return False
             return any(arguments.get('path') == region['path']
-                       and type(arguments.get('start')) is int and type(arguments.get('end')) is int
-                       and arguments['start'] <= region['line_end'] and arguments['end'] >= region['line_start']
+                       and start <= region['line_end'] and end >= region['line_start']
                        for region in regions)
         if command == "hunk-history":
             return arguments.get("hunk_id") == hunk["id"]
@@ -1369,49 +1416,95 @@ class AospBackportAgent(CausalityChecks):
             handoff_instructions = handoff.instructions(reused_impact=bool(accepted_impact)) if handoff else ''
             impact_request += handoff_instructions
             assessment = None
-            for impact_attempt in range(1, max_attempts + 1):
-                result = self._turn(runtime, impact_request, read_only=True,
-                                    phase="impact" if impact_attempt == 1 else "impact_correction",
-                                    schema=impact_schema)
-                self.record["impact_report"] = result.get("final_response", "")
+            from copy import deepcopy
+            from .assessment_repair import (REPAIR_SCHEMA, apply_repair, digest,
+                                            repair_prompt, seed_context)
+            from .execution_budget import ACTIVE_EXECUTION
+            from .impact_proof import assessment_diagnostic
+            from .sdk_runtime import CodexRuntimeError, charge_report_correction
+            from jsonschema import ValidationError, validate
+            ledger = ACTIVE_EXECUTION.get()
+            # Parsed report errors belong to the local field-repair loop, not
+            # the SDK's whole-document format retry. Both charge one ledger.
+            runtime.defer_schema_errors = True
+            runtime.report_repository = self.case.repository
+            raw_report, previous_failure = None, None
+            impact_limit = ledger.phase_limit('impact_attempts', max_attempts) if ledger else max_attempts
+            for impact_attempt in range(1, impact_limit + 1):
+                correction = raw_report is not None
+                scope_correction = bool(accepted_impact and handoff.scope_feedback and impact_attempt == 1)
+                if correction:
+                    charge_report_correction(phase='impact_correction', repository=self.case.repository)
+                elif scope_correction:
+                    charge_report_correction(phase='backend_scope_correction', repository=self.case.repository)
+                diagnostic = None
                 try:
-                    # Prefer the runtime's parsed (possibly tail-repaired) object;
-                    # re-parsing the raw text would bypass that repair.
-                    response = result.get("output", result["final_response"])
-                    if handoff:
-                        from .mapping_plan import _shape
-                        if isinstance(response, str):
-                            try:
-                                response = json.loads(response)
-                            except ValueError as exc:
-                                raise AssessmentError('backend handoff response must be JSON') from exc
-                        _shape(response, impact_schema)
+                    result = self._turn(runtime, impact_request, read_only=True,
+                                        phase=('impact_correction' if correction else
+                                               'backend_scope_correction' if scope_correction else 'impact'),
+                                        schema=REPAIR_SCHEMA if correction else impact_schema)
+                    self.record['impact_report'] = result.get('final_response', '')
+                    response = result.get('output', result['final_response'])
+                    if isinstance(response, str):
+                        response = json.loads(response)
+                    if correction:
+                        self._json(f'impact-repair-{impact_attempt}.json', response)
+                        try:
+                            raw_report = apply_repair(raw_report, response, schema=impact_schema)
+                        except AssessmentError as exc:
+                            exc.diagnostic = {'category': 'REPORT_SCHEMA', 'path': '/',
+                                              'message': str(exc)[:1200]}
+                            raise
+                    else:
+                        raw_report = response
+                    self._json(f'impact-report-{impact_attempt}.json', raw_report)
+                    validate(raw_report, impact_schema)
+                    response = deepcopy(raw_report)
                     assessment = accepted_impact or self._ground_assessment(response['impact'] if handoff else response)
                     break
-                except AssessmentError as exc:
-                    self._event("impact_evidence_rejected", attempt=impact_attempt, error=str(exc))
-                    if impact_attempt == max_attempts:
+                except CodexRuntimeError as exc:
+                    # A syntax failure already spent the one SDK format retry.
+                    # Only a parsed schema-invalid *initial* report becomes a
+                    # new repair base; malformed corrections never replace it.
+                    diagnostic = exc.details.get('output_diagnostic')
+                    if exc.kind != 'INVALID_OUTPUT' or not diagnostic or diagnostic['category'] != 'REPORT_SCHEMA':
                         raise
-                    if accepted_impact:
-                        impact_request = ('Correct the scope response: ' + str(exc) + context + handoff_instructions)
-                        continue
-                    impact_request = ("Your previous JSON assessment failed deterministic Git evidence "
-                                      "grounding with this error:\n" + str(exc) +
-                                      "\nRe-read the exact blobs and line ranges. Repair scope_contract and "
-                                      "proof_steps as well as causal_chain. For AFFECTED, supply "
-                                      "a valid causal_chain: source_parent changed-line evidence for the donor "
-                                      "fault, source_fix changed-line evidence for the fix delta, executable "
-                                      "target evidence for the equivalent faulty state, executable target "
-                                      "evidence for downstream harm, every pattern-required proof step, "
-                                      "representation_equivalence when applicable, no external_behavior_assumptions "
-                                      "(cite decisive repository/framework behavior in evidence instead), and "
-                                      "platform_semantics entries {api, behavior, relied_at_evidence, implementation_evidence} "
-                                      "with separate target call-site and actual target implementation evidence. "
-                                      "API names and prose do not verify behavior across versions. Return "
-                                      "UNKNOWN only when a material step is genuinely unresolved by available "
-                                      "evidence; return NOT_AFFECTED only when the donor-defined faulty data "
-                                      "flow is affirmatively absent and cleared by target evidence. "
-                                      "Do not edit files.\n" + context + handoff_instructions)
+                    self._sweep_tool_usage()
+                    self.audit_diff(require_clean=True)
+                    if not correction:
+                        raw_report = exc.details.get('parsed_output')
+                        self.record['impact_report'] = exc.details.get('final_response', '')
+                        self._json(f'impact-report-{impact_attempt}.json', raw_report)
+                except json.JSONDecodeError:
+                    # Test/adaptor runtimes without SDK validation still cannot
+                    # invent a repair base for an unparseable document.
+                    raise
+                except (AssessmentError, ValidationError, ValueError) as exc:
+                    diagnostic = assessment_diagnostic(exc, raw_report, wrapped=bool(handoff))
+                if not isinstance(raw_report, dict):
+                    raise AssessmentError('impact report must be an object for local correction')
+                self._event('impact_evidence_rejected', attempt=impact_attempt,
+                            error=diagnostic['message'], diagnostic=diagnostic)
+                self.record.setdefault('impact_report_rejections', []).append(
+                    {'attempt': impact_attempt, 'base_sha256': digest(raw_report), 'diagnostic': diagnostic})
+                self._json(f'impact-rejection-{impact_attempt}.json', self.record['impact_report_rejections'][-1])
+                signature = (diagnostic['category'], diagnostic['path'], diagnostic['message'])
+                if impact_attempt == impact_limit or (ledger and signature == previous_failure):
+                    error = AssessmentError(diagnostic['message'])
+                    error.diagnostic = diagnostic
+                    raise error
+                previous_failure = signature
+                impact_request = (repair_prompt(raw_report, json.dumps(diagnostic, ensure_ascii=False))
+                    + seed_context(raw_report, self.run_dir / f'impact-seed-{impact_attempt}.txt')
+                    + '\nThis is a backend report. Preserve all unchanged evidence and its indices. '
+                      'An AFFECTED conclusion requires the full pinned-source causal proof. '
+                      'Repository-internal behavior belongs in ordinary source evidence and causal '
+                      'explanations, never in external_behavior_assumptions to bypass proof. '
+                      'A platform API signature must identify the actual definition and overload; '
+                      'renaming or removing a behavior claim cannot resolve missing evidence. '
+                      'If a material fact remains unresolved, retain that gap and UNKNOWN. '
+                    + handoff_instructions)
+            runtime.defer_schema_errors = False
             assert assessment is not None
             self.record["assessment"] = assessment
             self.record["impact_decision"] = assessment["status"].lower()
@@ -1439,19 +1532,36 @@ class AospBackportAgent(CausalityChecks):
                 self.record["status"] = assessment["status"]; return
             # AFFECTED — mechanical migration first (R2; r2 revision 1: only
             # after the impact phase so the assessment saw a clean baseline).
-            if mechanical:
+            from .execution_budget import ACTIVE_EXECUTION
+            execution = ACTIVE_EXECUTION.get()
+            resume_id = (getattr(self, 'resume_candidate_id', None)
+                         or (getattr(execution, 'resume_candidates', {}).get(self.mapping_repository or self.case.repository)
+                             if execution else None))
+            restored_patch = None
+            if resume_id:
+                from .candidate_store import for_agent
+                restored_patch = for_agent(self).restore(self, resume_id)
+            if restored_patch:
+                migration = {'hunks': [], 'applied': [], 'failed': [], 'skipped': [],
+                             'starting_state': 'partial', 'restored_candidate_id': resume_id}
+            elif mechanical:
                 migration = self.mechanical_migration(inspection)
             else:
                 migration = {"hunks": [], "applied": [], "failed": [],
                              "skipped": [h["id"] for h in inspection["hunks"]],
                              "starting_state": "none", "skipped_reason": "no_mechanical"}
+            if migration.get('applied'):
+                self._begin_candidate_attempt('mechanical')
+                self._archive_candidate(self._render_patch(), outcome='MECHANICAL_DRAFT')
+                self._finish_candidate_attempt('MECHANICAL_DRAFT')
             ladder_ctx: dict[str, Any] = {
                 "applied_hunk_ids": migration["applied"],
                 "failed_hunks": [e for e in migration["hunks"] if e["status"] == "failed"],
                 "missing_symbols": [e["name"] for e in (symbol_report or {}).get("missing", [])],
                 "history_available": self._history_available(),
             }
-            plan = [level for level in ladder_plan(ladder_ctx)][:max(1, max_attempts)]
+            candidate_limit = execution.limits['candidate_turns'] if execution else max_attempts
+            plan = [level for level in ladder_plan(ladder_ctx)][:max(1, candidate_limit)]
             base_prompt = (backport_prompt(self.case, source_diff, assessment,
                                            commit_message=self.commit_message,
                                            starting_state=self._starting_state_text(migration, inspection))
@@ -1494,6 +1604,7 @@ class AospBackportAgent(CausalityChecks):
             failing_stages: list[str] = []
             previous_patch_shas: list[str] = []
             for attempt, level in enumerate(plan, 1):
+                self._finish_candidate_attempt(self.record.get('status', 'COMPLETED'))
                 self.record["attempt"] = attempt
                 prompt = base_prompt + "\n" + (strategy_prompt(
                     level["index"], {**ladder_ctx, "diagnosis_json": diagnosis_json,
@@ -1519,6 +1630,7 @@ class AospBackportAgent(CausalityChecks):
                 self.record["attempts"].append(
                     {"index": attempt, "strategy": level["strategy"], "turn_id": None,
                      "patch_sha256": None})
+                self._begin_candidate_attempt('model', strategy=level['strategy'], runtime=runtime)
                 try:
                     result = self._turn(runtime, prompt, read_only=False,
                                         phase=f"backport_{level['strategy']}")
@@ -1553,6 +1665,12 @@ class AospBackportAgent(CausalityChecks):
                         f"{sorted(self.case.files)} and place the fix in the correct "
                         "allowlisted file.")
                     failing_stages = ["patch_export"]
+                    audit = self.record.get('new_file_audits', {}).get(str(attempt), {})
+                    subjects = ({'rejected_paths': sorted(row['path'] for row in audit.get('rejected', []))}
+                                if isinstance(exc, CandidateRejected) else
+                                {'unexpected_paths': json.loads((self.run_dir / 'diff-audit.json').read_text())['unexpected_files']})
+                    if self._migration_repeated_error(blocked_by, subjects):
+                        return
                     continue
                 self.record["backport_reports"].append(result.get("final_response", ""))
                 self.record["attempts"][-1]["turn_id"] = result.get("turn_id")
@@ -1581,11 +1699,18 @@ class AospBackportAgent(CausalityChecks):
                         "status": "NOT_RUN", "blocked_by": "EMPTY_PATCH",
                         "patch_sha256": self.record["patch_sha256"], "commands": []}
                     self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
+                    if self._migration_repeated_error('EMPTY_PATCH', {'allowlist': sorted(self.case.files)}):
+                        return
                     continue
                 claims = self._check_hunk_results(
                     result.get("final_response", ""),
                     self._last_audit["changed_files"], patch, review_mapped=True)
                 self.record["hunk_results"] = claims["claims"]
+                self._candidate_evidence('coverage', {
+                    'status': 'PASS' if claims['ok'] else 'FAIL',
+                    'claims': claims, 'repair_obligation_review': self.record.get('repair_obligation_review'),
+                    'patch_sha256': self.record['patch_sha256']})
+                self._migration_progress(claims=claims)
                 if not claims["ok"]:
                     # P1.6 / r2 revision 6: contradicted or missing declarations
                     # fail the turn; feedback goes to the next ladder level.
@@ -1607,9 +1732,21 @@ class AospBackportAgent(CausalityChecks):
                             return
                         obligation_failures += 1
                         repeated = len(previous_patch_shas) >= 2 and previous_patch_shas[-1] == previous_patch_shas[-2]
-                        if obligation_failures >= 3 or repeated:
+                        if execution is None and (obligation_failures >= 3 or repeated):
                             self.record['obligation_repairs_exhausted'] = True
                             return
+                    subjects = {'coverage': {key: claims['coverage'][key] for key in
+                                             ('missing', 'duplicate', 'unexpected')},
+                                'missing_declaration': claims['missing_declaration']}
+                    if obligation_review:
+                        subjects['obligations'] = sorted((row['id'], entry['id'], entry['verdict'])
+                            for row in obligation_review.get('obligations', [])
+                            for entry in row.get('paths', []) if entry['verdict'] in ('unresolved', 'remap'))
+                    else:
+                        subjects['contradictions'] = sorted(claims['contradictions'])
+                    if self._migration_repeated_error('HUNK_LEDGER', subjects):
+                        self.record['obligation_repairs_exhausted'] = bool(obligation_review)
+                        return
                     continue
                 claim_feedback = None
                 if not verify:
@@ -1618,6 +1755,8 @@ class AospBackportAgent(CausalityChecks):
                 verification = self.verify()
                 self.record["final_verification"] = verification
                 self.record["attempt_verifications"][str(attempt)] = verification
+                self._candidate_evidence('verification', verification)
+                self._migration_progress(verification=verification)
                 if verification["status"] == "PASS":
                     self.record["status"] = 'VALIDATED' if verification['sufficient_for_validated'] else 'PATCH_UNVERIFIED'
                     if not getattr(self, 'defer_post_fix', False):
@@ -1629,10 +1768,154 @@ class AospBackportAgent(CausalityChecks):
                 diagnosis_json = verification_diagnosis(verification["commands"])
                 failing_stages = [stage for stage, outcome in verification["stages"].items()
                                   if outcome == "FAIL"]
+                failed = [{'stage': row.get('stage'), 'argv': row.get('argv'),
+                           'returncode': row.get('returncode'),
+                           'output_sha256': hashlib.sha256(json.dumps({key: row.get(key) for key in
+                               ('stdout', 'stderr', 'error')}, sort_keys=True).encode()).hexdigest()}
+                          for row in verification['commands'] if row.get('returncode') != 0]
+                if self._migration_repeated_error('VERIFICATION', {'commands': failed}):
+                    return
             # Preserve the candidate and evidence for human review. The run is a
             # completed *attempt* but not a successful security validation.
             self.record["status"] = "VALIDATION_FAILED"
             return
+
+    def _migration_progress(self, *, claims=None, verification=None):
+        """Grant progress only for new controller-checked milestones.
+
+        A new patch hash, larger diff or rewritten explanation is not progress.
+        Stable source/obligation/check identities deduplicate across resumes.
+        """
+        from .execution_budget import ACTIVE_EXECUTION
+        from .candidate_store import agent_identity
+        execution = ACTIVE_EXECUTION.get()
+        if execution is None:
+            return
+        identity = agent_identity(self)
+        facts = []
+        if self.record.get('patch_replay') == 'pass':
+            facts.append({'kind': 'clean_replay', 'identity': identity})
+        if claims is not None:
+            receipt = self.record.get('repair_obligation_review', {})
+            if receipt.get('patch_sha256') == self.record.get('patch_sha256'):
+                for row in receipt.get('obligations', []):
+                    if row.get('verdict') == 'covered':
+                        facts.append({'kind': 'covered_obligation', 'identity': identity, 'id': row['id'],
+                                      'paths': sorted(entry['id'] for entry in row.get('paths', []))})
+            for claim in claims.get('claims', []):
+                evidence = claim.get('target_evidence', {})
+                if evidence.get('required') and evidence.get('ok'):
+                    facts.append({'kind': 'grounded_hunk_coverage', 'identity': identity, 'id': claim['id']})
+        if verification is not None:
+            for row in verification.get('commands', []):
+                if row.get('returncode') == 0:
+                    facts.append({'kind': 'check_pass', 'identity': identity,
+                                  'stage': row.get('stage'), 'argv': row.get('argv')})
+        execution.record_progress('migration:' + identity['repository'], facts)
+
+    def _migration_repeated_error(self, kind, subjects):
+        from .execution_budget import ACTIVE_EXECUTION
+        execution = ACTIVE_EXECUTION.get()
+        phase = 'migration:' + (self.mapping_repository or self.case.repository)
+        if execution is None or not execution.repeated_error(phase, kind, subjects):
+            return False
+        self.record.update(completion_blocked_by='REPEATED_ERROR_NO_PROGRESS',
+            repeated_error={'phase': phase, 'kind': kind, 'subjects': subjects})
+        self._event('migration_repeated_error', kind=kind, subjects=subjects)
+        return True
+
+    def _begin_candidate_attempt(self, source_kind, strategy=None, runtime=None):
+        from .candidate_store import for_agent, agent_identity
+        from .execution_budget import ACTIVE_EXECUTION
+        execution = ACTIVE_EXECUTION.get()
+        operation = execution.current_operation() if execution else None
+        recovery = {'writer_policy': 'controller_broker_only' if getattr(runtime, '_broker', None) is not None else 'UNVERIFIED',
+            'runtime_child': runtime.recovery_child() if callable(getattr(runtime, 'recovery_child', None)) else None,
+            'worktree': str(self.worktree), 'source_root': str(self._source_scope),
+            'source_repo': str(self.repo), 'source_state': self._source_before,
+            'target_commit': self.record.get('target_commit', self.case.target_commit),
+            'allowlist': list(self.case.files), 'artifact_paths': sorted(self._artifact_paths)}
+        self._candidate_attempt_id = for_agent(self).begin(agent_identity(self),
+            source_record=self.run_dir / 'run.json', source_kind=source_kind,
+            strategy=strategy, operation_id=operation.get('id') if operation else None,
+            recovery=recovery,
+            parent=self.record.get('candidate_id') or (self.record.get('restored_candidate', {}).get('id')
+                if self.record.get('restored_candidate', {}).get('status') == 'DRAFT' else None))
+        self.record['candidate_attempt_id'] = self._candidate_attempt_id
+        self.record['candidate_history'] = for_agent(self).summary(agent_identity(self))
+        self._write_record()
+
+    def _archive_candidate(self, patch, *, outcome='EXPORTED', source_kind=None):
+        from .candidate_store import for_agent, agent_identity
+        if not getattr(self, '_candidate_attempt_id', None):
+            self._begin_candidate_attempt(source_kind or 'controller_export')
+        ident = for_agent(self).observe(self._candidate_attempt_id, patch,
+                                       source_kind=source_kind, outcome=outcome)
+        self.record['candidate_id'] = ident
+        # A new observation cannot carry the previous attempt's delivery fields.
+        # Exact historical receipts remain attached to their archived candidate.
+        sha = hashlib.sha256(patch.encode()).hexdigest()
+        previous_review = self.record.get('post_fix_review') or {}
+        stale_review = ({**previous_review, 'status': 'STALE', 'superseded_by': sha}
+                        if previous_review.get('patch_sha256') else {'status': 'NOT_REQUESTED'})
+        self.record.update(patch_file=None, patch_sha256=sha, patch_replay='not_run',
+            final_verification={'status': 'NOT_RUN', 'commands': []},
+            post_fix_review=stale_review, verification_memory={})
+        for stale in ('patch_replay_evidence', 'post_fix_impact', 'post_fix_patch_sha256'):
+            self.record.pop(stale, None)
+        self.record['candidate_history'] = for_agent(self).summary(agent_identity(self))
+        return ident
+
+    def _candidate_evidence(self, kind, receipt):
+        from .candidate_store import for_agent, agent_identity
+        ident = self.record.get('candidate_id')
+        if ident:
+            for_agent(self).evidence(ident, kind, receipt)
+            self.record['candidate_history'] = for_agent(self).summary(agent_identity(self))
+
+    def _finish_candidate_attempt(self, status, error=None):
+        from .candidate_store import for_agent, agent_identity
+        ident = getattr(self, '_candidate_attempt_id', None)
+        if ident:
+            for_agent(self).finish(ident, status=status, error=error)
+            self._candidate_attempt_id = None
+            self.record['candidate_history'] = for_agent(self).summary(agent_identity(self))
+
+    def _preserve_interrupted_candidate(self, exc):
+        """Called only after the runtime context has drained its writer processes.
+
+        A failed cleanup or source audit prevents even diagnostic export. Raw
+        bytes saved here do not become patch_file, replay, coverage or delivery.
+        """
+        if not getattr(self, '_candidate_attempt_id', None):
+            return
+        peer_audit = getattr(self, '_backend_turn_audit', None)
+        if (getattr(exc, 'kind', None) in ('BACKGROUND_CLEANUP_FAILED', 'NATIVE_TOOL_BYPASS',
+                                          'SOURCE_AUDIT_UNVERIFIED')
+                or peer_audit and not peer_audit[1]):
+            self.record['candidate_preservation'] = {'status': 'BLOCKED',
+                'reason': getattr(exc, 'kind', 'SOURCE_AUDIT_UNVERIFIED')}
+            return
+        try:
+            from .retrieval import suspend_investigation_budget
+            with suspend_investigation_budget():
+                audit = self.audit_diff()
+                patch = self._render_patch(audit)
+                from .candidate_store import for_agent
+                attempt = for_agent(self).snapshot()['attempts'][self._candidate_attempt_id]
+                # Export already persisted these exact bytes before a later
+                # coverage/build/report failure; preserve their original state.
+                if (attempt.get('candidate_id') and self.record.get('patch_sha256') ==
+                        hashlib.sha256(patch.encode()).hexdigest()):
+                    ident = attempt['candidate_id']
+                else:
+                    ident = self._archive_candidate(patch, outcome='INTERRUPTED_DRAFT',
+                                                    source_kind='recovered_workspace')
+            self.record['candidate_preservation'] = {'status': 'SAVED' if ident else 'NO_NEW_CANDIDATE',
+                'candidate_id': ident, 'validation_reused': False}
+        except Exception as preservation_error:
+            self.record['candidate_preservation'] = {'status': 'BLOCKED',
+                'reason': type(preservation_error).__name__, 'message': str(preservation_error)[:500]}
 
     def assess_post_fix(self, runtime, patch, context=''):
         """Optional analysis may fail, but even a read-only turn must not edit."""
@@ -1680,17 +1963,25 @@ class AospBackportAgent(CausalityChecks):
                 self._codex_workflow(inspection, verify, max_attempts, mechanical=mechanical,
                                      impact_only=impact_only)
             self.audit_diff(require_clean=not use_codex)
+            self._write_record()
+            if self.record.get('candidate_id') and self.record.get('patch_sha256'):
+                self._candidate_evidence('delivery', {key: self.record[key] for key in
+                    ('status', 'patch_sha256', 'delivery', 'build_validation', 'review_status') if key in self.record})
+            self._finish_candidate_attempt(self.record['status'])
             self._write_record(); return self.record
-        except Exception as exc:
+        except (Exception, KeyboardInterrupt) as exc:
             if self._owns_run:
+                self._preserve_interrupted_candidate(exc)
                 message = re.sub(r"sk-[A-Za-z0-9_-]{16,}", "[REDACTED]", str(exc))
                 existing_kind = self.record.get("error", {}).get("kind")
-                self.record.update(status="FAILED", model_execution=("failed" if self.record.get("model_execution") == "not_run" else self.record.get("model_execution")), error={"kind": existing_kind or getattr(exc, "kind", _codex_error_kind(message)),
+                self.record.update(status="CANCELLED" if isinstance(exc, KeyboardInterrupt) else "FAILED", model_execution=("failed" if self.record.get("model_execution") == "not_run" else self.record.get("model_execution")), error={"kind": existing_kind or getattr(exc, "kind", _codex_error_kind(message)),
                                "type": type(exc).__name__, "message": message})
+                self._finish_candidate_attempt(self.record['status'], self.record['error'])
                 self._event("failed", **self.record["error"])
             raise
 
-    def audit_diff(self, *, require_clean: bool = False) -> dict[str, Any]:
+    @controller_audit('engine.audit_diff')
+    def audit_diff(self, *, require_clean: bool = False, expected_source_head=None) -> dict[str, Any]:
         expected = self._git("rev-parse", self.case.target_commit).stdout.strip()
         head = self._git("rev-parse", "HEAD", cwd=self.worktree).stdout.strip()
         tracked = set(filter(None, self._git("diff", "--name-only", "-z", "--no-renames", self.case.target_commit,
@@ -1706,7 +1997,10 @@ class AospBackportAgent(CausalityChecks):
             path = self.worktree / relative
             if path.is_symlink() or not path.resolve().is_relative_to(self.worktree): unsafe.append(relative)
         check = self._git("diff", "--check", self.case.target_commit, cwd=self.worktree, check=False)
-        unchanged = self._source_before is None or self._source_state() == self._source_before
+        source_before = self._source_before
+        if source_before is not None and expected_source_head is not None:
+            source_before = {**source_before, 'head': expected_source_head}
+        unchanged = source_before is None or self._source_state() == source_before
         result = {"changed_files": changed, "untracked_files": sorted(untracked),
                   "unexpected_files": sorted(set(changed) - set(self.case.files)), "unsafe_paths": unsafe,
                   "head_unchanged": head == expected, "original_checkout_unchanged": unchanged,
@@ -1883,9 +2177,12 @@ class AospBackportAgent(CausalityChecks):
     def export_patch(self, attempt: int) -> str:
         audit = self.audit_diff()
         patch = self._render_patch(audit)
+        self._archive_candidate(patch, outcome='EXPORTED_DRAFT')
         new_file_audit = self._new_file_integration_audit(audit, patch)
         self.record.setdefault("new_file_audits", {})[str(attempt)] = new_file_audit
         self._json(f"new-file-audit-{attempt}.json", new_file_audit)
+        self._candidate_evidence('source_integration', {**new_file_audit,
+            'patch_sha256': hashlib.sha256(patch.encode()).hexdigest()})
         if new_file_audit["status"] != "PASS":
             # Preserve rejected bytes separately and invalidate stale evidence from
             # a previously exported candidate. The final patch path is not a receipt.
@@ -1913,12 +2210,13 @@ class AospBackportAgent(CausalityChecks):
         write_text(self.run_dir / f"candidate-{attempt}.patch", patch)
         write_text(self.run_dir / "backport.patch", patch)
         check = self._check_application(patch)
-        self.record.update(patch_file=str(self.run_dir / "backport.patch"),
+        self.record.update(patch_file=str(self.run_dir / "backport.patch") if patch.strip() else None,
                            patch_sha256=hashlib.sha256(patch.encode()).hexdigest(), patch_application=check)
         self._event("patch_exported", attempt=attempt, sha256=self.record["patch_sha256"], application=check)
         replay = self._replay_clean_target(patch, attempt)
         self.record["patch_replay"] = replay["status"]
         self.record["patch_replay_evidence"] = replay
+        self._candidate_evidence('replay', {**replay, 'patch_sha256': self.record['patch_sha256']})
         self.record["candidate_file_hashes"] = {
             relative: (hashlib.sha256((self.worktree / relative).read_bytes()).hexdigest()
                        if (self.worktree / relative).is_file() else None)

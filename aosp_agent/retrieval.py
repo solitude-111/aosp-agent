@@ -1,4 +1,4 @@
-"""Bounded reads and immutable-object caching; mutable workspace audits bypass it."""
+"""Bounded reads and immutable-object caching; mutable audits bypass the cache."""
 from collections.abc import Mapping
 from collections import Counter
 from contextlib import contextmanager
@@ -32,6 +32,11 @@ def record_read_activity(**counts):
 
 def capture_git(argv, *, check, errors=None, input=None, **options):
     """Capture controller Git bytes before applying normal subprocess text decoding."""
+    from .execution_budget import ACTIVE_EXECUTION
+    from .tool_io import ACTIVE_TOOL_IO
+    ledger = ACTIVE_EXECUTION.get()
+    if ledger is not None and ACTIVE_BUDGET.get() is None and ACTIVE_TOOL_IO.get() is None:
+        options['timeout'] = ledger.controller_git_timeout(options.get('timeout', 45), argv)
     if ACTIVE_READ_PHASE.get() is None:
         return subprocess.run(argv, check=check, text=True, errors=errors, input=input,
                               capture_output=True, **options)
@@ -60,20 +65,41 @@ class DiscoveryDeferred(RuntimeError):
 
 
 class ReadBudget:
-    def __init__(self, seconds=900, operations=2000, output_bytes=64 * 1024 * 1024):
+    def __init__(self, seconds=900, operations=2000, output_bytes=64 * 1024 * 1024, *, ledger=None,
+                 tracks_investigation=True):
         if (isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds)
                 or seconds <= 0 or isinstance(operations, bool) or not isinstance(operations, int) or operations < 1):
             raise ValueError('read budget must be finite and positive')
         if type(output_bytes) is not int or output_bytes < 1:
             raise ValueError('output byte budget must be positive')
         self.started, self.seconds, self.operations = time.monotonic(), seconds, operations
+        self.tracks_investigation = tracks_investigation
         self.used, self.paused_seconds = 0, 0
         self.byte_limit, self.bytes_used = output_bytes, 0
+        if ledger is None:
+            from .execution_budget import ACTIVE_EXECUTION
+            ledger = ACTIVE_EXECUTION.get()
+        self.ledger = ledger
+        if ledger is not None:
+            self.byte_limit = ledger.limits['io_bytes']
+            self.operations = ledger.limits['tool_operations']
+        self.bytes_reserved = 0
+        self._reservations = {}
+        self._reservation_sequence = 0
+        self._boundaries = Counter()
         self._lock = threading.RLock()
         self._phases = {}
 
     def remaining(self):
-        left = self.seconds - (time.monotonic() - self.started - self.paused_seconds)
+        elapsed = time.monotonic() - self.started - self.paused_seconds
+        allowance = self.seconds
+        if self.ledger is not None and self.tracks_investigation:
+            self.ledger.set_investigation_time(elapsed, active=True)
+            active = ACTIVE_READ_PHASE.get()
+            allowance = self.ledger.investigation_allowance(elapsed, active[1] if active else 'INVESTIGATION')
+        left = allowance - elapsed
+        if self.ledger is not None:
+            left = min(left, self.ledger.remaining_seconds())
         if left <= 0:
             raise BudgetExceeded('total investigation time budget exhausted')
         return left
@@ -83,8 +109,10 @@ class ReadBudget:
             left = self.remaining()
             if DISCOVERY_RESERVE.get() is self:
                 left = self.discovery_remaining()
-            if self.used >= self.operations:
+            if self.ledger is None and self.used >= self.operations:
                 raise BudgetExceeded('total read/tool operation budget exhausted')
+            if self.ledger is not None:
+                self.ledger.charge('tool_operations')
             self.used += 1
             record_read_activity(operations=1)
             return min(timeout, left)
@@ -106,32 +134,69 @@ class ReadBudget:
         finally:
             DISCOVERY_RESERVE.reset(token)
 
-    def claim_bytes(self, size):
-        """Reserve before read; conservative reservations are not refunded."""
+    def reserve_bytes(self, size, category='tool_data'):
+        """Admit bytes before I/O. The returned receipt must be settled once."""
         if type(size) is not int or size < 0:
             raise ValueError('byte reservation must be nonnegative')
         with self._lock:
             self.remaining()
-            if self.bytes_used + size > self.byte_limit:
+            if self.ledger is None and self.bytes_used + self.bytes_reserved + size > self.byte_limit:
                 raise BudgetExceeded('model tool I/O byte budget exhausted')
-            self.bytes_used += size
+            shared = self.ledger.reserve_io(size, category) if self.ledger is not None else None
+            self._reservation_sequence += 1
+            receipt = self._reservation_sequence
+            self._reservations[receipt] = (size, category, shared, ACTIVE_READ_PHASE.get())
+            self.bytes_reserved += size
             record_read_activity(io_reserved_bytes=size)
+            return receipt
+
+    def settle_bytes(self, receipt, actual):
+        """Settlement does not check deadlines: cleanup must release unused quota."""
+        with self._lock:
+            size, category, shared, phase = self._reservations[receipt]
+            if type(actual) is not int or not 0 <= actual <= size:
+                raise ValueError('actual byte consumption exceeds reservation')
+            if self.ledger is not None:
+                self.ledger.settle_io(shared, actual)
+            del self._reservations[receipt]
+            self.bytes_reserved -= size
+            self.bytes_used += actual
+            self._boundaries[category] += actual
+            if phase is not None:
+                owner, name = phase
+                with owner._lock:
+                    owner._phases.setdefault(name, Counter()).update(
+                        io_consumed_bytes=actual, io_released_bytes=size - actual,
+                        **{category + '_bytes': actual})
+
+    def claim_bytes(self, size, category='tool_data'):
+        """Charge a known, actually processed byte count (no outstanding reserve)."""
+        receipt = self.reserve_bytes(size, category)
+        self.settle_bytes(receipt, size)
 
     def remaining_bytes(self):
         with self._lock:
-            return self.byte_limit - self.bytes_used
+            return (self.ledger.remaining_io() if self.ledger is not None else
+                    self.byte_limit - self.bytes_used - self.bytes_reserved)
 
     def data(self):
         return {'seconds': self.seconds, 'elapsed_seconds': round(time.monotonic() - self.started - self.paused_seconds, 3),
+                'tracks_investigation': self.tracks_investigation,
                 'operation_limit': self.operations, 'operations_used': self.used,
-                'model_io_bytes_reserved': self.bytes_used, 'model_io_byte_limit': self.byte_limit,
+                'model_io_bytes_reserved': self.bytes_reserved, 'model_io_bytes_consumed': self.bytes_used,
+                'model_io_byte_limit': self.byte_limit,
+                'io_by_boundary': dict(self._boundaries),
+                **({'case_io': {k: v for k, v in self.ledger.snapshot().items()
+                               if k in ('io_consumed', 'io_reserved', 'io_limit', 'io_by_boundary')}}
+                   if self.ledger is not None else {}),
                 'operation_accounting': 'controller Git processes plus broker requests and their Git subqueries; legacy unscoped SDK counts tool-start events',
-                'byte_accounting': 'pre-read reservations for broker file I/O and Git output; not total disk or controller I/O'}
+                'byte_accounting': 'settled broker request, source capture, file I/O and reply boundaries; not physical disk I/O'}
 
     def phase_data(self):
         with self._lock:
-            return {phase: {key: counts[key] for key in ('operations', 'git_output_bytes',
-                        'broker_file_read_bytes', 'io_reserved_bytes')} for phase, counts in self._phases.items()}
+            return {phase: {key: counts[key] for key in set(counts) | {'operations', 'git_output_bytes',
+                        'broker_file_read_bytes', 'io_reserved_bytes', 'io_consumed_bytes', 'io_released_bytes'}}
+                    for phase, counts in self._phases.items()}
 
     @contextmanager
     def phase(self, name):
@@ -152,10 +217,14 @@ class ReadBudget:
 
 @contextmanager
 def suspend_investigation_budget():
-    """Migration/build has its own attempt/timeout policy and cannot consume a
-    later remapping investigation's read budget while waiting for a compiler.
+    """Pause only investigation time; case tool/time limits remain enforced.
+
+    Controller Git bytes are telemetry. Model broker I/O remains charged through
+    ToolIO even when a migration/build owner suspends investigation time.
     """
     budget = ACTIVE_BUDGET.get()
+    if budget and budget.ledger is not None and budget.tracks_investigation:
+        budget.ledger.set_investigation_time(budget.data()['elapsed_seconds'], active=False)
     token = ACTIVE_BUDGET.set(None)
     started = time.monotonic()
     try:
@@ -163,6 +232,8 @@ def suspend_investigation_budget():
     finally:
         if budget:
             budget.paused_seconds += time.monotonic() - started
+            if budget.ledger is not None and budget.tracks_investigation:
+                budget.ledger.set_investigation_time(budget.data()['elapsed_seconds'], active=True)
         ACTIVE_BUDGET.reset(token)
 
 

@@ -5,6 +5,7 @@
 !/aosp_agent
 !/scripts
 !/README.md
+!/run-patches
 aosp_agent/**/__pycache__/
 aosp_agent/oracles/
 **/__pycache__/

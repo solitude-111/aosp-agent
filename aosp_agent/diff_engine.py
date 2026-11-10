@@ -25,6 +25,7 @@ from .prompts import SYSTEM
 from .validation_plan import make_plan, normalize_checks
 from .mapping_plan import MappingPlanner, MappingPlan, _shape, _excerpt
 from .lifecycle import source_guard, operation_lease
+from .execution_budget import controller_audit
 
 
 def _write(path, value, *, control=False):
@@ -255,9 +256,13 @@ class DiffBackportAgent:
     def _owner(self, path):
         return self.mapper._owner(path)
 
-    def _originals_unchanged(self):
+    @controller_audit('diff._originals_unchanged')
+    def _originals_unchanged(self, validation_pins=None):
         for repo in self.repos:
-            if repo.state() != self.before[repo.key]:
+            expected = dict(self.before[repo.key])
+            if validation_pins is not None:
+                expected['head'] = validation_pins[repo.key]
+            if repo.state() != expected:
                 raise RuntimeError(f'original repository changed: {repo.key}')
 
     def _candidate_hashes(self, except_key=None):
@@ -269,13 +274,13 @@ class DiffBackportAgent:
         if self._candidate_hashes(except_key=key) != before:
             raise RuntimeError('repository turn modified another candidate: ' + key)
 
-    def _audit(self):
+    def _audit(self, validation_pins=None):
         for path, digest in self.protected.items():
             if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                 raise RuntimeError('controller-owned plan was modified: ' + str(path))
-        self._originals_unchanged()
-        for child in self.children.values():
-            child.audit_diff()
+        self._originals_unchanged(validation_pins)
+        for key, child in self.children.items():
+            child.audit_diff(**({'expected_source_head': validation_pins[key]} if validation_pins is not None else {}))
             # Include ignored files in the raw-mode guard; never export a partial
             # result that silently omitted an ignored model-created file.
             ignored = local_git(child.worktree, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z').stdout
@@ -424,8 +429,9 @@ class DiffBackportAgent:
                          explicit=self.validation.get(key), auto=self.auto_validation,
                          build_runner=self.build_runner, build_requested=build_requested)
         local_checks = []
+        from .controlled_build import managed_build
         for check in plan['checks']:
-            if multi and files and check['stage'] == 'android_module_build':
+            if (multi or managed_build(self)) and files and check['stage'] == 'android_module_build':
                 deferred.append((key, check))
             else:
                 local_checks.append(check)
@@ -500,19 +506,21 @@ class DiffBackportAgent:
         from dataclasses import replace
         from .joint_validation import prepare_joint
         self._save_mapping_plan(assessment)
+        deferred = []
         for name, child in self.children.items():
             child.mapping_plan = self.mapping_plan
             child.record['mapping_plan_sha256'] = self.mapping_plan.sha256
             files = self.mapping_plan.files(name)
             if name == key:
-                checks = self._local_validation(assessment, name, files, build_requested=build_requested)
+                checks = self._local_validation(assessment, name, files, build_requested=build_requested,
+                                                deferred=deferred)
                 child.case = replace(child.case, files=files, validation=checks.validation,
                                      validation_checks=checks.validation_checks)
                 child._artifact_paths = {p for c in checks.validation_checks for p in c.get('artifacts', [])}
                 self._save_child_case(child, name)
             else:
                 child.case = replace(child.case, files=files)
-        prepare_joint(self, [])
+        prepare_joint(self, deferred)
         self._audit()
 
     def _coverage(self, raw, assessment):

@@ -18,7 +18,7 @@ from aosp_agent.sandbox_scope import ModelScope, source_scope
 from aosp_agent.diff_engine import DiffBackportAgent
 from aosp_agent.sdk_runtime import CodexRuntime
 from aosp_agent.tool_broker import ToolBroker
-from aosp_agent.tool_io import ToolIO
+from aosp_agent.tool_io import ToolIO, QueryOutputLimit
 from engine_fixtures import GitFixture, git
 from scoped_provider_fixture import ScriptedProvider
 from test_diff_workflow import diff
@@ -64,7 +64,8 @@ class ToolBrokerTest(unittest.TestCase):
             broker = self.broker(root, budget=budget)
             denied = call(broker, 'aosp_read_file', {'path': 'metadata', 'start': 1, 'end': 1})
             self.assertFalse(denied['success']); self.assertLess(budget.bytes_used, 70000)
-            self.assertGreaterEqual(budget.bytes_used, 65536)  # Reply reservation succeeded; data reservation did not.
+            self.assertLess(budget.bytes_used, 65536)  # Unused reply quota is returned on admission failure.
+            self.assertEqual(budget.bytes_reserved, 0)
             self.assertIsInstance(broker.failure, BudgetExceeded)
 
     def test_only_exact_candidate_writes_with_current_hash_no_symlink_or_peer(self):
@@ -158,7 +159,9 @@ class ToolBrokerTest(unittest.TestCase):
                 expired = call(broker, 'aosp_source', dict(args, operation='search', query='normalize_count'), 'timeout')
             self.assertFalse(expired['success'])
             self.assertEqual(response(expired)['status'], 'SEARCH_INCOMPLETE')
-            self.assertEqual(response(expired)['searched_paths'], ['counter.py'])
+            self.assertEqual(response(expired)['requested_paths'], ['counter.py'])
+            self.assertFalse(response(expired)['completed_scope_known'])
+            self.assertEqual(response(expired)['completed_paths'], [])
             self.assertFalse(response(expired)['absence_proven'])
             self.assertEqual(search_git.call_args.args[-1], ':(literal)counter.py')
             self.assertEqual(search_git.call_args.kwargs['timeout'], 30)
@@ -212,7 +215,9 @@ class ToolBrokerTest(unittest.TestCase):
             self.assertEqual(budget.used, 12)
             usage = budget.phase_data()['IMPACT_ANALYSIS']
             self.assertEqual(usage['operations'], 12)
-            self.assertEqual(usage['io_reserved_bytes'], budget.bytes_used)
+            self.assertEqual(usage['io_consumed_bytes'], budget.bytes_used)
+            self.assertEqual(usage['io_reserved_bytes'] - usage['io_released_bytes'], budget.bytes_used)
+            self.assertEqual(budget.bytes_reserved, 0)
             expected_git_bytes = sum(len(subprocess.check_output(
                 ['git', '-C', str(fx.repo), 'show', ref + ':large.c'])) for ref in (baseline, updated))
             self.assertEqual(usage['git_output_bytes'], expected_git_bytes)
@@ -228,9 +233,10 @@ class ToolBrokerTest(unittest.TestCase):
                 timer = threading.Timer(.1, cancelled.set) if mode == 'cancel' else None
                 if timer: timer.start()
                 try:
-                    with patch('aosp_agent.tool_io.subprocess.Popen', tracked), self.assertRaises(BudgetExceeded):
+                    expected = QueryOutputLimit if mode == 'output' else BudgetExceeded
+                    with patch('aosp_agent.tool_io.subprocess.Popen', tracked), self.assertRaises(expected):
                         io.run([sys.executable, '-c', 'import time; ' +
-                                ('time.sleep(20)' if mode == 'cancel' else 'print("x" * 10000); time.sleep(20)')])
+                                ('time.sleep(20)' if mode == 'cancel' else 'print("x" * 10000, flush=True); time.sleep(20)')])
                 finally:
                     if timer: timer.join()
                 self.assertIsNotNone(processes[0].poll())

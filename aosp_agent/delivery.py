@@ -49,6 +49,9 @@ def _build(record):
 def _review(record):
     review = record.get('post_fix_review') or {}
     result = {'status': 'INCOMPLETE', 'risks': {}, 'runtime_security_proven': False}
+    if review.get('status') == 'STALE':
+        result['status'] = 'STALE'
+        return result
     if review.get('status') != 'COMPLETED':
         result['status'] = 'NOT_REQUESTED' if review.get('status') == 'NOT_REQUESTED' else 'INCOMPLETE'
         return result

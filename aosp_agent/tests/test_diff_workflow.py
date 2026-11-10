@@ -250,6 +250,9 @@ class DiffWorkflowTest(unittest.TestCase):
             result = agent.run(max_attempts=1)
             self.assertEqual(result['status'], 'MIGRATION_INCOMPLETE')
             self.assertNotEqual(result['patch_replay'], 'pass')
+            self.assertEqual(result['patches'], {})
+            self.assertIsNone(agent.children['repo'].record['patch_file'])
+            self.assertIsNone(agent.children['repo'].record['candidate_id'])
 
     def test_illegal_write_fails_and_original_is_preserved(self):
         with GitFixture() as fx:

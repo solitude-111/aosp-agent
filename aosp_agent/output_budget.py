@@ -32,6 +32,10 @@ class OutputBudgetExceeded(OutputBudgetUnavailable):
     kind = 'OUTPUT_BUDGET_EXHAUSTED'
 
 
+class CaseOutputBudgetExceeded(OutputBudgetExceeded):
+    kind = 'CASE_OUTPUT_BUDGET_EXHAUSTED'
+
+
 def _atomic(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
@@ -79,6 +83,10 @@ class OutputBudget:
                         raise OutputBudgetUnavailable('invalid output budget counters')
                 if type(value.get('exhausted')) is not bool:
                     raise OutputBudgetUnavailable('invalid output budget status')
+                if value.get('parent_root'):
+                    parent = Path(value['parent_root'])
+                    if parent != parent.resolve() or parent == self.root or not self.root.is_relative_to(parent):
+                        raise OutputBudgetUnavailable('invalid parent output budget')
                 limit = value['limit']
                 if (not 128 * 1024 <= limit <= 1024 ** 4 or
                     value['normal_limit'] != limit - min(4 * 1024 * 1024, limit // 8) - METADATA_RESERVE or
@@ -98,8 +106,19 @@ class OutputBudget:
 
     def check(self):
         with self._locked() as value:
+            if value.get('parent_root'):
+                OutputBudget(value['parent_root']).check()
             if value['exhausted']:
-                raise OutputBudgetExceeded('managed output budget exhausted; no new work is permitted')
+                error = CaseOutputBudgetExceeded if value.get('parent_root') else OutputBudgetExceeded
+                raise error('managed output budget exhausted; no new work is permitted')
+
+    def exhausted_owner(self):
+        with self._locked() as value:
+            if value.get('parent_root'):
+                parent = OutputBudget(value['parent_root']).exhausted_owner()
+                if parent is not None:
+                    return parent
+            return self if value['exhausted'] else None
 
     def _save(self, value):
         # A fixed temporary name is safe under the cross-process lock and
@@ -113,7 +132,7 @@ class OutputBudget:
             stream.write(data)
         temporary.replace(self.root / STATE)
 
-    def write(self, path, data, *, append=False, control=False):
+    def write(self, path, data, *, append=False, control=False, _reserve_only=False):
         path = Path(path)
         resolved_path = path.resolve()
         if path.is_symlink() or not resolved_path.is_relative_to(self.root):
@@ -129,10 +148,17 @@ class OutputBudget:
                     self._save(value)
                 if control:
                     return False  # The persistent exhausted state remains authoritative.
-                raise OutputBudgetExceeded('managed output budget exhausted before writing ' + path.name)
+                error = CaseOutputBudgetExceeded if value.get('parent_root') else OutputBudgetExceeded
+                raise error('managed output budget exhausted before writing ' + path.name)
+            if value.get('parent_root'):
+                admitted = OutputBudget(value['parent_root']).write(path, data, control=control, _reserve_only=True)
+                if not admitted:
+                    return False
             key = 'control_reserved' if control else 'normal_reserved'
             value[key] += len(data)
             self._save(value)  # Reserve before the file, including interrupted/failed writes.
+            if _reserve_only:
+                return True
             if append:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
@@ -153,19 +179,22 @@ def find_budget(path):
     return None
 
 
-def create_budget(root, limit=DEFAULT_LIMIT):
+def create_budget(root, limit=DEFAULT_LIMIT, *, independent=False):
     if type(limit) is not int or not 128 * 1024 <= limit <= 1024 ** 4:
         raise ValueError('max_output_bytes must be between 128 KiB and 1 TiB')
     root = Path(root).resolve()
     inherited = find_budget(root / 'placeholder')
     if inherited is not None:
         inherited.check()
-        return inherited
+        if not independent or inherited.root == root:
+            return inherited
     if any(root.iterdir()):
         raise ValueError('output budget must be initialized in a fresh empty task directory')
     reserve = min(4 * 1024 * 1024, limit // 8)
     value = dict(version=1, limit=limit, normal_limit=limit - reserve - METADATA_RESERVE,
                  normal_reserved=0, control_reserved=0, exhausted=False)
+    if inherited is not None:
+        value['parent_root'] = str(inherited.root)
     _atomic(root / STATE, (json.dumps(value) + '\n').encode())
     return OutputBudget(root)
 
@@ -196,7 +225,7 @@ def write_text(path, text, *, append=False, budget=None):
 def _blocked_record(value, budget):
     # Delivery stays blocked. The controller's confirmed baseline decision is
     # independent of the later failure to persist migration output.
-    reason = 'OUTPUT_BUDGET_EXHAUSTED'
+    reason = 'CASE_OUTPUT_BUDGET_EXHAUSTED' if budget.data().get('parent_root') else 'OUTPUT_BUDGET_EXHAUSTED'
     essential = dict(status='BLOCKED', impact_decision='UNKNOWN', delivery_status='BLOCKED',
                      completion_blocked_by=reason, record_compacted=True, output_budget=budget.data())
     if 'verdict' in value:
@@ -223,7 +252,12 @@ def _blocked_record(value, budget):
             'resume_input_sha256', 'resumed_from', 'resumed_to', 'active_round_record', 'final_round_record',
             'row_count', 'counts', 'remaining_rows', 'source_guard', 'cancellation_source_guard',
             'investigation_budget', 'stage_read_usage')
+    keep += ('checkpoint_protocol', 'checkpoint_code_sha256', 'preparation_receipt',
+             'preparation_frozen_receipt', 'preparation_frozen_sha256', 'batch_budget_root')
     compact = {**{key: value[key] for key in keep if key in value}, **essential}
+    if isinstance(value.get('execution_budget'), dict):
+        compact['execution_budget'] = {key: value['execution_budget'][key] for key in
+            ('root', 'path', 'lineage_id', 'input_sha256', 'limits', 'consumed') if key in value['execution_budget']}
     if impact:
         compact['impact_analysis'] = impact
     return compact if len(json.dumps(compact, ensure_ascii=False, indent=2).encode()) < 4096 else essential
@@ -231,8 +265,9 @@ def _blocked_record(value, budget):
 
 def write_json(path, value, *, control=False):
     budget = find_budget(path)
-    if control and budget is not None and budget.data()['exhausted']:
-        compact = _blocked_record(value, budget)
+    exhausted = budget.exhausted_owner() if control and budget is not None else None
+    if exhausted is not None:
+        compact = _blocked_record(value, exhausted)
         if isinstance(value, dict):
             value.update({k: compact[k] for k in ('status', 'impact_decision', 'delivery_status',
                           'completion_blocked_by', 'record_compacted', 'output_budget', 'impact_analysis',

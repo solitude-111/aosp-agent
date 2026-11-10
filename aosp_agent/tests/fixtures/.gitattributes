@@ -1,0 +1,2 @@
+# Preserve the historical patch byte-for-byte, including blank context lines.
+conditional-continuation/candidate.patch -whitespace

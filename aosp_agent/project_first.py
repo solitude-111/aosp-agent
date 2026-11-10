@@ -19,6 +19,7 @@ from .mapping_plan import _shape
 from .project_catalog import Project, ProjectCatalog, catalog_at_revision, catalog_from_checkout
 from .retrieval import ACTIVE_BUDGET, ACTIVE_MODEL_BUDGET, BudgetExceeded, ObjectCache, ReadBudget
 from .lifecycle import run_lease, source_lease, LeaseBusy, RecoveryBlocked
+from .execution_budget import ExecutionBudget, ACTIVE_EXECUTION, MODEL_CONTEXT
 
 
 PREANALYSIS_SCHEMA = obj({'summary': STRING, 'projects': array(obj({'key': STRING, 'reason': STRING})),
@@ -54,14 +55,19 @@ def checkout_catalog(root, pinned_heads=None):
 
 
 class ModelTurnLimit:
-    def __init__(self, factory=None, limit=48):
+    def __init__(self, factory=None, limit=48, ledger=None):
         self.factory, self.limit, self.used = factory, limit, 0
+        self.ledger = ledger
+        if ledger is not None:
+            self.used = ledger.snapshot()['consumed'].get('model_calls', 0)
         self.exhausted = False
 
-    def claim(self):
+    def claim(self, *, read_only=True):
         if self.used >= self.limit:
             self.exhausted = True
             raise BudgetExceeded('total model turn budget exhausted')
+        if self.ledger is not None:
+            self.ledger.admit_model(read_only=read_only, **MODEL_CONTEXT.get())
         self.used += 1
 
     def __call__(self, **options):
@@ -88,9 +94,12 @@ class ModelTurnLimit:
                 # Runtime doubles/other adapters count one call unless they opt
                 # into the same accounting contract.
                 if not getattr(self.runtime, 'accounts_model_calls', False):
-                    owner.claim()
+                    owner.claim(read_only=kwargs.get('read_only', True))
                 token = ACTIVE_MODEL_BUDGET.set(owner)
                 try:
+                    if owner.ledger is not None and not getattr(self.runtime, 'accounts_model_calls', False):
+                        with owner.ledger.operation('model', timeout=options.get('turn_timeout', 900), **MODEL_CONTEXT.get()):
+                            return self.runtime.run(*args, **kwargs)
                     return self.runtime.run(*args, **kwargs)
                 finally:
                     ACTIVE_MODEL_BUDGET.reset(token)
@@ -106,7 +115,10 @@ class ProjectFirstAgent:
                  build_runner=None, cache_root=None, max_projects=12, max_rounds=3,
                  investigation_seconds=900, max_git_operations=2000, max_model_turns=48,
                  project_hints=None, read_budget=None, max_output_bytes=256 * 1024 * 1024,
-                 resumed_assessment=None, locate_first=False):
+                 resumed_assessment=None, locate_first=False, max_read_bytes=64 * 1024 * 1024,
+                 case_timeout=7200, candidate_attempts=None, location_attempts=None,
+                 impact_attempts=None, report_corrections=6, execution_budget=None,
+                 max_stage_extensions=1, extension_seconds=300, prepared_case=None):
         self.patch = patch if isinstance(patch, bytes) else Path(patch).read_bytes()
         self.units = diff_units(self.patch.decode())
         self.target_root = Path(target_root).resolve()
@@ -123,8 +135,25 @@ class ProjectFirstAgent:
                        'stage': 'ROUTING', 'impact_analysis': {'status': 'NOT_STARTED'},
                        'execution_path': 'project_first', 'input_patch_sha256': hashlib.sha256(self.patch).hexdigest(),
                        'rounds': [], 'runtime_security_proven': False, 'model_execution': 'not_run'}
-        self.budget = read_budget or ReadBudget(investigation_seconds, max_git_operations)
-        self.factory = ModelTurnLimit(runtime_factory, max_model_turns)
+        from .checkpoint import checkpoint_metadata
+        self.record.update(checkpoint_metadata())
+        self.prepared_case = prepared_case
+        limits = dict(candidate_turns=candidate_attempts or 6, model_calls=max_model_turns,
+            investigation_rounds=max_rounds, tool_operations=max_git_operations,
+            io_bytes=max_read_bytes, execution_seconds=case_timeout,
+            investigation_seconds=investigation_seconds, report_corrections=report_corrections)
+        self.execution = execution_budget or ExecutionBudget(self.run_dir, self.record['input_patch_sha256'], limits=limits)
+        self.stage_overrides = dict(candidate_attempts=candidate_attempts, location_attempts=location_attempts,
+                                    impact_attempts=impact_attempts)
+        self.extension_policy = dict(max_stage_extensions=max_stage_extensions, extension_seconds=extension_seconds)
+        self.budget = read_budget or ReadBudget(investigation_seconds, max_git_operations,
+                                               output_bytes=max_read_bytes, ledger=self.execution)
+        self.preparation_usage = (read_budget.data() if read_budget is not None and execution_budget is None else None)
+        self.budget.ledger = self.execution
+        prior = self.execution.snapshot()
+        self.budget.used = max(self.budget.used, prior['consumed'].get('tool_operations', 0))
+        self.budget.paused_seconds -= prior.get('investigation_ms', 0) / 1000
+        self.factory = ModelTurnLimit(runtime_factory, max_model_turns, ledger=self.execution)
         from .exclusion_review import ExclusionCorrections
         self.exclusion_corrections = ExclusionCorrections()
         self.model, self.mapping_model, self.provider = model, mapping_model or model, model_provider
@@ -143,6 +172,7 @@ class ProjectFirstAgent:
         if cache_path.is_relative_to(self.target_root) or cache_path.is_relative_to(self.run_dir):
             raise ValueError('shared object cache must be outside source and task workspaces')
         self.cache = ObjectCache(cache_path)
+        self.execution.object_cache = self.cache
         from .output_budget import write_bytes
         write_bytes(self.run_dir / 'input.patch', self.patch)
         def serial(value):
@@ -159,7 +189,11 @@ class ProjectFirstAgent:
                 'pinned_heads': self.pinned_heads, 'repository_keys': self.explicit_keys, 'project_hints': self.project_hints,
                 'cache_root': self.cache.directory, 'max_projects': max_projects, 'max_rounds': max_rounds,
                 'investigation_seconds': investigation_seconds, 'max_git_operations': max_git_operations,
-                'max_model_turns': max_model_turns, 'max_output_bytes': max_output_bytes}})
+                'max_model_turns': max_model_turns, 'max_output_bytes': max_output_bytes,
+                'max_read_bytes': max_read_bytes, 'case_timeout': case_timeout,
+                'candidate_attempts': candidate_attempts, 'location_attempts': location_attempts,
+                'impact_attempts': impact_attempts, 'report_corrections': report_corrections,
+                **self.extension_policy}})
         _write(self.run_dir / 'resume-input.json', self.resume_spec)
         self.record['resume_input_sha256'] = hashlib.sha256((self.run_dir / 'resume-input.json').read_bytes()).hexdigest()
         self._save()
@@ -178,6 +212,16 @@ class ProjectFirstAgent:
         self.record['model_turns'] = {'used': self.factory.used, 'limit': self.factory.limit}
         self.record['object_cache'] = self.cache.data()
         self.record['output_budget'] = self.output_budget.data()
+        self.record['execution_budget'] = self.execution.snapshot()
+        candidate_index = self.execution.root / 'candidate-store/index.json'
+        if candidate_index.is_file():
+            from .candidate_store import CandidateStore
+            store = CandidateStore(candidate_index.parent)
+            snapshot = store.snapshot()
+            identities = {json.dumps(row['identity'], sort_keys=True): row['identity']
+                          for row in snapshot['candidates'].values()}
+            self.record['candidate_history'] = {**store.summary(), 'by_identity': [
+                {'identity': identity, **store.summary(identity)} for identity in identities.values()]}
         _write(self.run_dir / 'run.json', self.record, control=True)
 
     def _migration_result(self):
@@ -205,6 +249,10 @@ class ProjectFirstAgent:
 
     def _merge_round_impact(self, result, round_path):
         self.record['stage'] = result.get('stage', self.record['stage'])
+        for key in ('build_environment', 'runtime_build_discovery', 'dependency_evidence_revalidation',
+                    'completion_blocked_by', 'pause_batch'):
+            if key in result:
+                self.record[key] = result[key]
         for key in ('repository_errors', 'source_audit_errors', 'budget_interruption'):
             if key in result:
                 self.record[key] = result[key]
@@ -320,9 +368,9 @@ class ProjectFirstAgent:
         if set(keys) - set(self.catalog.projects):
             raise ValueError('selected project is not in the target catalogue')
 
-    def run(self, *, inspect_only=False, max_attempts=3, verify=False, impact_only=False, mechanical=True,
+    def run(self, *, inspect_only=False, max_attempts=None, verify=False, impact_only=False, mechanical=True,
             _source_lease=None):
-        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+        if max_attempts is not None and (isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1):
             raise ValueError('max_attempts must be a positive integer')
         with run_lease(self.run_dir):
             self.record['run_options'] = dict(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
@@ -330,11 +378,30 @@ class ProjectFirstAgent:
             self._save()
             try:
                 with source_lease(self.target_root, _source_lease) as lease:
-                    return self._run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
-                                     impact_only=impact_only, mechanical=mechanical, _source_lease=lease)
+                    stages = {key: value if value is not None else max_attempts if max_attempts is not None
+                              else 6 if key == 'candidate_attempts' else 3
+                              for key, value in self.stage_overrides.items()}
+                    stages.update(self.extension_policy)
+                    limits = {**self.execution.limits, 'candidate_turns': stages['candidate_attempts']}
+                    self.execution.configure(limits, stages)
+                    if self.preparation_usage is not None:
+                        self.execution.import_preparation(self.preparation_usage)
+                    self.record['effective_stage_limits'] = stages
+                    with self.execution.active():
+                        result = self._run(inspect_only=inspect_only, max_attempts=max_attempts or 3, verify=verify,
+                                         impact_only=impact_only, mechanical=mechanical, _source_lease=lease)
+                    self.execution.set_investigation_time(self.budget.data()['elapsed_seconds'])
+                    self._save()
+                    return result
             except LeaseBusy as exc:
                 self.record.update(status='BLOCKED', impact_decision='UNKNOWN', completion_blocked_by='ACTIVE_SOURCE_LEASE',
                                    error={'type': type(exc).__name__, 'message': str(exc)})
+                self._save()
+                return self.record
+            except (BudgetExceeded, RecoveryBlocked) as exc:
+                self.record.update(status='INCONCLUSIVE' if isinstance(exc, BudgetExceeded) else 'BLOCKED',
+                    completion_blocked_by=getattr(exc, 'kind', 'EXECUTION_OR_RECOVERY_BARRIER'),
+                    error={'type': type(exc).__name__, 'message': str(exc)})
                 self._save()
                 return self.record
 
@@ -344,8 +411,13 @@ class ProjectFirstAgent:
         try:
             with self.budget.active(), self.budget.phase('ROUTING'):
                 self._prepare()
+                used_rounds = self.execution.snapshot()['consumed'].get('investigation_rounds', 0)
+                continuing_round = self.resumed_assessment is not None and used_rounds > 0
+                if used_rounds >= self.max_rounds and not continuing_round:
+                    raise BudgetExceeded('case investigation round limit exhausted across resumptions')
                 feedback, assessment_seed, obligation_remaps = None, None, 0
                 location_feedback = location_seed = backend_impact_seed = None
+                from .location_handoff import backend_scope_feedback
                 revalidate_seed = seed_pending_proof = False
                 if self.resumed_assessment is not None and not inspect_only:
                     keys = list(self.resumed_assessment['targets'])
@@ -358,6 +430,12 @@ class ProjectFirstAgent:
                     location_seed = self.resumed_assessment.get('location')
                     location_feedback = (feedback or None) if location_seed else None
                     backend_impact_seed = self.resumed_assessment.get('backend_impact')
+                    scope_feedback = (backend_scope_feedback(feedback, location_seed,
+                        feedback.get('location_handoff', {}), self.resumed_assessment['targets'])
+                        if backend_impact_seed else None)
+                    if scope_feedback is not None:
+                        location_feedback = None
+                        backend_impact_seed = {**backend_impact_seed, 'scope_feedback': scope_feedback}
                     revalidate_seed = self.resumed_assessment['revalidate']
                     seed_pending_proof = self.resumed_assessment.get('pending_proof', False)
                 elif self.explicit_keys is not None:
@@ -378,7 +456,11 @@ class ProjectFirstAgent:
                     plan = {'summary': 'Metadata-only inspection hints; no model or semantic conclusion', 'projects': keys}
                 else:
                     keys, plan = self._plan(1, max_attempts=max_attempts)
-                for number in range(1, self.max_rounds + 1):
+                for number in range(used_rounds if continuing_round else used_rounds + 1, self.max_rounds + 1):
+                    if not continuing_round or number != used_rounds:
+                        self.execution.charge('investigation_rounds', phase='DISCOVERY')
+                    else:
+                        self.record['continued_investigation_round'] = number
                     self.budget.remaining()
                     if number > 1:
                         self.cache.retry_transient()
@@ -426,6 +508,7 @@ class ProjectFirstAgent:
                             location_feedback=location_feedback, location_seed=location_seed,
                             backend_impact_seed=backend_impact_seed,
                             **self.donor_options, **self.options)
+                        controller.prepared_case = self.prepared_case
                         self.record['active_round_record'] = str(controller.run_dir / 'run.json'); self._save()
                         try:
                             result = controller.run(inspect_only=inspect_only, max_attempts=max_attempts, verify=verify,
@@ -455,7 +538,8 @@ class ProjectFirstAgent:
                     requests = result.get('scope_requests') or []
                     feedback = {k: result[k] for k in ('status', 'replan_required', 'scope_evidence', 'backend_conflicts',
                                 'causal_evidence', 'coverage_error', 'coverage_blockers', 'repository_errors',
-                                'verification', 'joint_verification', 'migration_scope_error') if k in result}
+                                'verification', 'joint_verification', 'migration_scope_error',
+                                'migration_scope_diagnostic', 'backend_scope_retry', 'location_gaps') if k in result}
                     location_seed = controller.grounded_location if self.options['locate_first'] else None
                     location_feedback = ({**feedback, 'scope_requests': requests} if location_seed else None)
                     backend_impact_seed = None
@@ -465,6 +549,11 @@ class ProjectFirstAgent:
                         if hashlib.sha256(path.read_bytes()).hexdigest() != confirmed['assessment_sha256']:
                             raise RecoveryBlocked('backend impact changed after grounding')
                         backend_impact_seed = {'targets': confirmed['targets'], 'assessment': json.loads(path.read_text())}
+                        scope_feedback = backend_scope_feedback(result, location_seed,
+                            result.get('location_handoff', {}), pins)
+                        if scope_feedback is not None:
+                            location_feedback = None
+                            backend_impact_seed['scope_feedback'] = scope_feedback
                     assessment_seed = None
                     revalidate_seed = seed_pending_proof = False
                     if (not requests and (result.get('coverage_blockers')
@@ -538,8 +627,10 @@ class ProjectFirstAgent:
                     'repository_statuses', 'android_module_build', 'patch_replay', 'source_guard', 'error',
                     'analysis_scope', 'inventory_status', 'completion_blocked_by', 'causal_evidence', 'model_read_boundary',
                     'retrieval_summary', 'discovery_status', 'scope_evidence', 'coverage_blockers', 'repair_obligation_review',
-                    'budget_interruption', 'migration_scope_error',
-                    'post_fix_review', 'post_fix_impact', 'candidate_bundle_sha256'):
+                    'budget_interruption', 'migration_scope_error', 'migration_scope_diagnostic',
+                    'backend_scope_retry', 'location_gaps', 'scope_requests',
+                    'post_fix_review', 'post_fix_impact', 'candidate_bundle_sha256',
+                    'build_environment', 'runtime_build_discovery', 'dependency_evidence_revalidation', 'pause_batch'):
             if key in result:
                 self.record[key] = result[key]
         self.record['final_round_record'] = self.record['rounds'][-1]['record']
@@ -548,6 +639,9 @@ class ProjectFirstAgent:
             self.record.update(status='INCONCLUSIVE', impact_decision='UNKNOWN', completion_blocked_by=blocked)
             if blocked == 'REPLANNING_BUDGET_EXHAUSTED':
                 self.record['budget_interruption'] = {'stage': 'REPLANNING', 'reason': blocked}
+        elif self.record.get('budget_interruption') and not self.record.get('completion_blocked_by') and self.record['status'] not in (
+                'VALIDATED', 'NEEDS_REVIEW', 'PATCH_UNVERIFIED', 'MIGRATION_INCOMPLETE'):
+            self.record.update(status='INCONCLUSIVE', completion_blocked_by='BUDGET_EXHAUSTED')
         if self.record['impact_analysis']['status'] == 'CONFLICT':
             self.record.update(status='INCONCLUSIVE', completion_blocked_by='IMPACT_EVIDENCE_CONFLICT')
         if preserve_impact:

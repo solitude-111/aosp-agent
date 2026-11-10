@@ -37,11 +37,12 @@ def unassociated_reference(fx):
 
 class LocationHandoffTest(unittest.TestCase):
     def execute(self, fx, response, *, located=None, extras=(), turns=None, max_rounds=1,
-                resume=False, prepared_manifest=False, verify=False, max_attempts=1):
+                resume=False, prepared_manifest=False, verify=False, max_attempts=1,
+                input_changes=None, agent_options=None):
         if not prepared_manifest:
             manifest(fx)
         data = fx.root / 'input.jsonl'
-        data.write_text(json.dumps(row(fx)) + '\n')
+        data.write_text(json.dumps(row(fx, **(input_changes or {}))) + '\n')
         events, scopes = [], []
         scripted = {
             'sdk-routing-1.jsonl': [(routing_fixtures.ProjectFirstTest().plan(), None)],
@@ -70,7 +71,8 @@ class LocationHandoffTest(unittest.TestCase):
 
         agent = RuntimeBatch(data, fx.source_root, fx.run_root, fx.root / 'donors',
                              donor_map={ORIGIN: str(fx.repo)}, runtime_factory=factory,
-                             agent_options={'locate_first': True, 'max_rounds': max_rounds})
+                             agent_options={'locate_first': True, 'max_rounds': max_rounds,
+                                            **(agent_options or {})})
         result = agent.run(max_attempts=max_attempts, verify=verify)['rows'][0]
         if resume:
             self.assertEqual(result['status'], 'INCONCLUSIVE', result)

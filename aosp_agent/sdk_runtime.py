@@ -28,6 +28,40 @@ class CodexRuntimeError(RuntimeError):
         self.details = details or {}
 
 
+def report_diagnostic(error, *, category="REPORT_SCHEMA", prefix=""):
+    """Bounded feedback with a stable field address, never a copy of the schema."""
+    path = prefix + ''.join('/' + str(part).replace('~', '~0').replace('/', '~1')
+                            for part in getattr(error, 'absolute_path', ()))
+    result = {"category": category, "path": path or "/",
+              "message": getattr(error, 'message', str(error))[:1200]}
+    if getattr(error, 'validator', None):
+        result['constraint'] = error.validator
+        properties = getattr(error, 'schema', {}).get('properties', {})
+        instance = getattr(error, 'instance', None)
+        fields = []
+        if isinstance(instance, dict) and error.validator == 'additionalProperties':
+            patterns = getattr(error, 'schema', {}).get('patternProperties', {})
+            fields = [name for name in instance if name not in properties
+                      and not any(re.search(pattern, name) for pattern in patterns)]
+        elif isinstance(instance, dict) and error.validator == 'required':
+            fields = [name for name in error.validator_value if name not in instance]
+        if fields:
+            result['fields'] = [path + '/' + name.replace('~', '~0').replace('/', '~1') for name in fields]
+            if len(fields) == 1:
+                result['path'] = result['fields'][0]
+    if isinstance(error, json.JSONDecodeError):
+        result.update(line=error.lineno, column=error.colno, offset=error.pos)
+    return result
+
+
+def charge_report_correction(*, phase, repository=""):
+    """All transport and business report corrections share the case ledger."""
+    from .execution_budget import ACTIVE_EXECUTION
+    ledger = ACTIVE_EXECUTION.get()
+    if ledger is not None:
+        ledger.charge('report_corrections', phase=phase, repository=repository)
+
+
 def _schema_allows_null(schema: Any) -> bool:
     if not isinstance(schema, dict):
         return False
@@ -138,6 +172,11 @@ class CodexRuntime:
         self._event_count = 0
         self._log_lock = threading.RLock()
         self._broker = None
+        self._runtime_child = None
+        # Business controllers with hash-bound local repair own parsed schema
+        # errors. Other callers retain the existing single transport retry.
+        self.defer_schema_errors = False
+        self.report_repository = ""
         from .output_budget import find_budget
         self._output_budget = find_budget(self.events_path)
         self._output_error = None
@@ -187,6 +226,9 @@ class CodexRuntime:
                   codex_bin=self.codex_path or "sdk-pinned", turn_timeout=self.turn_timeout)
         try:
             self._call(self._codex.__aenter__(), timeout=min(30, self.turn_timeout))
+            from .runtime_children import RuntimeChild
+            process = getattr(getattr(getattr(self._codex, '_client', None), '_sync', None), '_proc', None)
+            self._runtime_child = RuntimeChild(self.events_path, process)
             self._log("runtime_ready", metadata=_plain(self._codex.metadata))
         except BaseException:
             self.close()
@@ -195,9 +237,12 @@ class CodexRuntime:
 
     def _make_broker(self):
         from .tool_broker import ToolBroker
-        # Investigation supplies its shared budget per turn. Migration retains
-        # bounded I/O across this runtime and each turn keeps its own deadline.
+        # The broker fallback inherits the case ledger without activating the
+        # paused investigation clock; tools, bytes and case time remain shared.
         return ToolBroker(self.read_scope, self._log, seconds=self.turn_timeout * 48)
+
+    def recovery_child(self):
+        return self._runtime_child.reference() if self._runtime_child is not None else None
 
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
@@ -263,11 +308,17 @@ class CodexRuntime:
                             timeout=self.turn_timeout)
         output, failure = self._validated_output(result, output_schema, validator)
         if failure is not None:
+            if self.defer_schema_errors and result.get('output_diagnostic', {}).get('category') == 'REPORT_SCHEMA':
+                self._log('output_validation_rejected', diagnostic=result['output_diagnostic'],
+                          final_response=result.get('final_response', ''))
+                raise CodexRuntimeError('Structured report requires local field correction: ' + failure,
+                                        kind='INVALID_OUTPUT', details=result)
             # One corrective re-ask: a malformed structured reply is a
             # transport-level defect (e.g. a closing-brace slip), not a
             # reasoned answer. It shares the call deadline and total model
             # budget; it does not reset either. Second failure is terminal.
             self._log("output_retry", thread_id=self._thread.id, error=failure)
+            charge_report_correction(phase='report_format', repository=self.report_repository)
             correction = ("Your previous reply failed machine parsing/validation:\n"
                           + failure
                           + "\nReturn the complete corrected reply now. Match the requested "
@@ -297,6 +348,7 @@ class CodexRuntime:
             output = json.loads(text)
         except ValueError as exc:
             error_text = f"{type(exc).__name__}: {exc}"[:500]
+            result['output_diagnostic'] = report_diagnostic(exc, category='JSON_SYNTAX')
             # Deterministic repair for the known GLM slip (misordered trailing
             # closers, e.g. '"}]}' instead of '"]}' ); anything structurally
             # broken mid-body or truncated is left for the corrective re-ask.
@@ -339,17 +391,22 @@ class CodexRuntime:
                 return None, error_text
         if self._deepseek_schema_compat and output_schema is not None:
             output = _remove_wire_only_nulls(output, output_schema)
+        result.pop('output_diagnostic', None)
         if validator is not None:
             try:
                 validator.validate(output)
             except Exception as exc:
                 unwrapped = _unwrap_schema_envelope(output, output_schema)
                 if unwrapped is None:
-                    return None, f"{type(exc).__name__}: {exc}"[:500]
+                    result['parsed_output'] = output
+                    result['output_diagnostic'] = report_diagnostic(exc)
+                    return None, json.dumps(result['output_diagnostic'], ensure_ascii=False)
                 try:
                     validator.validate(unwrapped)
-                except Exception:
-                    return None, f"{type(exc).__name__}: {exc}"[:500]
+                except Exception as inner:
+                    result['parsed_output'] = output
+                    result['output_diagnostic'] = report_diagnostic(inner)
+                    return None, json.dumps(result['output_diagnostic'], ensure_ascii=False)
                 self._log("output_schema_envelope_unwrapped", thread_id=self._thread.id)
                 result["schema_envelope_unwrapped"] = True
                 output = unwrapped
@@ -357,11 +414,23 @@ class CodexRuntime:
 
 
     async def _consume(self, prompt: str, read_only: bool, output_schema) -> dict[str, Any]:
-        self._output_guard()
-        from .retrieval import ACTIVE_BUDGET, ACTIVE_MODEL_BUDGET
+        from contextlib import nullcontext
+        from .execution_budget import ACTIVE_EXECUTION, MODEL_CONTEXT
+        from .retrieval import ACTIVE_MODEL_BUDGET
         limit = ACTIVE_MODEL_BUDGET.get()
         if limit is not None:
-            limit.claim()
+            limit.claim(read_only=read_only)
+        ledger = ACTIVE_EXECUTION.get()
+        if ledger is not None and limit is None:
+            ledger.admit_model(read_only=read_only, **MODEL_CONTEXT.get())
+        operation = (ledger.operation('model', timeout=self.turn_timeout, **MODEL_CONTEXT.get())
+                     if ledger is not None else nullcontext())
+        with operation:
+            return await self._consume_stream(prompt, read_only, output_schema)
+
+    async def _consume_stream(self, prompt: str, read_only: bool, output_schema) -> dict[str, Any]:
+        self._output_guard()
+        from .retrieval import ACTIVE_BUDGET
         turn_options: dict[str, Any] = {}
         if self.model:
             turn_options["model"] = self.model
@@ -451,6 +520,8 @@ class CodexRuntime:
     def _call(self, coroutine, *, timeout: float):
         from .retrieval import ACTIVE_BUDGET, BudgetExceeded
         from .output_budget import OutputBudgetUnavailable
+        from .lifecycle import RecoveryBlocked
+        task = waiter = None
         try:
             try:
                 self._output_guard()
@@ -458,14 +529,59 @@ class CodexRuntime:
                 coroutine.close()
                 raise
             budget = ACTIVE_BUDGET.get()
+            from .execution_budget import ACTIVE_EXECUTION
+            execution = ACTIVE_EXECUTION.get()
+            if execution is not None:
+                try:
+                    timeout = min(timeout, execution.remaining_seconds())
+                except (BudgetExceeded, RecoveryBlocked):
+                    coroutine.close()
+                    raise
             if budget is not None:
                 try:
                     timeout = min(timeout, budget.remaining())
-                except BudgetExceeded:
+                except (BudgetExceeded, RecoveryBlocked):
                     coroutine.close()
                     raise
-            return self._loop.run_until_complete(asyncio.wait_for(coroutine, timeout))
+            task = self._loop.create_task(coroutine)
+            waiter = self._loop.create_task(asyncio.wait_for(task, timeout))
+            return self._loop.run_until_complete(waiter)
+        except KeyboardInterrupt as exc:
+            # A signal interrupts run_until_complete, not its asynchronous task.
+            # Drain cancellation while that task still owns its ContextVars so
+            # model-operation/broker finally blocks persist their settlements.
+            pending = {item for item in (task, waiter) if item is not None and not item.done()}
+            draining = set(pending)
+            cleanup_errors = []
+            # wait_for propagates its cancellation to the inner task. Sending
+            # both cancellations can interrupt the inner task's async finally.
+            if waiter in pending:
+                waiter.cancel()
+            elif task in pending:
+                task.cancel()
+            if task is None:
+                coroutine.close()
+            if pending:
+                try:
+                    _, pending = self._loop.run_until_complete(asyncio.wait(pending, timeout=5))
+                except Exception as cleanup_error:
+                    cleanup_errors.append(cleanup_error)
+            for item in draining:
+                if item.done() and not item.cancelled() and item.exception() is not None:
+                    cleanup_errors.append(item.exception())
+            try:
+                self.close()
+            except Exception as cleanup_error:
+                cleanup_errors.append(cleanup_error)
+            if pending or cleanup_errors:
+                blocked = RecoveryBlocked('Cancelled runtime task cleanup unverified')
+                blocked.kind = 'BACKGROUND_CLEANUP_FAILED'
+                raise blocked from (cleanup_errors[0] if cleanup_errors else exc)
+            raise
         except OutputBudgetUnavailable:
+            self.close()
+            raise
+        except RecoveryBlocked:
             self.close()
             raise
         except BudgetExceeded as exc:
@@ -525,6 +641,13 @@ class CodexRuntime:
                             stream.close()
                 self._loop.close()
                 self._log("runtime_closed")
+        if self._runtime_child is not None:
+            try:
+                state = self._runtime_child.finish()
+            except Exception as exc:
+                raise CodexRuntimeError('Runtime child cleanup receipt unavailable', kind='BACKGROUND_CLEANUP_FAILED') from exc
+            if process is not None and state not in ('EXITED', 'EXITED_ID_REUSED'):
+                raise CodexRuntimeError('Runtime child exit is unverified', kind='BACKGROUND_CLEANUP_FAILED')
         if broker_error is not None:
             raise CodexRuntimeError('Controller callback cleanup unverified', kind='BACKGROUND_CLEANUP_FAILED') from broker_error
 
@@ -654,6 +777,8 @@ def _final_response(items):
 
 def _error_kind(message: str, status: str | None = None) -> str:
     lower = message.lower()
+    if re.search(r'\b402\b', message) or 'insufficient balance' in lower or 'payment required' in lower:
+        return 'QUOTA_EXHAUSTED'
     if re.search(r"\b(401|403)\b", message) or any(word in lower for word in ("unauthorized", "authentication", "not logged in")):
         return "AUTH_REQUIRED"
     if status == "interrupted":

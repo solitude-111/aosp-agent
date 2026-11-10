@@ -256,7 +256,7 @@ def collect_regions(agent, claims, candidate_patch):
                     if row['action'] == 'edit' and row['status'] == 'AFFECTED']
         for index, (region, row) in enumerate(zip(mappings, evidence.get('regions', [])), 1):
             row['mapping'] = region
-            if row['ok'] or 'site_binding' in row or 'site_evidence' in row:
+            if row['ok'] or 'site_binding' in row or 'site_evidence' in row or 'control_flow_obligations' in row:
                 continue  # Keep exact donor-site contradictions authoritative.
             path = region['path']
             if path not in cache:

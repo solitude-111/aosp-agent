@@ -97,7 +97,7 @@ scripts/
 - Python 虚拟环境和缓存；
 - 模型认证配置。
 
-示例构建脚本包含部署环境的路径和产品选择，使用前需按目标环境核对；这些示例不能当作新环境已通过资格验证的证明。完整验收范围和未完成项见 [验收矩阵](aosp_agent/ARCHITECTURE.md#验收范围与尚未完成的资格验证)。
+Android 模块构建脚本从受控 build profile 接收隔离目录、产品和架构，使用前需核对配置；示例不能当作新环境已通过资格验证的证明。完整验收范围和未完成项见 [验收矩阵](aosp_agent/ARCHITECTURE.md#验收范围与尚未完成的资格验证)。
 
 ## 安装
 
@@ -124,6 +124,11 @@ agent 会在 `--run-root` 下创建隔离 worktree。编译脚本会在受控流
 
 ## 运行
 
+四字段 JSONL 的无人值守入口是 `./run-patches cases.jsonl --config server.json`。
+它按行串行准备固定 manifest、隔离源码与输出目录，并记录跨轮次、跨仓库和恢复后的累计预算。
+配置示例、默认预算、状态查询及恢复方式见 [无人值守运行说明](aosp_agent/docs/unattended.md)。
+该入口的模块编译使用受控 build profile；旧 CLI 单独传 bundled build runner 而没有 prepared view 时会明确阻塞编译。
+
 列出 R760 案例：
 
 ```sh
@@ -140,9 +145,10 @@ agent 会在 `--run-root` 下创建隔离 worktree。编译脚本会在受控流
   --source-root /path/to/aosp \
   --donor-root /path/to/donor-git \
   --run-root /path/to/runs \
-  --build-runner /absolute/path/to/module-build-r760.sh \
-  --verify --max-attempts 6 --turn-timeout 3600
+  --max-attempts 6 --turn-timeout 3600
 ```
+
+此命令执行迁移。需要受控 Android 模块编译时，使用上面的无人值守入口并配置 build profile。
 
 需要保留独立人工验收时，使用 `--validation /path/to/overrides.json` 显式提供按仓库 key 分组的检查；旧 dataset 验收不会自动沿用。
 `--mapping-model` 可单独指定只读出题会话的模型，默认继承 `--model`；答题会话无权改写映射和验收计划。

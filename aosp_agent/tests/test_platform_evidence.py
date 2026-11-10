@@ -71,6 +71,31 @@ def map_platform_dependencies(raw):
 
 
 class PlatformEvidenceTest(unittest.TestCase):
+    def test_signed_constructor_still_requires_matching_target_definition_and_call(self):
+        with GitFixture() as fx:
+            add_sources(fx)
+            owner = core_tests.AgentTest(); agent = owner.agent(fx); owner._with_counter_hunk(agent)
+            raw = fx.assessment(); add_platform(raw)
+            raw['causal_chain']['platform_semantics'][0]['api'] = 'java.io.File(String,String)'
+            self.assertEqual(agent._ground_assessment(copy.deepcopy(raw))['status'], 'AFFECTED')
+            raw['causal_chain']['platform_semantics'][0]['api'] = 'java.io.File(String,int)'
+            with self.assertRaises(AssessmentError) as failure:
+                agent._ground_assessment(copy.deepcopy(raw))
+            self.assertEqual(failure.exception.diagnostic['category'], 'EVIDENCE_MISSING')
+
+    def test_repository_api_classification_error_does_not_recommend_unverified_affected(self):
+        with GitFixture() as fx:
+            owner = core_tests.AgentTest(); agent = owner.agent(fx); owner._with_counter_hunk(agent)
+            raw = fx.assessment(); add_platform(raw)
+            raw['causal_chain']['platform_semantics'][0]['api'] = 'android::Parcel::internalCall'
+            with self.assertRaises(AssessmentError) as failure:
+                agent._validate_impact_causality(raw)
+            diagnostic = failure.exception.diagnostic
+            self.assertEqual(diagnostic['category'], 'API_CLASSIFICATION')
+            self.assertEqual(diagnostic['path'], '/causal_chain/platform_semantics/0/api')
+            self.assertIn('ordinary pinned-source evidence', diagnostic['message'])
+            self.assertNotIn('declared in external_behavior_assumptions', diagnostic['message'])
+
     def test_real_target_blobs_required_and_record_is_not_semantic_proof(self):
         with GitFixture() as fx:
             add_sources(fx)
@@ -221,7 +246,13 @@ class PlatformEvidenceTest(unittest.TestCase):
             class CorrectedRuntime(ScriptedRuntime):
                 def run(self, *args, **kwargs):
                     if self.calls:
-                        self.assessment = fx.assessment('UNKNOWN')
+                        from aosp_agent.assessment_repair import digest
+                        import json
+                        unknown = fx.assessment('UNKNOWN')
+                        self.assessment = {'base_sha256': digest(bad), 'replacements': [
+                            {'path': '/' + key, 'value_json': json.dumps(value)}
+                            for key, value in unknown.items() if bad.get(key) != value],
+                            'retire_causal_claim': True}
                     return super().run(*args, **kwargs)
             runtime = CorrectedRuntime(bad)
             agent = core_tests.AgentTest().agent(fx, runtime)

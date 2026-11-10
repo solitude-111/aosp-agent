@@ -148,5 +148,5 @@ class AttemptChainTest(unittest.TestCase):
                 final = resume_batch(runner.run_dir / 'batch-status.json')
                 self.assertEqual(final['status'], 'COMPLETED', final)
                 self.assertEqual(final['rows'][0]['execution_record'], standalone['record'])
-                with self.assertRaisesRegex(RecoveryBlocked, 'latest batch attempt is already completed'):
+                with self.assertRaisesRegex(RecoveryBlocked, 'no interrupted or policy-retryable rows'):
                     resume_batch(runner.run_dir / 'batch-status.json')
