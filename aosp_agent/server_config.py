@@ -19,7 +19,8 @@ PREPARATION_DEFAULTS = {'local_command_timeout': 60, 'fetch_timeout': 180, 'max_
     'min_free_bytes': 2 * 1024**3, 'max_seconds': 3600, 'allow_fetch': True}
 REQUIRED_PATHS = {'source_root', 'donor_root', 'cache_root', 'isolation_root', 'run_root'}
 TOP_KEYS = REQUIRED_PATHS | {'version', 'manifest_origin', 'manifest_name', 'allowed_upstreams',
-    'donor_map', 'agent', 'preparation', 'build', 'credential_reference', 'batch_limits', 'retry_policy'}
+    'donor_map', 'agent', 'preparation', 'build', 'credential_reference', 'batch_limits', 'retry_policy',
+    'source_base'}
 
 
 def safe_origin(value):
@@ -93,6 +94,18 @@ def validate_config(raw):
     if not isinstance(build, dict): raise ValueError('build must be an object')
     from .build_environment import validate_build_config
     config['build'] = validate_build_config(build)
+    if 'source_base' in config:
+        binding = config['source_base']
+        import re
+        if (not isinstance(binding, dict) or set(binding) != {'receipt', 'receipt_sha256'}
+                or not isinstance(binding['receipt'], str) or not Path(binding['receipt']).is_absolute()
+                or not isinstance(binding['receipt_sha256'], str)
+                or not re.fullmatch(r'[0-9a-f]{64}', binding['receipt_sha256'])):
+            raise ValueError('source_base requires an absolute registration receipt and its fixed SHA-256')
+        receipt = Path(binding['receipt']).resolve()
+        if receipt.is_relative_to(source):
+            raise ValueError('source_base receipt must be outside the source view')
+        config['source_base'] = {**binding, 'receipt': str(receipt)}
     if config['build'].get('enabled'):
         roots = [source, *(Path(config[k]) for k in ('cache_root', 'isolation_root', 'run_root'))]
         build_paths = [Path(config['build'][k]).resolve() for k in ('output_root', 'tmp_root', 'baseline_cache')]

@@ -39,6 +39,9 @@ class ControlledBuild:
             'differences': identity['differences'], 'source_scope': 'prepared_private_view',
             'validation_manifest_scope': 'derived' if identity['differences'] else 'original',
             'original_manifest_validated': False, 'baseline_receipts': []}
+        if 'source_view' in identity:
+            controller.record['build_environment'].update(
+                source_scope='immutable_base_with_project_work_layers', source_view=identity['source_view'])
 
     def graph_file(self):
         root = Path(self.config['output_root'])
@@ -188,6 +191,8 @@ def controlled_build_session(controller):
     protected = {key: child.case.target_commit for key, child in controller.children.items() if child.case.files}
     from .preparation import PreparationError
     try:
+        if 'source_view' in prepared.environment:
+            prepared.ensure_writable(protected.keys())
         prepared.materialize_all()
     except PreparationError as exc:
         raise BuildEnvironmentBlocked('fixed build view cannot be prepared: ' + str(exc)) from exc

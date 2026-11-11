@@ -18,6 +18,67 @@ export AOSP_AGENT_PYTHON=/absolute/path/aosp-agent/.venv-sdk/bin/python
 
 `--print-config` 校验并显示有效配置，不调用模型、不启动编译，也不证明服务器隔离或源码完整性已经通过。也可以每次传入 `--config /absolute/path/server.json`。入口暴露的模型、预算和目录参数可以覆盖配置；实际配置及其哈希会保存到新启动目录的 `effective-config.json`。
 
+## 显式复用只读源码底座
+
+当前新增能力在本地实现和测试；服务器部署、挂载、AOSP 准备及此前候选重测仍保持暂停。本节给出接口和前置条件，不表示现有服务器已具备可复用底座，也不表示实际构建已经通过。未配置 `source_base` 时继续使用原隔离流程和完整源码审计。
+
+复用需要先登记一次经过独立完整核验的只读底座。当前支持的 provider 是 `fsverity_squashfs`：镜像文件必须受 fs-verity 保护，通过只读 loop 设备挂载为只读 SquashFS。控制器读取实际内核证据并绑定镜像摘要、目录清单和登记收据；仅有 `chmod`、普通只读 bind、JSON 中的 `READY` 或上次成功日志都不足以授权复用。每次打开或使用视图仍核对内核身份，登记后的相同底座不再逐仓执行 Git 审计。
+
+先对已有、离线对象齐备的 checkout 生成目录清单，输出必须位于源码树外且不能覆盖既有文件：
+
+```sh
+"$AOSP_AGENT_PYTHON" -m aosp_agent.source_base_cli create-catalog \
+  --source-root /srv/aosp/input \
+  --manifest-origin https://android.googlesource.com/platform/manifest \
+  --output /srv/aosp-registration/catalog.json
+```
+
+该步骤核验完整项目及 Git 元数据、对象闭包、固定引用和 manifest 的 copy/link 文件。随后由运维在本流程之外制作镜像，将上述清单的原始字节包含在镜像内，并完成 fs-verity、只读 loop 和 SquashFS 挂载。CLI 不下载对象、不切换 checkout、不制作镜像、不启用 verity，也不执行挂载。没有 `.repo` 的小型 checkout 可显式提供 `--project-catalog`；已有 `.repo` 时不能用手写清单缩小项目范围。
+
+登记 spec 必须恰好包含以下六项，摘要占位符须替换为实际值，`catalog_path` 是镜像内部相对路径：
+
+```json
+{
+  "provider": "fsverity_squashfs",
+  "image": "/srv/aosp-base/base.squashfs",
+  "mount_root": "/srv/aosp-base/mount",
+  "verity_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+  "catalog_path": ".source-base/catalog.json",
+  "catalog_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+}
+```
+
+```sh
+"$AOSP_AGENT_PYTHON" -m aosp_agent.source_base_cli register \
+  --spec /srv/aosp-registration/sealed-image-spec.json \
+  --receipt /srv/aosp-registration/registration.json
+```
+
+登记先核实真实 provider，再独立审计镜像内的完整源码；结果必须与镜像内清单一致才发布收据。上述两个 CLI 的默认审计限额分别为：单条 Git 最多 60 秒、64 MiB 输出，整次最多 7200 秒、1 GiB 输出、50000 条 Git；可显式配置有限额度，超限不发布成功登记。该初始成本与每案准备预算分开记录。
+
+首次登记也核验 Git 配置的实际来源：首版拒绝 `include`/`includeIf`，配置文件及其符号链接必须完全位于可重定位的源码闭包内。完整索引不得含 `assume-unchanged` 或 `skip-worktree` 标志；否则 status/diff 的干净结果不足以证明源码未变。登记不会自动清除这些标志或修改配置。
+
+将 `register` 输出中的 `receipt` 和 `receipt_sha256` 两项加入服务器配置顶层：
+
+```json
+{
+  "source_base": {
+    "receipt": "/srv/aosp-registration/registration.json",
+    "receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  }
+}
+```
+
+底座挂载目录必须与任务源码、缓存、隔离层、运行目录和构建目录互不覆盖，镜像和登记收据也不能被任务挂载遮住。配置声明了底座但摘要、seal、挂载或目录清单失效时明确阻塞；不会静默回退到扫描 1048 个仓库，也不会继续信任旧 `source_view` 收据。
+
+完整目标向量中与登记底座相同的项目直接复用；选中的写入仓库获得自己的可写 upper，pin 改变只物化相应仓库。相同向量的派生验证视图不重新物化项目；不同向量仅处理差异项目，并保留父视图已有的可写仓库。每案及每个派生视图使用独立工作层和输出层，修改不得写入底座或宿主 checkout。源码恢复审计继承仍有效的只读项目证据，并实际检查可写仓库；失去底座或活动视图证据时阻塞，不能把“少做检查”当成恢复成功。
+
+每次可写仓审计都会重新核对 Git 实际 worktree、gitdir 和 common-dir，防止构建期间配置被改向另一棵干净源码树；同时用有界 `ls-files -v -z` 检查整个该仓索引，拒绝可隐藏改动的索引标志。大仓的索引路径输出可能较大，仍受读取与输出额度限制，超限即阻断；只读底座仓继承首次已核验的索引证明，不重复逐仓 Git 查询。
+
+runner 路径、脚本字节、输出目录或构建参数变化不改变源码底座身份，也不应触发全仓 Git 扫描；它们仍改变构建环境身份，旧基线成功缓存不能据此沿用。源码复用与构建验证是两份独立证据。登记清单中来源匹配的固定 ref 也可直接继承，不重复查询本地或远程；这代表明确选用已登记的源码快照，不承诺上游最新。需要更新时显式选择新目标 pin 或重新登记新的底座，不能改写旧登记。
+
+首版要求项目集合和 manifest copy/link 声明与已封存清单一致：新增或删除项目、改变这些文件布局会明确阻塞。可写项目与清单中其他项目存在父子路径交叠、Git worktree 的 `commondir` 与 `git_dir` 不同，也不支持。恢复记录中的私有 Git 元数据尚未 `READY` 或原 upper 缺失时保留现场并阻塞，不能重建一个空层冒充原任务恢复。此类情况应先满足受支持的底座布局，再显式登记或启动独立新任务。
+
 ## 输入和执行
 
 每行恰好包含四个字段。以下 SHA 是格式占位符，执行前必须替换为真实提交及其父提交：
@@ -28,11 +89,11 @@ export AOSP_AGENT_PYTHON=/absolute/path/aosp-agent/.venv-sdk/bin/python
 
 `target_revision` 指向 manifest 的 tag、branch 或 commit，不是某个目标仓库的 SHA。准备阶段将完整项目清单固定为不可变提交向量；执行过程中不重新解析移动分支。输入不能额外加入 CVE、目标仓库、目标文件、模块或参考补丁答案。
 
-项目清单中的可变 branch/tag 优先从对应 checkout 读取本地快照。项目路径及 `.git`、`commondir` 和实际配置文件必须位于 `source_root` 内；本地任意 remote 名称的 HTTPS URL 还须与 manifest 项目来源匹配，比较时归一化末尾 `.git`。控制器先精确枚举 branch/tag 名称，再解引用 tag；同名歧义直接拒绝，不能忽略坏 ref 后选择另一个。所有本地 Git 命令禁止网络和惰性对象获取，每条最多 3 秒、stdout/stderr 合计 64 KiB。
+项目清单中的可变 branch/tag 在没有可继承的已登记底座引用时，优先从对应 checkout 读取本地快照。项目路径及 `.git`、`commondir` 和实际配置文件必须位于 `source_root` 内；本地任意 remote 名称的 HTTPS URL 还须与 manifest 项目来源匹配，比较时归一化末尾 `.git`。控制器先精确枚举 branch/tag 名称，再解引用 tag；同名歧义直接拒绝，不能忽略坏 ref 后选择另一个。所有本地 Git 命令禁止网络和惰性对象获取，每条最多 3 秒、stdout/stderr 合计 64 KiB。
 
 本地来源不可信、ref 缺失或无法可靠解析时，才从允许的 HTTPS 上游精确查询 `git ls-remote` 广告，单次最多 30 秒、64 KiB。记录注明本地来源或远程广告、完整 ref、OID 和观测时间；本地结果是冻结时看到的本地快照，不承诺上游最新。两种路径都不导入未选中目标项目的对象，也不证明 OID 是 commit 或 tree/blob 已齐备；选择该项目后才物化并严格核对类型、完整性及 checkout 的固定提交。开启完整编译时，才需要物化整个固定向量。
 
-一次批次冻结中，所有 manifest 按 `(origin, requested_revision)` 共用结果，包括失败结果；resume 使用已保存的固定向量，不重新解析。比如三行输入共有 1048 个待解析的来源/ref 对，且全部本地命中，只需 1048 次本地探查，不逐行重复三轮；本地探查后再回退远程的对会另计一次远程查询。完整固定 SHA 不需要解析 ref。独立新批次重新观测本地 ref，并仅在必要时查询远程。`allow_fetch: false` 禁止远程广告和对象获取，仍允许可信本地 ref 解析；需要的固定对象缺失时明确阻塞。
+一次批次冻结中，所有 manifest 按 `(origin, requested_revision)` 共用结果，包括失败结果；resume 使用已保存的固定向量，不重新解析。比如三行输入共有 1048 个待解析的来源/ref 对，且全部本地命中，只需 1048 次本地探查，不逐行重复三轮；本地探查后再回退远程的对会另计一次远程查询。完整固定 SHA 不需要解析 ref。未显式使用已登记底座引用时，独立新批次重新观测本地 ref，并仅在必要时查询远程。`allow_fetch: false` 禁止远程广告和对象获取，仍允许可信本地 ref 解析；需要的固定对象缺失时明确阻塞。
 
 ```sh
 ./run-patches cases.jsonl --config /absolute/path/server.json
@@ -110,15 +171,17 @@ export AOSP_AGENT_PYTHON=/absolute/path/aosp-agent/.venv-sdk/bin/python
 
 ### 全 manifest 构建的工具预算
 
+下列按 `N` 计算的费用适用于未启用已登记只读底座的原流程。启用底座后，准备只处理变化项目，构建快照只对可写仓库执行逐仓 Git 审计；底座身份、活动挂载及 manifest 投影仍需核对。应按实际复用项目数、可写仓库数和控制器消耗配置有限预算，不能把原来的全仓估算当成复用模式必付的固定成本，也不能把少量 Git 等同于零验证成本。
+
 默认 `max_git_operations=2000` 适用于迁移调查，不适合直接覆盖大型完整 AOSP 构建的源审计。设固定向量含 `N` 个项目，manifest 含 `D` 个目录 linkfile，计划验证 `K` 组模块，最多执行 `R` 次候选验证：
 
-- 每次完整源码快照需 `5N + 2D` 次 Git 命令，检查 HEAD/tree、status、暂存区、工作区、ignored 输入和 manifest 目录 linkfile 的目标树；普通 root copyfile/linkfile 还检查字节或链接身份。
-- 每组首次构建最多 4 次快照：无补丁基线前后、候选前后，即 `20N` 次命令。命中基线缓存时为 `15N`。
-- 若静态归属不完整，需要生成无补丁实际构建图，每次验证再增加 `10N`。
+- 每次完整源码快照需 `7N + 2D` 次 Git 命令，检查 Git 实际路径绑定、索引标志、HEAD/tree、status、暂存区、工作区、ignored 输入和 manifest 目录 linkfile 的目标树；普通 root copyfile/linkfile 还检查字节或链接身份。
+- 每组首次构建最多 4 次快照：无补丁基线前后、候选前后，即 `28N` 次命令。命中基线缓存时为 `21N`。
+- 若静态归属不完整，需要生成无补丁实际构建图，每次验证再增加 `14N`。
 
-有图发现时按 `R × (2 + 4K) × (5N + 2D)` 估算构建快照上界，再给准备、环境身份核对、已准入仓库的常规审计和调查留出明确余量。上面的 `20N/15N/10N` 是没有目录 linkfile 时的例子。启用编译前在独立 build profile 中显式提高 `max_git_operations` 并记录 `N/D/K/R` 依据；不要把这一变化混入迁移对照实验。无模型的专项构建若需要提高准备读取额度，必须另存有限额度配置并记录原因，不能改动 M2 的 64 MiB 基线。检查只返回状态和摘要，仍逐条计入命令次数。
+有图发现时按 `R × (2 + 4K) × (7N + 2D)` 估算构建快照上界，再给准备、环境身份核对、已准入仓库的常规审计和调查留出明确余量。上面的 `28N/21N/14N` 是没有目录 linkfile 时的例子。不可变底座模式用本次可写仓数 `W` 代替逐仓审计项中的 `N`，即每次 `7W + 2D`，另计底座与挂载核验成本。启用编译前在独立 build profile 中显式配置 `max_git_operations` 并记录 `N/D/K/R` 依据；不要把这一变化混入迁移对照实验。无模型的专项构建若需要提高准备读取额度，必须另存有限额度配置并记录原因，不能改动 M2 的 64 MiB 基线。索引检查会读取该仓完整的有界路径列表，所有命令仍逐条计费。
 
-以专项 M4 的有限配置 `max_git_operations=50000` 为例：`N=1048`、`D=3`、一组模块与一次候选验证，四次基线/候选快照加可选的两次构建图快照为 `6 × (5N + 2D) = 31476` 次。再预留本地 ref 探查最多 `3N=3144` 条命令，以及对象已齐备、已有 checkout 时约 `7N=7336` 条物化命令，共约 `41956` 次，留下约 `8044` 次余量。专项 M4 从准备开始就激活整案账本，准备 Git 与快照均按实际发起计次；上述预留数值不代表已经消费，准备层仍同时受自己的时间、ref/fetch 次数及 ToolIO 字节限制。这不是保证足够的上界。缺对象获取、额外模块、验证重试或兼容视图会增加成本，须记录实际消耗并在有限额度耗尽时停止，不能自动扩大预算。
+以 `N=1048`、`D=3`、一组模块与一次候选验证的未启用底座流程为例：四次基线/候选快照加可选两次构建图快照为 `6 × (7N + 2D) = 44052` 次。再预留本地 ref 探查最多 `3N=3144` 条，以及对象已齐备、已有 checkout 时约 `7N=7336` 条物化命令，共约 `54532` 次。历史 M4 的 `max_git_operations=50000` 已不足以覆盖这个新估算，旧配置与结果仍保留；若另建 `60000` 的独立实验 profile，仅余约 `5468` 次，仍不是完成保证。专项 M4 从准备开始就激活整案账本，准备 Git 与快照均按实际发起计次；预留数值不代表已经消费，准备层仍受自己的时间、ref/fetch 次数及 ToolIO 字节限制。缺对象获取、额外模块、验证重试或兼容视图会增加成本，须记录实际消耗并在有限额度耗尽时停止，不能自动扩大预算。
 
 必要完整性审计有固定的 `audit_grace`：从首次整案硬限耗尽开始，最多 120 秒和 20000 条获准只读审计命令，两者均需满足。这是持久的墙钟截止时间和累计次数，跨 resume 不刷新；不能配置成无限，也不能用于写入、模型调用、修补、新调查或编译。`BatchBudgetExceeded` 等整批阻塞仍然生效，不会被这项宽限捕获或绕过。
 

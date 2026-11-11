@@ -47,6 +47,19 @@ def setup(fixture):
 
 
 class ConfigurationTest(TestCase):
+    def test_source_base_requires_explicit_fixed_registration_outside_view(self):
+        with GitFixture() as f:
+            raw, _ = setup(f)
+            binding = {'receipt': str(f.root / 'registration.json'), 'receipt_sha256': 'a' * 64}
+            self.assertNotIn('source_base', validate_config(raw))
+            self.assertEqual(validate_config({**raw, 'source_base': binding})['source_base'], binding)
+            for invalid in (None, {}, {**binding, 'receipt': 'relative.json'},
+                            {**binding, 'receipt_sha256': 'not-a-hash'},
+                            {**binding, 'verified': True},
+                            {**binding, 'receipt': str(f.source_root / 'registration.json')}):
+                with self.subTest(binding=invalid), self.assertRaises(ValueError):
+                    validate_config({**raw, 'source_base': invalid})
+
     def test_only_environment_configuration_and_explicit_precedence(self):
         with GitFixture() as f:
             raw, row = setup(f)

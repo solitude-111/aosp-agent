@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import signal
 import sys
 import tempfile
 import threading
@@ -24,6 +25,61 @@ from test_tool_broker import call, response
 
 
 class ReadAccountingTest(unittest.TestCase):
+    def test_query_limit_survives_short_lived_process_group_cleanup(self):
+        budget = ReadBudget(seconds=10)
+        io = ToolIO(budget, threading.Event(), time.monotonic() + 10, max_output=2)
+        real_killpg = os.killpg
+        def delayed_signal(pid, sig):
+            # Widen the real exit-to-reap window. On Darwin the original
+            # cleanup raised EPERM here and hid QueryOutputLimit.
+            time.sleep(.02)
+            return real_killpg(pid, sig)
+        with patch('aosp_agent.tool_io.os.killpg', side_effect=delayed_signal):
+            with self.assertRaises(QueryOutputLimit):
+                io.run([sys.executable, '-c', 'import os; os.write(1,b"abc"); os._exit(0)'])
+        self.assertEqual((budget.bytes_used, budget.bytes_reserved), (3, 0))
+
+    def test_permission_denied_group_cleanup_blocks_even_if_leader_has_exited(self):
+        # A dead leader does not prove that a same-group child is absent. Both
+        # a live leader and a persistent denied group must stop the case.
+        for live in (True, False):
+            with self.subTest(live_leader=live):
+                budget = ReadBudget(seconds=10)
+                io = ToolIO(budget, threading.Event(), time.monotonic() + 10, max_output=2)
+                children, original_popen, real_killpg = [], subprocess.Popen, os.killpg
+                def start(*args, **kwargs):
+                    child = original_popen(*args, **kwargs)
+                    children.append(child)
+                    return child
+                def refuse_group(_pid, _sig):
+                    if not live:
+                        children[0].wait(timeout=1)
+                    raise PermissionError(1, 'denied group')
+                try:
+                    with patch('aosp_agent.tool_io.subprocess.Popen', side_effect=start), \
+                            patch('aosp_agent.tool_io.os.killpg', side_effect=refuse_group) as denied:
+                        started = time.monotonic()
+                        with self.assertRaises(RecoveryBlocked):
+                            io.run([sys.executable, '-c', 'import os,time; os.write(1,b"abc"); '
+                                    + ('time.sleep(30)' if live else 'os._exit(0)')])
+                        self.assertLess(time.monotonic() - started, 5)
+                        self.assertEqual(denied.call_count, 1 if live else 2)
+                        if live:
+                            self.assertIsNone(children[0].poll())
+                        else:
+                            self.assertEqual(children[0].poll(), 0)
+                    self.assertEqual((budget.bytes_used, budget.bytes_reserved), (3, 0))
+                finally:
+                    # The denial is a mock boundary. Reap every real fixture
+                    # process after restoring actual signaling permissions.
+                    for child in children:
+                        child.poll()
+                        try:
+                            real_killpg(child.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        child.wait(timeout=5)
+
     def test_short_reads_eof_and_exact_query_limit_release_unused_reservation(self):
         budget = ReadBudget(seconds=20, output_bytes=100000)
         io = ToolIO(budget, threading.Event(), time.monotonic() + 20, max_output=3)

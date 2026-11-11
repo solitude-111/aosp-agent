@@ -11,6 +11,18 @@ from aosp_agent.sdk_runtime import _error_kind
 
 
 class BatchFailurePolicyTest(unittest.TestCase):
+    def test_source_base_proof_failure_stays_shared_after_receipt_roundtrip(self):
+        from aosp_agent.source_base import SourceBaseBlocked
+        for kind in ('SOURCE_BASE_INVALID', 'SOURCE_BASE_UNAVAILABLE',
+                     'SOURCE_BASE_PATH_OVERLAP', 'SOURCE_VIEW_UNVERIFIED'):
+            with self.subTest(kind=kind):
+                error = SourceBaseBlocked('immutable evidence lost', kind=kind)
+                policy = classify_failure(error)
+                record = json.loads(json.dumps({'status': 'BLOCKED', 'completion_blocked_by': kind}))
+                self.assertEqual(classify_failure(record), policy)
+                self.assertEqual(policy['action'], 'PAUSE_BATCH')
+                self.assertFalse(terminal_retry_allowed(record))
+
     def test_terminal_retry_is_bounded_and_only_for_observed_transient_error(self):
         timeout = {'status': 'INCONCLUSIVE', 'completion_blocked_by': 'MODEL_TIMEOUT'}
         self.assertTrue(terminal_retry_allowed(timeout))

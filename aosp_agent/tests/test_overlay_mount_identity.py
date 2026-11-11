@@ -23,12 +23,12 @@ class OverlayMountIdentityTest(unittest.TestCase):
                 f'{values["fstype"]} overlay {values["supermode"]},lowerdir={values["lower"]},'
                 f'upperdir={values["upper"]},workdir={values["work"]},userxattr\n')
 
-    def verify(self, table, fdinfo='pos:\t0\nmnt_id:\t17\nflags:\t02300000\n'):
+    def verify(self, table, fdinfo='pos:\t0\nmnt_id:\t17\nflags:\t02300000\n', *, lower=None):
         def read(path, *_args, **_kwargs):
             return io.StringIO(fdinfo if str(path).startswith('/proc/self/fdinfo/') else table)
         with patch('aosp_agent.preparation.os.open', return_value=47), patch('aosp_agent.preparation.os.close') as close, patch.object(Path, 'open', read):
             try:
-                LinuxOverlays._verify_mount(self.root, self.upper, self.work)
+                LinuxOverlays._verify_mount(self.root, self.upper, self.work, lower)
             finally:
                 close.assert_called_once_with(47)
 
@@ -82,6 +82,53 @@ class OverlayMountIdentityTest(unittest.TestCase):
                 with self.assertRaises(PreparationBlocked): overlays.mount(source, root / 'layer')
             self.assertEqual([args[0] for args in calls], ['mount', 'umount'])
             self.assertEqual(overlays.mounted, [])
+
+    def test_fresh_empty_output_lower_is_bound_exactly(self):
+        lower = Path('/fixture/new-output/empty')
+        self.verify(self.entry(lower=lower), lower=lower)
+        with self.assertRaises(PreparationBlocked):
+            self.verify(self.entry(), lower=lower)
+
+    def test_bind_checks_inode_readonly_mode_and_live_mount_replacement(self):
+        # Simulated mount table; these tests do not mount filesystems on macOS.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source, target = root / 'sealed', root / 'visible'
+            source.mkdir(); target.mkdir()
+            info = source.stat()
+            current = {'mount_id': '17', 'target': str(target), 'options': ['ro'],
+                       'device': info.st_dev, 'inode': info.st_ino}
+            overlays = LinuxOverlays('fixture'); calls = []
+            with patch.object(overlays, 'check_namespace'), patch.object(overlays, 'command', side_effect=lambda args: calls.append(args)), \
+                    patch.object(overlays, '_visible_mount', side_effect=lambda _: dict(current)):
+                overlays.bind(source, target, readonly=True)
+                self.assertEqual(overlays.verify(target)['mount_id'], '17')
+                for key, invalid in [('mount_id', '18'), ('inode', info.st_ino + 1), ('options', ['rw'])]:
+                    saved = current[key]; current[key] = invalid
+                    with self.assertRaises(PreparationBlocked): overlays.verify(target)
+                    current[key] = saved
+                overlays.unmount(target)
+            self.assertEqual(calls[1], ['mount', '-o', 'remount,bind,ro', str(target)])
+            self.assertFalse(overlays.mount_records)
+
+    def test_failed_stacked_bind_keeps_parent_mount_record(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            source, target = root / 'sealed', root / 'visible'
+            source.mkdir(); target.mkdir()
+            info = source.stat()
+            observed = {'mount_id': '17', 'target': str(target), 'options': ['ro'],
+                        'device': info.st_dev, 'inode': info.st_ino}
+            overlays = LinuxOverlays('fixture')
+            with patch.object(overlays, 'check_namespace'), patch.object(overlays, 'command'), \
+                    patch.object(overlays, '_visible_mount', return_value=observed):
+                overlays.bind(source, target, readonly=True)
+                with self.assertRaises(PreparationBlocked):
+                    overlays.bind(source, target, readonly=False)
+                self.assertEqual(overlays.mounted, [target])
+                self.assertEqual(len(overlays.mount_records[str(target)]), 1)
+                self.assertEqual(overlays.verify(target)['mount_id'], '17')
+                overlays.unmount(target)
 
 
 if __name__ == '__main__':

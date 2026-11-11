@@ -217,6 +217,38 @@ def select_validation_vector(target_pins, protected_pins, mappings=()):
             'evidence_revalidation_required': sorted(differences)}
 
 
+def _source_view_proof(environment):
+    """A declaration never grants audit credit without its active mount proof."""
+    if 'source_view' not in environment:
+        return None
+    descriptor = environment['source_view']
+    fields = {'version', 'base_id', 'base_receipt_sha256', 'base_vector_sha256',
+              'project_pins_sha256', 'writable_repositories'}
+    vector = environment['project_pins']
+    if (not isinstance(descriptor, dict) or set(descriptor) != fields
+            or type(descriptor.get('version')) is not int or descriptor['version'] != 1
+            or any(not isinstance(descriptor.get(key), str)
+                   or not re.fullmatch(r'[0-9a-f]{64}', descriptor[key])
+                   for key in fields - {'version', 'writable_repositories'})
+            or descriptor['project_pins_sha256'] != canonical_hash(vector)):
+        raise RecoveryBlocked('immutable source view declaration is invalid')
+    writable = descriptor['writable_repositories']
+    if (not isinstance(writable, list) or any(not isinstance(key, str) for key in writable)
+            or writable != sorted(set(writable)) or not set(writable) <= set(vector)):
+        raise RecoveryBlocked('immutable source view writable scope is invalid')
+    from .preparation import verify_active_source_view
+    proof = verify_active_source_view(environment['source_root'], vector, descriptor)
+    if (not isinstance(proof, dict) or proof.get('base_id') != descriptor['base_id']
+            or proof.get('base_receipt_sha256') != descriptor['base_receipt_sha256']
+            or proof.get('writable_repositories') != writable
+            or not isinstance(proof.get('repositories'), dict)
+            or set(proof['repositories']) != set(vector) - set(writable)
+            or not isinstance(proof.get('runtime_mount_proof'), dict)
+            or not proof['runtime_mount_proof']):
+        raise RecoveryBlocked('active immutable source view proof is incomplete')
+    return proof
+
+
 def environment_identity(prepared_environment, config, protected_pins):
     config = validate_build_config(config)
     if not config['enabled']:
@@ -255,6 +287,11 @@ def environment_identity(prepared_environment, config, protected_pins):
                'files': files, 'controller_sources': controller_sources, 'host': host, 'environment': config['environment'],
                'source_root': str(source), 'output_root': config['output_root'], 'tmp_root': config['tmp_root'],
                'scope': 'declared_controlled_build_profile', 'runtime_security_proven': False}
+    if 'source_view' in prepared_environment:
+        # Source reuse is independent of runner/controller/output identities.
+        # Keep activation-specific mount IDs out of the stable cache key.
+        _source_view_proof(prepared_environment)
+        payload['source_view'] = deepcopy(prepared_environment['source_view'])
     return {**payload, 'environment_id': canonical_hash(payload)}
 
 
@@ -262,6 +299,7 @@ def verify_environment_identity(identity, config):
     payload = {k: v for k, v in identity.items() if k != 'environment_id'}
     if identity.get('environment_id') != canonical_hash(payload):
         raise BuildEnvironmentBlocked('build environment identity was altered')
+    _source_view_proof(identity)
     verify_manifest_files(identity)
     for key in ('product', 'variant', 'arch', 'build_system', 'toolchain', 'environment', 'output_root', 'tmp_root'):
         if identity.get(key) != config.get(key):
@@ -375,17 +413,57 @@ def _source_snapshot(identity, *, receipt_path=None):
     from .discovery import local_git
     root = Path(identity['source_root']).resolve(); result = {}
     declared = {Path(item['resolved_path']) for item in identity['files'].values()}
-    complete, error = False, None
+    complete, error, proof = False, None, None
+    inherited, inspected, git_bindings = [], [], {}
     try:
+        proof = _source_view_proof(identity)
         manifest_files = verify_manifest_files(identity)
         for key, pin in identity['project_pins'].items():
             repo = (root / key).resolve()
             if not repo.is_relative_to(root):
                 raise RecoveryBlocked('build repository escapes the isolated source view')
+            if proof is not None and key in proof['repositories']:
+                current = result[key] = deepcopy(proof['repositories'][key])
+                if (not isinstance(current, dict) or current.get('head') != pin
+                        or not isinstance(current.get('tree'), str)
+                        or not re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', current['tree'])
+                        or current.get('status') != ''
+                        or current.get('index_flags_verified') is not True
+                        or type(current.get('index_check_returncode')) is not int
+                        or current['index_check_returncode'] != 0
+                        or type(current.get('worktree_check_returncode')) is not int
+                        or current['worktree_check_returncode'] != 0
+                        or current.get('undeclared_ignored_files') != []
+                        or not isinstance(current.get('ignored_files'), list)
+                        or not isinstance(current.get('declared_ignored_inputs'), dict)
+                        or set(current['ignored_files']) != set(current['declared_ignored_inputs'])):
+                    raise RecoveryBlocked('sealed source audit is not a complete clean proof: ' + key)
+                for name, evidence in current['declared_ignored_inputs'].items():
+                    path = (repo / validate_relative_path(name)).resolve()
+                    if path not in declared or evidence != file_identity(path):
+                        raise RecoveryBlocked('sealed ignored input is not currently declared: ' + key + '/' + name)
+                inherited.append(key)
+                continue
+            inspected.append(key)
+            paths = local_git(repo, 'rev-parse', '--show-toplevel', '--absolute-git-dir',
+                              '--git-common-dir').stdout.splitlines()
+            if len(paths) != 3:
+                raise RecoveryBlocked('build repository Git path binding is unavailable: ' + key)
+            top, git_dir, common = [((Path(path) if Path(path).is_absolute() else repo / path).resolve())
+                                   for path in paths]
+            git_bindings[key] = {'worktree': str(top), 'git_dir': str(git_dir), 'common_dir': str(common)}
+            if (top != repo or any(path == root or not path.is_relative_to(root) for path in (git_dir, common))
+                    or proof is not None and (git_dir != repo / '.git' or common != repo / '.git')):
+                raise RecoveryBlocked('build repository Git paths escape their controlled binding: ' + key)
+            flags = local_git(repo, 'ls-files', '-v', '-z').stdout.split('\0')
+            if any(len(entry) < 3 or entry[1] != ' ' or entry[0].islower() or entry[0] == 'S'
+                   for entry in flags if entry):
+                raise RecoveryBlocked('build source index has assume-unchanged/skip-worktree flags: ' + key)
             # --quiet performs full index/worktree comparisons without returning
             # the complete index on every audit; every command is still charged.
             refs = local_git(repo, 'rev-parse', 'HEAD', 'HEAD^{tree}').stdout.splitlines()
             current = result[key] = {'head': refs[0], 'tree': refs[1],
+                'index_flags_verified': True,
                 'status': local_git(repo, 'status', '--porcelain=v1', '-z', '--untracked-files=all').stdout,
                 'index_check_returncode': local_git(repo, 'diff', '--cached', '--quiet', '--no-ext-diff',
                     '--no-textconv', 'HEAD', check=False).returncode,
@@ -411,7 +489,14 @@ def _source_snapshot(identity, *, receipt_path=None):
         if receipt_path is not None:
             _write(receipt_path, {'environment_id': identity['environment_id'],
                 'status': 'PASS' if complete else 'UNVERIFIED', 'repositories': result, 'error': error,
-                'manifest_files': manifest_files if 'manifest_files' in locals() else None})
+                'manifest_files': manifest_files if 'manifest_files' in locals() else None,
+                'audit_mode': 'immutable_base_with_project_work_layers' if 'source_view' in identity else
+                              'legacy_full_vector',
+                'inherited_repositories': inherited, 'inspected_repositories': inspected,
+                'repository_git_bindings': git_bindings,
+                'source_base': ({'base_id': proof['base_id'],
+                    'base_receipt_sha256': proof['base_receipt_sha256'],
+                    'runtime_mount_proof': proof['runtime_mount_proof']} if proof is not None else None)})
 
 
 def run_baseline(identity, config, modules, run_dir, *, runner=None, use_cache=True):

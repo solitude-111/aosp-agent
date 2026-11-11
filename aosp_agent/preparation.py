@@ -71,11 +71,18 @@ def project_origin(manifest_origin, project):
     return safe_origin(urljoin(base, project.name))
 
 
+def verify_active_source_view(source_root, vector, descriptor):
+    """Resolve audit credit only from a live, verified immutable source view."""
+    from .prepared_source_base import verify_active_source_view as verify
+    return verify(source_root, vector, descriptor)
+
+
 class LinuxOverlays:
     """Mount only inside the launcher's private namespace, preserving each upper."""
     def __init__(self, parent_namespace=None):
         self.parent_namespace = parent_namespace
         self.mounted = []
+        self.mount_records = {}
 
     def check_namespace(self):
         if sys.platform != 'linux' or not self.parent_namespace:
@@ -92,7 +99,7 @@ class LinuxOverlays:
         return result.stdout.decode().strip()
 
     @staticmethod
-    def _verify_mount(root, upper, work):
+    def _verify_mount(root, upper, work, lower=None):
         # findmnt on util-linux 2.37 returns every mount stacked at this path;
         # --first-only selects the covered lower mount, not the visible one.
         # fdinfo binds this check to the mount actually opened at root.
@@ -130,7 +137,7 @@ class LinuxOverlays:
                 if key in options:
                     raise ValueError('overlay mount option is ambiguous')
                 options[key] = unescape(value)
-            if ('rw' not in options or options.get('lowerdir') != str(root)
+            if ('rw' not in options or options.get('lowerdir') != str(lower or root)
                     or options.get('upperdir') != str(upper) or options.get('workdir') != str(work)):
                 raise ValueError('visible overlay does not use the requested backing directories')
         except (OSError, ValueError) as exc:
@@ -141,7 +148,33 @@ class LinuxOverlays:
             if descriptor is not None:
                 os.close(descriptor)
 
-    def mount(self, root, layer):
+    @staticmethod
+    def _visible_mount(root):
+        descriptor = os.open(root, os.O_RDONLY | os.O_CLOEXEC)
+        try:
+            with Path('/proc/self/fdinfo/' + str(descriptor)).open() as stream:
+                data = stream.read(65537)
+            if len(data) > 65536:
+                raise PreparationBlocked('ISOLATION_UNVERIFIED', 'visible mount identity exceeds its bound')
+            ids = re.findall(r'^mnt_id:\s*([1-9][0-9]*)\s*$', data, re.M)
+            if len(ids) != 1:
+                raise PreparationBlocked('ISOLATION_UNVERIFIED', 'visible mount identity is unavailable')
+            with Path('/proc/self/mountinfo').open() as stream:
+                lines = stream.read(4 * 1024**2 + 1)
+            if len(lines) > 4 * 1024**2:
+                raise PreparationBlocked('ISOLATION_UNVERIFIED', 'mount inventory exceeds its bound')
+            rows = [line for line in lines.splitlines() if line.split(' ', 1)[0] == ids[0]]
+            if len(rows) != 1:
+                raise PreparationBlocked('ISOLATION_UNVERIFIED', 'visible mount entry is ambiguous')
+            fields = rows[0].split(' - ', 1)[0].split()
+            decode = lambda value: re.sub(r'\\(040|011|012|134)', lambda m: chr(int(m[1], 8)), value)
+            return {'mount_id': ids[0], 'target': decode(fields[4]),
+                    'options': fields[5].split(','), 'device': os.fstat(descriptor).st_dev,
+                    'inode': os.fstat(descriptor).st_ino}
+        finally:
+            os.close(descriptor)
+
+    def mount(self, root, layer, *, lower=None):
         self.check_namespace()
         root, layer = Path(root).resolve(), Path(layer).resolve()
         if not root.is_dir() or any(char in str(root) + str(layer) for char in ',:\n'):
@@ -150,19 +183,86 @@ class LinuxOverlays:
         if upper.is_symlink() or work.is_symlink():
             raise PreparationBlocked('ISOLATION_RECEIPT_INVALID', 'overlay backing directories cannot be symlinks')
         upper.mkdir(parents=True, exist_ok=True); work.mkdir(exist_ok=True)
+        lower = Path(lower).resolve() if lower is not None else root
+        if not lower.is_dir() or any(char in str(lower) for char in ',:\n'):
+            raise PreparationBlocked('ISOLATION_UNAVAILABLE', 'invalid overlay lower directory')
         self.command(['mount', '-t', 'overlay', 'overlay', '-o',
-            f'lowerdir={root},upperdir={upper},workdir={work},userxattr', str(root)])
+            f'lowerdir={lower},upperdir={upper},workdir={work},userxattr', str(root)])
         self.mounted.append(root)
+        record = {'kind': 'overlay', 'root': root, 'upper': upper, 'work': work,
+                  'lower': lower, 'mount_id': None}
+        self.mount_records.setdefault(str(root), []).append(record)
         try:
-            self._verify_mount(root, upper, work)
+            self._verify_mount(root, upper, work, lower)
+            observed = self._visible_mount(root)
+            record['mount_id'] = observed['mount_id']
         except BaseException:
             self.unmount(root)
             raise
 
+    def bind(self, source, target, *, readonly):
+        self.check_namespace()
+        source, target = Path(source).resolve(), Path(target).resolve()
+        original = source.stat()
+        if source.is_dir() != target.is_dir():
+            raise PreparationBlocked('ISOLATION_UNAVAILABLE', 'bind source and target have different kinds')
+        self.command(['mount', '--bind', str(source), str(target)])
+        self.mounted.append(target)
+        record = {'kind': 'bind', 'source': source, 'root': target, 'readonly': readonly,
+                  'device': original.st_dev, 'inode': original.st_ino, 'mount_id': None}
+        self.mount_records.setdefault(str(target), []).append(record)
+        try:
+            self.command(['mount', '-o', 'remount,bind,' + ('ro' if readonly else 'rw'), str(target)])
+            observed = self._visible_mount(target)
+            if (observed['target'] != str(target)
+                    or observed['device'] != original.st_dev or observed['inode'] != original.st_ino
+                    or ('ro' in observed['options']) != readonly):
+                raise PreparationBlocked('ISOLATION_UNVERIFIED', 'bind mount identity or access mode differs')
+            record['mount_id'] = observed['mount_id']
+        except BaseException:
+            self.unmount(target)
+            raise
+
+    def verify(self, root):
+        root = Path(root).resolve()
+        records = self.mount_records.get(str(root), [])
+        if not records:
+            raise PreparationBlocked('ISOLATION_UNVERIFIED', 'mount is not owned by this controller')
+        record, current = records[-1], self._visible_mount(root)
+        if current['mount_id'] != record['mount_id'] or current['target'] != str(root):
+            raise PreparationBlocked('ISOLATION_UNVERIFIED', 'visible mount was replaced')
+        if record['kind'] == 'overlay':
+            self._verify_mount(root, record['upper'], record['work'], record['lower'])
+        elif (current['device'] != record['device'] or current['inode'] != record['inode']
+                or ('ro' in current['options']) != record['readonly']):
+            raise PreparationBlocked('ISOLATION_UNVERIFIED', 'bind view identity or access changed')
+        return current
+
+    @staticmethod
+    def source_mounts(root):
+        root = str(Path(root).resolve())
+        with Path('/proc/self/mountinfo').open() as stream:
+            data = stream.read(4 * 1024**2 + 1)
+        if len(data) > 4 * 1024**2:
+            raise PreparationBlocked('ISOLATION_UNVERIFIED', 'mount inventory exceeds its bound')
+        paths = set()
+        for line in data.splitlines():
+            value = line.split(' - ', 1)[0].split()[4]
+            value = re.sub(r'\\(040|011|012|134)', lambda m: chr(int(m[1], 8)), value)
+            if value == root or value.startswith(root + '/'):
+                paths.add(value)
+        return paths
+
     def unmount(self, root):
         root = Path(root).resolve()
         self.command(['umount', str(root)])
-        self.mounted.remove(root)
+        index = len(self.mounted) - 1 - self.mounted[::-1].index(root)
+        self.mounted.pop(index)
+        records = self.mount_records.get(str(root), [])
+        if records:
+            records.pop()
+        if not records:
+            self.mount_records.pop(str(root), None)
 
 
 class PreparedCatalog(ProjectCatalog):
@@ -171,6 +271,7 @@ class PreparedCatalog(ProjectCatalog):
         self.prepared = prepared
 
     def pin(self, key):
+        self.prepared.ensure_writable([key])
         self.prepared.materialize(key)
         return super().pin(key)
 
@@ -184,6 +285,13 @@ class PreparedCase:
         self.environment = record['environment']
         self.materialized = set(record.get('materialized', []))
         self.mounted = []
+        self.source_view = None
+
+    def ensure_writable(self, keys):
+        if self.source_view is not None:
+            self.source_view.ensure_writable(keys)
+            self.environment['source_view'] = self.source_view.descriptor
+            self.save()
 
     def save(self):
         self.record['materialized'] = sorted(self.materialized)
@@ -193,8 +301,11 @@ class PreparedCase:
         if key in self.materialized:
             return
         project = self.catalog.projects[key]
+        self.ensure_writable([key])
         self.manager._materialize(project)
         self.materialized.add(key)
+        if self.source_view is not None:
+            self.record['materialized_projects'] = sorted(set(self.record.get('materialized_projects', [])) | {key})
         self.save()
 
     def materialize_all(self):
@@ -202,10 +313,18 @@ class PreparedCase:
             self.manager._check_build_inventory(self)
             for key in sorted(self.catalog.projects, key=lambda value: (value.count('/'), value)):
                 if key not in self.materialized:
-                    self.manager._materialize(self.catalog.projects[key])
-                    self.materialized.add(key)
-                    if len(self.materialized) % 25 == 0: self.save()
-            self.manager._manifest_files(self.record['frozen'].get('manifest_files', []))
+                    if self.source_view is None:
+                        self.manager._materialize(self.catalog.projects[key])
+                        self.materialized.add(key)
+                        if len(self.materialized) % 25 == 0: self.save()
+                    else:
+                        self.materialize(key)
+            if self.source_view is not None:
+                self.source_view.refresh_manifest_files(self.record['frozen'].get('manifest_files', []))
+                self.environment['source_view'] = self.source_view.descriptor
+                self.source_view.verify(self.environment['project_pins'], self.environment['source_view'])
+            else:
+                self.manager._manifest_files(self.record['frozen'].get('manifest_files', []))
             self.environment['materialized_vector_sha256'] = digest(self.environment['project_pins'])
         finally:
             self.save()
@@ -215,6 +334,10 @@ class PreparedCase:
     def validation_view(self, validation_pins):
         if set(validation_pins) != set(self.environment['project_pins']) or any(not SHA.fullmatch(v) for v in validation_pins.values()):
             raise PreparationError('VALIDATION_VECTOR_INVALID', 'validation view requires a complete fixed project vector')
+        if self.source_view is not None:
+            with self._base_validation_view(validation_pins) as environment:
+                yield environment
+            return
         layer = Path(self.record['layer_root']) / ('validation-' + digest(validation_pins)[:20])
         mounted = []
         try:
@@ -238,6 +361,33 @@ class PreparedCase:
             except BaseException as exc:
                 raise PreparationBlocked('ISOLATION_RESTORE_UNVERIFIED', 'validation overlay did not restore') from exc
 
+    @contextmanager
+    def _base_validation_view(self, validation_pins):
+        from .prepared_source_base import SourceBaseView
+        import uuid
+        self.materialize_all()
+        layer = Path(self.record['layer_root']) / ('validation-' + uuid.uuid4().hex)
+        view = SourceBaseView(self, self.source_view.base, pins=validation_pins, layer=layer, parent=self.source_view)
+        differences = {key: {'original': self.environment['project_pins'][key], 'validation': sha}
+                       for key, sha in validation_pins.items() if sha != self.environment['project_pins'][key]}
+        try:
+            view.activate()
+            view.ensure_writable(sorted(differences))
+            for key in sorted(differences):
+                self.manager._materialize(replace(self.catalog.projects[key], revision=validation_pins[key]))
+            view.refresh_manifest_files(self.record['frozen'].get('manifest_files', []))
+            environment = {**self.environment, 'project_pins': dict(validation_pins),
+                'original_project_pins': dict(self.environment['project_pins']),
+                'validation_differences': differences, 'source_view': view.descriptor,
+                'source_layer': str(view.layer), 'derived_validation_environment': True,
+                'output_layer': str(view.layer / 'output_root'),
+                'target_vector_sha256': digest(validation_pins), 'materialized_vector_sha256': digest(validation_pins)}
+            view.verify(validation_pins, view.descriptor)
+            write_receipt(layer / 'environment.json', environment)
+            yield environment
+        finally:
+            view.close()
+
 
 class PreparationManager:
     def __init__(self, config, *, parent_namespace=None, overlays=None):
@@ -248,9 +398,39 @@ class PreparationManager:
         self.ref_queries, self.ref_advertisements = 0, {}
         self.local_ref_queries, self.remote_ref_queries = 0, 0
         self.active = None
+        self._source_base = None
         self.accounting_path = None
         self._git_bin = shutil.which('git')
         if not self._git_bin: raise PreparationBlocked('GIT_UNAVAILABLE', 'Git executable is unavailable')
+
+    def _get_source_base(self):
+        if 'source_base' not in self.config:
+            return None
+        if self._source_base is None:
+            from .source_base import open_source_base
+            base = open_source_base(self.config['source_base'])
+            try:
+                controlled = [Path(self.config[key]) for key in ('source_root', 'cache_root', 'isolation_root', 'run_root')]
+                controlled += [Path(self.config['build'][key]) for key in ('output_root', 'tmp_root', 'baseline_cache')
+                               if self.config.get('build', {}).get(key)]
+                mount = Path(base.mount_root).resolve()
+                if any(mount.is_relative_to(path) or path.is_relative_to(mount) for path in controlled):
+                    raise PreparationBlocked('SOURCE_BASE_PATH_OVERLAP', 'immutable base must not overlap source, build or control directories')
+                hidden = [Path(self.config['source_root'])]
+                hidden += [Path(self.config['build'][key]) for key in ('output_root', 'tmp_root') if self.config['build'].get(key)]
+                if any(Path(value).is_relative_to(path) for value in (base.spec['image'], self.config['source_base']['receipt']) for path in hidden):
+                    raise PreparationBlocked('SOURCE_BASE_PATH_OVERLAP', 'source view would hide its immutable image or registration')
+                self._source_base = base
+            except BaseException:
+                base.close()
+                raise
+        self._source_base.revalidate()
+        return self._source_base
+
+    def _close_source_base(self):
+        if self._source_base is not None:
+            self._source_base.close()
+            self._source_base = None
 
     def serialized_config(self):
         return self.config
@@ -734,6 +914,12 @@ class PreparationManager:
 
     def _check_build_inventory(self, prepared):
         from .build_environment import BuildEnvironmentBlocked
+        if prepared.source_view is not None:
+            base = prepared.source_view.base
+            if set(base.projects) != set(prepared.catalog.projects):
+                raise BuildEnvironmentBlocked('source-base project layout differs; register a compatible base explicitly')
+            prepared.environment.update(extra_projects=[], profile_gaps=[])
+            return
         root = Path(self.config['source_root'])
         listed = root / '.repo/project.list'
         if listed.is_file():
@@ -762,6 +948,7 @@ class PreparationManager:
         path = Path(frozen_receipt).resolve() if frozen_receipt else Path(run_dir) / 'preparation-frozen.json'
         accounting = Path(accounting_root).resolve() if accounting_root is not None else path.parent
         self._load_accounting(accounting / 'preparation-budget.json', existing=require_existing or path.exists())
+        base = self._get_source_base()
         input_digest = digest(lines)
         if path.exists():
             saved = json.loads(path.read_text())
@@ -792,7 +979,19 @@ class PreparationManager:
                         pin = project.revision
                     else:
                         url = project_origin(origin, project)
-                        pin, reference = self._advertise(url, project.revision, ref_memo, original=source / project.key)
+                        sealed = base.projects.get(project.key, {}) if base is not None else {}
+                        reference_pin = sealed.get('references', {}).get(project.revision)
+                        if (reference_pin and sealed.get('origin')
+                                and self._origin_identity(sealed['origin']) == self._origin_identity(url)):
+                            pin = reference_pin
+                            proof = {'method': 'immutable_source_base_reference', 'base_id': base.base_id,
+                                     'base_receipt_sha256': self.config['source_base']['receipt_sha256'],
+                                     'origin': url, 'requested_revision': project.revision, 'resolved_oid': pin,
+                                     'fresh_remote_advertisement': False}
+                            reference = digest(proof)
+                            self.ref_advertisements[reference] = proof
+                        else:
+                            pin, reference = self._advertise(url, project.revision, ref_memo, original=source / project.key)
                         ref_receipts[project.key] = reference
                     projects.append(asdict(replace(project, revision=pin)))
                 provenance = {**catalog.provenance, 'requested_revision': task.target_revision,
@@ -822,6 +1021,32 @@ class PreparationManager:
 
     def _activate(self, prepared):
         if self.active is not None: raise PreparationBlocked('ISOLATION_BUSY', 'another case overlay is still active')
+        if 'source_base' in self.config:
+            from .prepared_source_base import SourceBaseView
+            try:
+                base = self._get_source_base()
+                prepared.source_view = SourceBaseView(prepared, base)
+                prepared.source_view.activate()
+                self.active = prepared
+                # Only immutable, identical snapshots inherit the initial audit.
+                # Writable layers and differing revisions retain their own receipt.
+                reused = {key for key, pin in prepared.environment['project_pins'].items()
+                          if base.project_pins.get(key) == pin}
+                prepared.materialized.update(reused)
+                prepared.record['reused_projects'] = sorted(reused)
+                prepared.environment['source_view'] = prepared.source_view.descriptor
+                prepared.environment['source_layer'] = str(prepared.source_view.layer)
+                prepared.environment['output_layer'] = str(prepared.source_view.layer / 'output_root')
+                prepared.record.update(state='ACTIVE', process_id=os.getpid(),
+                    mount_namespace=os.readlink('/proc/self/ns/mnt') if sys.platform == 'linux' else 'test')
+                prepared.save()
+                return
+            except BaseException:
+                if prepared.source_view is not None:
+                    prepared.source_view.close()
+                self.active = None
+                self._close_source_base()
+                raise
         try:
             for root, name in self._overlay_roots():
                 if name != 'source': Path(root).mkdir(parents=True, exist_ok=True)
@@ -840,6 +1065,8 @@ class PreparationManager:
             raise
 
     def prepare(self, task, row_dir):
+        if 'source_base' in self.config:
+            self._get_source_base()  # Fail before donor work; never fall back to a full source scan.
         if task.target_revision not in self.frozen:
             error = getattr(self, 'freeze_errors', {}).get(task.target_revision, {})
             raise PreparationError(error.get('kind', 'TARGET_REVISION_UNAVAILABLE'), error.get('message', 'target manifest could not be frozen'))
@@ -922,7 +1149,10 @@ class PreparationManager:
 
     def release(self, prepared):
         try:
-            for root in reversed(prepared.mounted): self.overlays.unmount(root)
+            if prepared.source_view is not None:
+                prepared.source_view.close()
+            else:
+                for root in reversed(prepared.mounted): self.overlays.unmount(root)
             prepared.mounted.clear()
         except BaseException as exc:
             prepared.record.update(state='RESTORE_BLOCKED', restoration='UNVERIFIED')
@@ -931,6 +1161,7 @@ class PreparationManager:
         prepared.record.update(state='RELEASED', restoration='PASS')
         prepared.save()
         self.active = None
+        self._close_source_base()
 
     @contextmanager
     def activate_receipt(self, path):
