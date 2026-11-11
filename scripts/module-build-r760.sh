@@ -5,7 +5,9 @@ set -o pipefail
 # The server's controlled build profile supplies these paths. They must refer
 # to the private prepared view; no host-specific source/output defaults exist.
 AOSP="${AOSP_AGENT_SOURCE_ROOT:?configured isolated source root required}"
-OUT="${AOSP_AGENT_OUT_DIR:?configured isolated output root required}"
+# envsetup's lunch/setpaths exports OUT=ANDROID_PRODUCT_OUT. Keep the
+# controller boundary separate from that mutable Android convenience variable.
+readonly AOSP_AGENT_CONTROLLED_OUT_ROOT="${AOSP_AGENT_OUT_DIR:?configured isolated output root required}"
 BUILD_TMP="${AOSP_AGENT_TMPDIR:?configured build temporary directory required}"
 LUNCH_TARGET="${AOSP_AGENT_LUNCH:?configured product and variant required}"
 BUILD_LOCK="${AOSP_AGENT_BUILD_LOCK:?configured build lock required}"
@@ -27,9 +29,9 @@ fi
 WORKTREE="$AOSP_AGENT_WORKTREE"
 ARTIFACT_DIR="${AOSP_AGENT_ARTIFACT_DIR:-$WORKTREE/out-artifacts}"
 mkdir -p "$ARTIFACT_DIR" || exit 120
-export OUT_DIR="$OUT"
+export OUT_DIR="$AOSP_AGENT_CONTROLLED_OUT_ROOT"
 export TMPDIR="$BUILD_TMP"
-mkdir -p "$OUT" "$TMPDIR" || exit 120
+mkdir -p "$AOSP_AGENT_CONTROLLED_OUT_ROOT" "$TMPDIR" || exit 120
 cd "$AOSP" || exit 120
 source build/envsetup.sh || exit 117
 lunch "$LUNCH_TARGET" || exit 117
@@ -48,7 +50,7 @@ echo "MODULE_BUILD_EXIT=$rc"
 PRODUCT_OUT_ROOT="$(get_build_var PRODUCT_OUT)" || exit 117
 [[ "$PRODUCT_OUT_ROOT" = /* ]] || PRODUCT_OUT_ROOT="$AOSP/$PRODUCT_OUT_ROOT"
 PRODUCT_OUT_ROOT="$(cd -- "$PRODUCT_OUT_ROOT" && pwd -P)" || exit 125
-OUT_CANONICAL="$(cd -- "$OUT" && pwd -P)" || exit 125
+OUT_CANONICAL="$(cd -- "$AOSP_AGENT_CONTROLLED_OUT_ROOT" && pwd -P)" || exit 125
 [[ "$PRODUCT_OUT_ROOT" = "$OUT_CANONICAL"/* ]] || { echo "product output escapes controlled output view" >&2; exit 125; }
 for t in "$@"; do
   src=""
