@@ -18,6 +18,7 @@ import stat
 import tempfile
 import threading
 import time
+import uuid
 from urllib.parse import urljoin, urlsplit
 import xml.etree.ElementTree as ET
 
@@ -330,6 +331,37 @@ class PreparedCase:
             self.save()
         return self.environment
 
+    def _require_materialized_legacy_parent(self):
+        """Permit delta preparation only on this still-owned complete view."""
+        def require(condition, message):
+            if not condition:
+                raise PreparationBlocked('SOURCE_VIEW_UNVERIFIED', message)
+        require(self.manager.active is self and self.record.get('state') == 'ACTIVE',
+                'validation requires the active prepared parent view')
+        pins = self.environment['project_pins']
+        catalog_pins = {key: project.revision for key, project in self.catalog.projects.items()}
+        require(pins == catalog_pins and self.materialized == set(pins)
+                and self.environment.get('materialized_vector_sha256') == digest(pins),
+                'validation requires a completely materialized fixed parent vector')
+        roots = [(Path(root).resolve(), name) for root, name in self.manager._overlay_roots()]
+        require([Path(root).resolve() for root in self.mounted] == [root for root, _ in roots],
+                'prepared parent mount inventory is incomplete')
+        self.manager.overlays.check_namespace()
+        for root, name in roots:
+            records = getattr(self.manager.overlays, 'mount_records', {}).get(str(root), [])
+            require(bool(records), 'prepared parent mount is not owned by this controller')
+            owned = records[-1]
+            layer = Path(self.record['layer_root']) / name
+            require(owned.get('kind') == 'overlay'
+                    and Path(owned.get('upper', '')).resolve() == layer / 'upper'
+                    and Path(owned.get('work', '')).resolve() == layer / 'work'
+                    and Path(owned.get('lower', '')).resolve() == root,
+                    'visible mount is not the prepared parent layer')
+            observed = self.manager.overlays.verify(root)
+            require(observed.get('mount_id') == owned.get('mount_id')
+                    and observed.get('target') == str(root),
+                    'prepared parent mount identity changed')
+
     @contextmanager
     def validation_view(self, validation_pins):
         if set(validation_pins) != set(self.environment['project_pins']) or any(not SHA.fullmatch(v) for v in validation_pins.values()):
@@ -338,19 +370,35 @@ class PreparedCase:
             with self._base_validation_view(validation_pins) as environment:
                 yield environment
             return
-        layer = Path(self.record['layer_root']) / ('validation-' + digest(validation_pins)[:20])
+        try:
+            self._require_materialized_legacy_parent()
+        except (RecoveryBlocked, OSError) as exc:
+            raise PreparationBlocked('SOURCE_VIEW_UNVERIFIED', str(exc)) from exc
+        differences = {key: {'original': self.environment['project_pins'][key], 'validation': pin}
+                       for key, pin in validation_pins.items() if pin != self.environment['project_pins'][key]}
+        # A prior derived upper may still contain overrides even for unchanged
+        # projects. Only a fresh child layer may inherit the current parent.
+        layer = Path(self.record['layer_root']) / ('validation-' + uuid.uuid4().hex)
         mounted = []
         try:
             self.manager._check_build_inventory(self)
             for root, name in self.manager._overlay_roots():
-                self.manager.overlays.mount(root, layer / name); mounted.append(root)
-            for key in sorted(validation_pins, key=lambda value: (value.count('/'), value)):
+                if name == 'source':
+                    self.manager.overlays.mount(root, layer / name)
+                else:
+                    empty = layer / 'empty' / name
+                    empty.mkdir(parents=True)
+                    self.manager.overlays.mount(root, layer / name, lower=empty)
+                mounted.append(root)
+            for key in sorted(differences, key=lambda value: (value.count('/'), value)):
                 self.manager._materialize(replace(self.catalog.projects[key], revision=validation_pins[key]))
             self.manager._manifest_files(self.record['frozen'].get('manifest_files', []))
             environment = {**self.environment, 'project_pins': dict(validation_pins),
                 'original_project_pins': dict(self.environment['project_pins']),
-                'validation_differences': {key: {'original': self.environment['project_pins'][key], 'validation': sha}
-                    for key, sha in validation_pins.items() if sha != self.environment['project_pins'][key]},
+                'validation_differences': differences,
+                'preparation_scope': 'active_parent_delta', 'parent_preparation_receipt': str(self.receipt_path),
+                'reused_projects': sorted(set(validation_pins) - set(differences)),
+                'materialized_projects': sorted(differences), 'output_layer': str(layer / 'output_root'),
                 'source_layer': str(layer / 'source'), 'derived_validation_environment': True,
                 'target_vector_sha256': digest(validation_pins), 'materialized_vector_sha256': digest(validation_pins)}
             write_receipt(layer / 'environment.json', environment)
@@ -358,6 +406,7 @@ class PreparedCase:
         finally:
             try:
                 for root in reversed(mounted): self.manager.overlays.unmount(root)
+                self._require_materialized_legacy_parent()
             except BaseException as exc:
                 raise PreparationBlocked('ISOLATION_RESTORE_UNVERIFIED', 'validation overlay did not restore') from exc
 

@@ -2,6 +2,8 @@
 
 AOSP Backport Agent 是一个数据驱动的 Android 安全补丁回移系统。它以 donor 修复提交和固定版本的 Android 目标仓为输入，依次完成影响判断、补丁迁移、配置的检查、模块编译验证和补丁后业务影响评估，并输出可审计的补丁与完整运行证据。自动提取的 donor 符号仅用于调查提示，不作为修复正确性的验收条件。
 
+当前服务器的四字段 JSONL 自动入口是 `./run-patches INPUT --config CONFIG`，内部进入 `aosp_agent.unattended`。现有源码与独立修改/输出层继续使用；跨任务准备结果复用仍未生效，fs-verity/SquashFS/loop 不作为主流程前置条件。当前准备边界及配置要求见 [无人值守运行](aosp_agent/docs/unattended.md)。下文保留其他入口与历史验收说明。
+
 当前模型执行层使用官方 OpenAI Codex Python SDK。GLM `glm-5.3`（ZAI provider）是历史使用配置；新的受控工具流程仍需在目标环境与实际 provider 上验收，本地 SDK 和脚本化服务测试不能代替这项验收。模型和认证由运行账户的 Codex 配置提供，仓库不包含任何 API key。
 
 ## 功能概览
