@@ -91,6 +91,56 @@ class LinuxOverlays:
             raise PreparationBlocked('ISOLATION_UNAVAILABLE', 'mount operation failed: ' + result.stderr.decode(errors='replace')[-500:])
         return result.stdout.decode().strip()
 
+    @staticmethod
+    def _verify_mount(root, upper, work):
+        # findmnt on util-linux 2.37 returns every mount stacked at this path;
+        # --first-only selects the covered lower mount, not the visible one.
+        # fdinfo binds this check to the mount actually opened at root.
+        def read_proc(path, limit):
+            with Path(path).open() as stream:
+                value = stream.read(limit + 1)
+            if len(value) > limit:
+                raise ValueError('mount identity exceeds its read bound')
+            return value
+
+        def unescape(value):
+            return re.sub(r'\\(040|011|012|134)', lambda match: chr(int(match[1], 8)), value)
+
+        descriptor = None
+        try:
+            descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            info = read_proc('/proc/self/fdinfo/' + str(descriptor), 65536)
+            identities = [line for line in info.splitlines() if line.startswith('mnt_id:')]
+            match = re.fullmatch(r'mnt_id:[ \t]*([1-9][0-9]*)[ \t]*', identities[0]) if len(identities) == 1 else None
+            if match is None:
+                raise ValueError('visible directory mount ID is absent or ambiguous')
+            entries = [line for line in read_proc('/proc/self/mountinfo', 4 * 1024**2).splitlines()
+                       if line.split(' ', 1)[0] == match[1]]
+            if len(entries) != 1:
+                raise ValueError('visible mount entry is absent or ambiguous')
+            before, after = entries[0].split(' - ')
+            fields, filesystem = before.split(), after.split()
+            if (len(fields) < 6 or len(filesystem) != 3 or filesystem[0] != 'overlay'
+                    or unescape(fields[3]) != '/' or unescape(fields[4]) != str(root)
+                    or 'rw' not in fields[5].split(',')):
+                raise ValueError('visible directory is not the expected writable overlay root')
+            options = {}
+            for option in filesystem[2].split(','):
+                key, _, value = option.partition('=')
+                if key in options:
+                    raise ValueError('overlay mount option is ambiguous')
+                options[key] = unescape(value)
+            if ('rw' not in options or options.get('lowerdir') != str(root)
+                    or options.get('upperdir') != str(upper) or options.get('workdir') != str(work)):
+                raise ValueError('visible overlay does not use the requested backing directories')
+        except (OSError, ValueError) as exc:
+            raise PreparationBlocked('ISOLATION_UNVERIFIED', 'source overlay mount could not be verified: ' + str(exc)) from exc
+        finally:
+            # Close before mount() attempts rollback; an open root directory
+            # would otherwise make that umount fail with EBUSY.
+            if descriptor is not None:
+                os.close(descriptor)
+
     def mount(self, root, layer):
         self.check_namespace()
         root, layer = Path(root).resolve(), Path(layer).resolve()
@@ -104,8 +154,7 @@ class LinuxOverlays:
             f'lowerdir={root},upperdir={upper},workdir={work},userxattr', str(root)])
         self.mounted.append(root)
         try:
-            if self.command(['findmnt', '-n', '-T', str(root), '-o', 'FSTYPE']) != 'overlay':
-                raise PreparationBlocked('ISOLATION_UNVERIFIED', 'source overlay mount could not be verified')
+            self._verify_mount(root, upper, work)
         except BaseException:
             self.unmount(root)
             raise
