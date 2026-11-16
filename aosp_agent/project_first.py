@@ -261,7 +261,10 @@ class ProjectFirstAgent:
         if 'frontend_workflow' in result:
             self.record['frontend_workflow'] = result['frontend_workflow']
         if 'location_handoff' in result:
-            self.record['location_handoff'] = {**result['location_handoff'], 'round_record': str(round_path)}
+            location = {**result['location_handoff'], 'round_record': str(round_path)}
+            self.record['location_handoff'] = location
+            if location.get('status') == 'READY' and location.get('scope') != 'READ_ONLY_WITH_GAPS':
+                self.record['last_grounded_location'] = location
         if result.get('status') == 'MIGRATION_INCOMPLETE' and result.get('patches') and result.get('migration_scope_error'):
             self.record.setdefault('draft_candidates', []).append({
                 'round_record': str(round_path), 'patches': result['patches'],
@@ -417,7 +420,7 @@ class ProjectFirstAgent:
                     raise BudgetExceeded('case investigation round limit exhausted across resumptions')
                 feedback, assessment_seed, obligation_remaps = None, None, 0
                 location_feedback = location_seed = backend_impact_seed = None
-                from .location_handoff import backend_scope_feedback
+                from .location_handoff import backend_scope_feedback, focused_impact_challenge
                 revalidate_seed = seed_pending_proof = False
                 if self.resumed_assessment is not None and not inspect_only:
                     keys = list(self.resumed_assessment['targets'])
@@ -554,6 +557,11 @@ class ProjectFirstAgent:
                         if scope_feedback is not None:
                             location_feedback = None
                             backend_impact_seed['scope_feedback'] = scope_feedback
+                    if backend_impact_seed is None and not requests:
+                        challenge = focused_impact_challenge(result, location_seed, pins)
+                        if challenge is not None:
+                            location_feedback = None
+                            backend_impact_seed = {'targets': pins, 'challenge': challenge}
                     assessment_seed = None
                     revalidate_seed = seed_pending_proof = False
                     if (not requests and (result.get('coverage_blockers')

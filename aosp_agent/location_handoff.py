@@ -68,6 +68,32 @@ def backend_scope_feedback(record, location, handoff, targets):
     return {'diagnostic': retry['diagnostic'], 'previous_scope_report': retry['report']}
 
 
+def focused_impact_challenge(record, location, targets):
+    """Reuse a location only when the challenged units still have grounded anchors."""
+    challenge = record.get('impact_challenge')
+    handoff = record.get('location_handoff', {})
+    if (not challenge or record.get('completion_blocked_by') != 'BACKEND_EXCLUSION_CHALLENGED'
+            or record.get('replan_required') != 'IMPACT_RECHECK_REQUIRED'
+            or not location or handoff.get('status') != 'READY'
+            or handoff.get('scope') == 'READ_ONLY_WITH_GAPS' or handoff.get('targets') != targets
+            or record.get('location_gaps') or record.get('scope_requests')):
+        return None
+    mapped = {unit['id'] for unit in location['units'] if unit['targets']}
+    return challenge if all(item['id'] in mapped for item in challenge) else None
+
+
+def _compact_impact_challenge(details):
+    result = []
+    for item in details:
+        indices = list(dict.fromkeys(item['blocking_evidence'] + item['state_flow_evidence']))
+        citations = [{k: entry[k] for k in ('origin', 'path', 'line_start', 'line_end')}
+                     for entry in (item['evidence'][i - 1] for i in indices[:8])]
+        result.append({'id': item['id'], 'operation': item['security_operation'][:600],
+                       'dispute': item['blocking_analysis'][:1800], 'locations': citations,
+                       'unresolved_assumptions': [a[:400] for a in item['unresolved_assumptions'][:6]]})
+    return result
+
+
 def ground_locations(controller, raw, *, unassociated=None):
     _shape(raw, LOCATION_SCHEMA)
     source = {unit['id']: unit for unit in controller.units}
@@ -368,8 +394,12 @@ class BackendHandoff:
         self.budget = ACTIVE_BUDGET.get()
         seed = controller.backend_impact_seed
         targets = {repo.key: repo.head for repo in controller.repos}
-        self.accepted_impact = seed['assessment'] if seed and seed['targets'] == targets else None
+        seed = seed if seed and seed['targets'] == targets else {}
+        self.accepted_impact = seed.get('assessment')
+        self.impact_challenge = seed.get('challenge')
         self.scope_feedback = seed.get('scope_feedback') if self.accepted_impact is not None else None
+        if self.impact_challenge:
+            controller.record['impact_recheck'] = {'units': [item['id'] for item in self.impact_challenge]}
 
     def target_content(self, path):
         # Preserve local paths used by the original backend. Fully qualified
@@ -393,6 +423,12 @@ class BackendHandoff:
                           'flag_cleanup_support unless the diagnostic points to those fields. '
                           'When correcting repair_obligations, reuse the grounded locations.\n'
                           + json.dumps(self.scope_feedback, ensure_ascii=False) if self.scope_feedback else '')
+        challenge = ('\nAn independent review challenged the previous exclusion. Recheck the disputed '
+                     'behavior on the pinned target using the locations below. Trace the specific state write, '
+                     'lifetime, consumer and effect in dispute. Do not infer absence from a changed API. '
+                     'Use UNKNOWN and name any material premise still unresolved. Report a location gap only '
+                     'if a required edit has no grounded location. The review is evidence to investigate, not a verdict.\n'
+                     + json.dumps(self.impact_challenge, ensure_ascii=False) if self.impact_challenge else '')
         return ('''
 The locations below are pinned candidate anchors, not a verdict. Qualify cross-project target evidence with its
 repository key. To read an admitted dependency, use target:<repository-key> and its pinned ref.
@@ -416,12 +452,13 @@ the donor delta and target flag references. Return an empty array for either fie
 when it does not apply.
 Select a member_insertion only if a new target member is required. Its insertion_lines
 name the permitted boundary; the wider quoted range is context.
-''' + '\n' + assessment + scope_feedback + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
+''' + '\n' + assessment + scope_feedback + challenge + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
                 + '\nUnverified location gaps: ' + json.dumps(self.controller.record.get('location_gaps', []), ensure_ascii=False)
                 + '\nGuarded obligations: ' + json.dumps(self.controller.guarded_obligations, ensure_ascii=False))
 
     def accept(self, child, impact, response, *, impact_only):
-        from .exclusion_review import ExclusionReviewError, ExclusionReviewUnresolved, review_exclusions
+        from .exclusion_review import (ExclusionCounterpartChallenge, ExclusionReviewError,
+                                       ExclusionReviewUnresolved, review_exclusions)
         from .mapped_impact import RepairContractError, ground_repair_contract
 
         controller = self.controller
@@ -446,6 +483,19 @@ name the permitted boundary; the wider quoted range is context.
                 review_exclusions(controller, proposals, controller.record['repositories'], 1)
             except ExclusionReviewUnresolved as exc:
                 return self.unresolved(child, 'BACKEND_EXCLUSION_UNRESOLVED', str(exc))
+            except ExclusionCounterpartChallenge as exc:
+                if len(exc.details) <= 8:
+                    controller.record['impact_challenge'] = _compact_impact_challenge(exc.details)
+                    if not self.impact_challenge:
+                        controller.record['replan_required'] = 'IMPACT_RECHECK_REQUIRED'
+                        # A genuine missing anchor still needs location work.
+                        if focused_impact_challenge(
+                                {**controller.record, 'completion_blocked_by': 'BACKEND_EXCLUSION_CHALLENGED'},
+                                self.location, {repo.key: repo.head for repo in controller.repos}) is None:
+                            controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
+                else:
+                    controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
+                return self.unresolved(child, 'BACKEND_EXCLUSION_CHALLENGED', str(exc))
             except ExclusionReviewError as exc:
                 controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
                 return self.unresolved(child, 'BACKEND_EXCLUSION_CHALLENGED', str(exc))

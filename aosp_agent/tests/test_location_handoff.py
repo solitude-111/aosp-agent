@@ -240,6 +240,37 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertTrue(all(call['read_only'] for call in calls))
             self.assertIn(('sdk-exclusion-review-1.jsonl', ()), scopes)
 
+    def test_exclusion_challenge_rechecks_impact_without_repeating_location(self):
+        for second_status in ('UNKNOWN', 'NOT_AFFECTED'):
+            with self.subTest(second_status=second_status), GitFixture() as fx:
+                review = {'units': [{
+                    'id': 'f001-h001', 'verdict': 'COUNTERPART_POSSIBLE', 'security_operation': 'Limit a caller count.',
+                    'representation': 'equivalent', 'old_entrypoint_analysis': 'The legacy function receives the value.',
+                    'old_state_flow_analysis': 'The input reaches the return unchanged.',
+                    'blocking_analysis': 'The legacy operation may be equivalent despite the missing helper.',
+                    'entrypoint_evidence': [1], 'state_flow_evidence': [1], 'blocking_evidence': [1],
+                    'donor_evidence': [], 'evidence': [{
+                        'origin': 'target', 'path': 'repo/counter.py', 'line_start': 2, 'line_end': 2,
+                        'excerpt': BASELINE.splitlines()[1].strip(), 'claim': 'The target returns its input.',
+                    }], 'unresolved_assumptions': ['The caller is still unverified.'],
+                }], 'limitations': []}
+                outcome, calls, scopes = self.execute(fx, impact_reply(fx, 'NOT_AFFECTED'),
+                    max_rounds=3, extras=[(impact_reply(fx, second_status), None)], turns={
+                        'sdk-exclusion-review-1.jsonl': [(review, None)] * 2})
+                self.assertEqual(outcome['impact_decision'], 'UNKNOWN', outcome)
+                self.assertEqual(outcome['completion_blocked_by'],
+                                 'BACKEND_IMPACT_UNRESOLVED' if second_status == 'UNKNOWN'
+                                 else 'BACKEND_EXCLUSION_CHALLENGED')
+                self.assertEqual(sum(name == 'sdk-location-handoff.jsonl' for name, _ in scopes), 1)
+                self.assertEqual(len(outcome['rounds']), 2)
+                self.assertEqual(len(calls), 5 if second_status == 'UNKNOWN' else 6)
+                self.assertIn('Recheck the disputed', calls[4]['prompt'])
+                self.assertIn(review['units'][0]['blocking_analysis'], calls[4]['prompt'])
+                self.assertTrue(all(call['read_only'] for call in calls))
+                final_round = json.loads(Path(outcome['final_round_record']).read_text())
+                self.assertTrue(final_round['location_reused'])
+                self.assertEqual(final_round['impact_recheck']['units'], ['f001-h001'])
+
     def test_scope_replan_reuses_the_backend_impact_at_unchanged_pins(self):
         with GitFixture() as fx:
             incomplete = impact_reply(fx, 'AFFECTED')

@@ -42,6 +42,15 @@ class ExclusionReviewError(AssessmentError):
     """An exclusion needs remapping; exhaustion must remain UNKNOWN."""
 
 
+class ExclusionCounterpartChallenge(ExclusionReviewError):
+    """Grounded target behavior challenges the proposed exclusion."""
+
+    def __init__(self, details):
+        self.details = details
+        super().__init__('feature-absence not established; reconsider old-operation counterparts: '
+                         + json.dumps(details, ensure_ascii=False))
+
+
 class ExclusionReviewUnresolved(ExclusionReviewError):
     """No grounded counterevidence can be sent back to mapping."""
 
@@ -285,8 +294,7 @@ def review_exclusions(controller, assessment, inventory, attempt):
             entry['units'] = challenged
             raise ExclusionReviewUnresolved('independent review did not confirm exclusion for: ' + ', '.join(challenged))
         entry.update(status='REMAP_REQUIRED', units=[u['id'] for u in details])
-        raise ExclusionReviewError('feature-absence not established; reconsider old-operation counterparts: '
-                                   + json.dumps(details, ensure_ascii=False))
+        raise ExclusionCounterpartChallenge(details)
     entry['status'] = ('CONFIRMED_ABSENT' if all(u['status'] != 'ALREADY_FIXED' for u in assessment['units'])
                        else 'CONFIRMED_EXCLUSIONS')
 

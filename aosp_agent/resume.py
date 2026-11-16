@@ -120,12 +120,15 @@ def _accepted_location(root, record):
     from .checkpoint import validate_checkpoint
     validate_checkpoint(record)
     from .assessment_repair import MAX_REUSABLE_ASSESSMENT_BYTES
-    location = record.get('location_handoff', {})
-    targets = location.get('targets', {})
     pins = record.get('pinned_targets', {})
-    if (location.get('status') != 'READY' or not targets
-            or set(targets) != set(record.get('selected_projects', []))
-            or any(pins.get(key, {}).get('head') != head for key, head in targets.items())):
+    for field in ('location_handoff', 'last_grounded_location'):
+        location = record.get(field, {})
+        targets = location.get('targets', {})
+        if (location.get('status') == 'READY' and targets
+                and set(targets) == set(record.get('selected_projects', []))
+                and all(pins.get(key, {}).get('head') == head for key, head in targets.items())):
+            break
+    else:
         return None
 
     def artifact(field, checkpoint, name, digest):
