@@ -69,6 +69,39 @@ def seed_context(raw, path, *, pending_proof=False):
             + str(path) + '\n' + json.dumps(index, ensure_ascii=False))
 
 
+
+def _linked_causal_citations(impact, chain):
+    evidence = impact.get('evidence')
+    if not isinstance(evidence, list):
+        return set()
+    citations = set()
+    for role in ('donor_fault_evidence', 'donor_fix_evidence',
+                 'target_fault_evidence', 'target_harm_evidence'):
+        indices = chain.get(role)
+        if not isinstance(indices, list):
+            continue
+        for index in indices:
+            if type(index) is int and 1 <= index <= len(evidence) and isinstance(evidence[index - 1], dict):
+                item = evidence[index - 1]
+                citations.add((role, digest({key: item.get(key) for key in
+                    ('revision', 'path', 'line_start', 'line_end', 'excerpt')})))
+    return citations
+
+
+def _require_citations_for_cleared_behavior(raw, candidate):
+    prior = raw.get('impact', raw)
+    impact = candidate.get('impact', candidate)
+    if not isinstance(prior, dict) or not isinstance(impact, dict) or impact.get('status') != 'AFFECTED':
+        return
+    previous_chain = prior.get('causal_chain')
+    chain = impact.get('causal_chain')
+    if (isinstance(previous_chain, dict) and previous_chain.get('external_behavior_assumptions')
+            and isinstance(chain, dict) and not chain.get('external_behavior_assumptions')
+            and not _linked_causal_citations(impact, chain) - _linked_causal_citations(prior, previous_chain)):
+        raise AssessmentError('clearing behavior assumptions while retaining AFFECTED requires '
+                              'a new or corrected citation linked to the causal chain, or report UNKNOWN')
+
+
 def apply_repair(raw, repair, *, schema=ASSESSMENT_RESPONSE_SCHEMA):
     """Atomic replacement of existing fields (or optional top-level sections).
 
@@ -157,6 +190,7 @@ def apply_repair(raw, repair, *, schema=ASSESSMENT_RESPONSE_SCHEMA):
             raise AssessmentError('retiring a causal claim requires UNKNOWN with an explicit unresolved proof step')
         del impact['causal_chain']
     _shape(candidate, schema)
+    _require_citations_for_cleared_behavior(raw, candidate)
     return candidate
 
 

@@ -89,6 +89,31 @@ def assessment_diagnostic(error, raw=None, *, wrapped=False):
     return result
 
 
+class AssessmentGroundingError(AssessmentError):
+    """Independent errors in one parsed report, before dependent proof checks."""
+
+    def __init__(self, errors):
+        super().__init__(str(errors[0]))
+        self.errors = tuple(errors)
+        self.diagnostic = errors[0].diagnostic
+
+
+def require_grounded_behavior(assessment):
+    """Check the declared assumptions without relying on any evidence entry."""
+    causal = assessment.get('causal_chain') or {}
+    if assessment['status'] == 'AFFECTED' and causal.get('external_behavior_assumptions'):
+        error = AssessmentError(
+            "AFFECTED cannot rest on uncited repository/framework behavior: "
+            "causal_chain.external_behavior_assumptions must be empty. Put already "
+            "grounded facts in the causal explanation and reference their source evidence. "
+            "For any material unverified behavior, cite its implementation or keep the impact UNKNOWN. "
+            "Use ordinary evidence for android.* and com.android.* behavior; reserve "
+            "platform_semantics for recognized standard-library APIs with target implementations.")
+        error.diagnostic = {'category': 'EVIDENCE_UNGROUNDED',
+            'path': '/causal_chain/external_behavior_assumptions', 'message': str(error)}
+        raise error
+
+
 def _api_error(message, index, category, field='api'):
     error = AssessmentError(message)
     error.diagnostic = {'category': category,
@@ -296,15 +321,7 @@ class CausalityChecks:
             if not all(self._is_executable_evidence(entry) for entry in selected[field]):
                 raise AssessmentError(f"causal_chain {field} must cite executable target statements")
 
-        assumptions = causal.get("external_behavior_assumptions", [])
-        if assumptions:
-            raise AssessmentError(
-                "AFFECTED cannot rest on uncited repository/framework behavior: "
-                "causal_chain.external_behavior_assumptions must be empty. Put already "
-                "grounded facts in the causal explanation and reference their source evidence. "
-                "For any material unverified behavior, cite its implementation or keep the impact UNKNOWN. "
-                "Use ordinary evidence for android.* and com.android.* behavior; reserve "
-                "platform_semantics for recognized standard-library APIs with target implementations.")
+        require_grounded_behavior(assessment)
         repository = getattr(getattr(self, "case", None), "repository", "") or ""
         repository_roots = getattr(self, '_causality_repository_roots', {repository.split("/", 1)[0]} - {""})
         causal_anchor_indices = (set(causal.get("target_fault_evidence") or [])

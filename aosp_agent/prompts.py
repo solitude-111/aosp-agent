@@ -524,8 +524,8 @@ Fix-defined causal chain (required for every AFFECTED conclusion):
 Cite exact existing snippets, revision labels, repository-relative paths, and 1-based lines.
 Limit exploration to the named candidate files and a small number of directly referenced API files;
 do not grep the whole checkout or run history commands that can expand to thousands of lines; use
-the four controlled tools under <run_dir>/bin instead. After you have one contiguous target excerpt
-and one source excerpt, return the JSON response immediately.
+the controlled source tools instead. Return once the material proof steps have pinned evidence
+or a bounded search leaves a material premise unresolved. In the latter case, report UNKNOWN and name the gap.
 Keep product reachability and runtime validation claims separate from source-level conclusions;
 record unverified reachability, missing dependencies, and unexecuted regressions in limitations.
 Do not edit production source or tests, read evaluation oracles, or download/run PoCs.

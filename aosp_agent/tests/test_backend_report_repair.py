@@ -84,6 +84,44 @@ class BackendReportRepairTest(unittest.TestCase):
             with self.assertRaisesRegex(AssessmentError, 'unresolved proof step'):
                 apply_repair(raw, correction, schema=IMPACT_SCHEMA)
 
+    def test_single_correction_receives_all_independent_evidence_errors(self):
+        with GitFixture() as fx:
+            raw = fx.assessment()
+            broken = copy.deepcopy(raw)
+            broken['evidence'][0]['excerpt'] = 'invented target excerpt'
+            broken['evidence'][2]['path'] = 'outside.py'
+            broken['causal_chain']['external_behavior_assumptions'] = ['An unseen caller may bypass this check']
+            correction = {'base_sha256': digest(broken), 'replacements': [
+                {'path': '/evidence/0/excerpt', 'value_json': json.dumps(raw['evidence'][0]['excerpt'])},
+                {'path': '/evidence/2/path', 'value_json': json.dumps(raw['evidence'][2]['path'])},
+                {'path': '/status', 'value_json': '"UNKNOWN"'},
+                {'path': '/proof_steps/0/resolved', 'value_json': 'false'},
+                {'path': '/proof_steps/0/resolution', 'value_json': '"The caller has not been verified."'},
+            ], 'retire_causal_claim': True}
+            runtime = ReportRuntime([broken, correction])
+            agent = AospBackportAgent(fx.source_root, fx.run_root, fx.case(), runtime_factory=runtime.factory)
+            result = agent.run(impact_only=True, max_attempts=2)
+            self.assertEqual(result['impact_decision'], 'unknown')
+            rejection, = result['impact_report_rejections']
+            paths = [d['path'] for d in rejection['diagnostics']]
+            self.assertEqual(paths, ['/evidence/0/excerpt', '/evidence/2/path',
+                                     '/causal_chain/external_behavior_assumptions'])
+            self.assertTrue(rejection['dependent_proof_deferred'])
+            for path in paths:
+                self.assertIn(path, runtime.calls[1]['prompt'])
+            self.assertIn('relevant direct callers', runtime.calls[1]['prompt'])
+
+    def test_clearing_behavior_without_linked_evidence_is_rejected(self):
+        with GitFixture() as fx:
+            raw = fx.assessment()
+            raw['causal_chain']['external_behavior_assumptions'] = ['An unseen caller may bypass this check']
+            repair = {'base_sha256': digest(raw), 'replacements': [
+                {'path': '/causal_chain/external_behavior_assumptions', 'value_json': '[]'},
+                {'path': '/evidence/0/claim', 'value_json': '"Same source with a new explanation."'},
+            ]}
+            with self.assertRaisesRegex(AssessmentError, 'new or corrected citation'):
+                apply_repair(raw, repair, schema=IMPACT_SCHEMA)
+
     def test_explicit_constructor_signature_is_not_erased(self):
         source = 'package java.io; class File { File(String p, String c) { use(p,c); } }'
         entry = {'path': 'File.java', 'excerpt': source}

@@ -432,55 +432,75 @@ class AospBackportAgent(CausalityChecks):
                 "returncode": check.returncode, "stderr": check.stderr[-5000:]}
 
     def _ground_assessment(self, text: str) -> dict[str, Any]:
-        from .impact_proof import evidence_error
+        from .impact_proof import AssessmentGroundingError, require_grounded_behavior
         assessment = parse_impact_response(text)
         if assessment["status"] != "UNKNOWN" and not any(e["revision"] in ("source_parent", "source_fix")
                                                           for e in assessment["evidence"]):
             raise AssessmentError("determinate assessment requires donor evidence")
         refs = {"target": self.case.target_commit, "source_parent": self.case.source_parent,
                 "source_fix": self.case.source_commit}
+        errors = []
         for evidence_index, evidence in enumerate(assessment["evidence"]):
-            if (evidence["revision"] != "target"
-                    and evidence["path"] not in self.case.files
-                    and evidence["path"] not in getattr(self, "_source_changed_paths", set())):
-                raise evidence_error(f"source evidence path is not in the donor fix diff: {evidence['path']}",
-                                     evidence_index, 'path')
-            runner = self._git if evidence["revision"] == "target" else self._source_git
             try:
-                if self.location_handoff and evidence['revision'] == 'target':
-                    content = self.location_handoff.target_content(evidence['path'])
-                else:
-                    content = runner("show", f"{refs[evidence['revision']]}:{evidence['path']}").stdout
-            except subprocess.CalledProcessError as exc:
-                raise evidence_error(
-                    f"evidence file does not exist in {evidence['revision']}:{evidence['path']}",
-                    evidence_index, 'path') from exc
-            lines = content.splitlines()
-            start, end = evidence["line_start"], evidence["line_end"]
-            if end > len(lines):
-                raise evidence_error(f"evidence line range exceeds {evidence['revision']}:{evidence['path']}",
-                                     evidence_index, 'line_end')
-            excerpt = evidence["excerpt"].strip()
-            excerpt_lines = excerpt.splitlines()
-            matches = [index for index in range(len(lines) - len(excerpt_lines) + 1)
-                       if "\n".join(lines[index:index + len(excerpt_lines)]).strip() == excerpt]
-            if not matches:
-                raise evidence_error(f"evidence excerpt does not exist in {evidence['revision']}:{evidence['path']}:{start}-{end}",
-                                     evidence_index, 'excerpt')
-            if self.location_handoff and start - 1 not in matches and len(matches) != 1:
-                raise evidence_error(f"ambiguous pinned evidence range: {evidence['path']}:{start}-{end}",
-                                     evidence_index, 'line_start')
-            actual_start = start if self.location_handoff and start - 1 in matches else matches[0] + 1
-            actual_end = actual_start + len(excerpt_lines) - 1
-            if actual_start != start or actual_end != end:
-                self.record.setdefault("evidence_corrections", []).append(
-                    {"revision": evidence["revision"], "path": evidence["path"],
-                     "requested": [start, end], "grounded": [actual_start, actual_end]})
-                evidence["line_start"], evidence["line_end"] = actual_start, actual_end
+                self._ground_impact_evidence(evidence, evidence_index, refs)
+            except AssessmentError as exc:
+                errors.append(exc)
+                if len(errors) == 8:
+                    break
+        if errors:
+            # The declared assumptions are independently visible. The rest of
+            # the causal proof must wait until its citations are grounded.
+            try:
+                require_grounded_behavior(assessment)
+            except AssessmentError as exc:
+                errors.append(exc)
+            raise AssessmentGroundingError(errors)
         self._validate_impact_causality(assessment)
         from .platform_evidence import receipt
         self.record['platform_behavior_evidence'] = receipt(assessment)
         return assessment
+
+    def _ground_impact_evidence(self, evidence, evidence_index, refs):
+        from .impact_proof import evidence_error
+        if (evidence["revision"] != "target"
+                and evidence["path"] not in self.case.files
+                and evidence["path"] not in getattr(self, "_source_changed_paths", set())):
+            raise evidence_error(f"source evidence path is not in the donor fix diff: {evidence['path']}",
+                                 evidence_index, 'path')
+        runner = self._git if evidence["revision"] == "target" else self._source_git
+        try:
+            if self.location_handoff and evidence['revision'] == 'target':
+                content = self.location_handoff.target_content(evidence['path'])
+            else:
+                content = runner("show", f"{refs[evidence['revision']]}:{evidence['path']}").stdout
+        except AssessmentError as exc:
+            raise evidence_error(str(exc), evidence_index, 'path') from exc
+        except subprocess.CalledProcessError as exc:
+            raise evidence_error(
+                f"evidence file does not exist in {evidence['revision']}:{evidence['path']}",
+                evidence_index, 'path') from exc
+        lines = content.splitlines()
+        start, end = evidence["line_start"], evidence["line_end"]
+        if end > len(lines):
+            raise evidence_error(f"evidence line range exceeds {evidence['revision']}:{evidence['path']}",
+                                 evidence_index, 'line_end')
+        excerpt = evidence["excerpt"].strip()
+        excerpt_lines = excerpt.splitlines()
+        matches = [index for index in range(len(lines) - len(excerpt_lines) + 1)
+                   if "\n".join(lines[index:index + len(excerpt_lines)]).strip() == excerpt]
+        if not matches:
+            raise evidence_error(f"evidence excerpt does not exist in {evidence['revision']}:{evidence['path']}:{start}-{end}",
+                                 evidence_index, 'excerpt')
+        if self.location_handoff and start - 1 not in matches and len(matches) != 1:
+            raise evidence_error(f"ambiguous pinned evidence range: {evidence['path']}:{start}-{end}",
+                                 evidence_index, 'line_start')
+        actual_start = start if self.location_handoff and start - 1 in matches else matches[0] + 1
+        actual_end = actual_start + len(excerpt_lines) - 1
+        if actual_start != start or actual_end != end:
+            self.record.setdefault("evidence_corrections", []).append(
+                {"revision": evidence["revision"], "path": evidence["path"],
+                 "requested": [start, end], "grounded": [actual_start, actual_end]})
+            evidence["line_start"], evidence["line_end"] = actual_start, actual_end
 
 
     def _turn(self, runtime, prompt: str, *, read_only: bool, phase: str, schema=None) -> dict:
@@ -1420,7 +1440,7 @@ class AospBackportAgent(CausalityChecks):
             from .assessment_repair import (REPAIR_SCHEMA, apply_repair, digest,
                                             repair_prompt, seed_context)
             from .execution_budget import ACTIVE_EXECUTION
-            from .impact_proof import assessment_diagnostic
+            from .impact_proof import AssessmentGroundingError, assessment_diagnostic
             from .sdk_runtime import CodexRuntimeError, charge_report_correction
             from jsonschema import ValidationError, validate
             ledger = ACTIVE_EXECUTION.get()
@@ -1437,7 +1457,7 @@ class AospBackportAgent(CausalityChecks):
                     charge_report_correction(phase='impact_correction', repository=self.case.repository)
                 elif scope_correction:
                     charge_report_correction(phase='backend_scope_correction', repository=self.case.repository)
-                diagnostic = None
+                diagnostic, grounding_errors = None, None
                 try:
                     result = self._turn(runtime, impact_request, read_only=True,
                                         phase=('impact_correction' if correction else
@@ -1481,20 +1501,29 @@ class AospBackportAgent(CausalityChecks):
                     raise
                 except (AssessmentError, ValidationError, ValueError) as exc:
                     diagnostic = assessment_diagnostic(exc, raw_report, wrapped=bool(handoff))
+                    if isinstance(exc, AssessmentGroundingError):
+                        grounding_errors = [assessment_diagnostic(error, raw_report, wrapped=bool(handoff))
+                                            for error in exc.errors]
                 if not isinstance(raw_report, dict):
                     raise AssessmentError('impact report must be an object for local correction')
+                diagnostics = grounding_errors or [diagnostic]
                 self._event('impact_evidence_rejected', attempt=impact_attempt,
-                            error=diagnostic['message'], diagnostic=diagnostic)
+                            error=diagnostic['message'], diagnostic=diagnostic, diagnostics=diagnostics)
                 self.record.setdefault('impact_report_rejections', []).append(
-                    {'attempt': impact_attempt, 'base_sha256': digest(raw_report), 'diagnostic': diagnostic})
+                    {'attempt': impact_attempt, 'base_sha256': digest(raw_report),
+                     'diagnostic': diagnostic, 'diagnostics': diagnostics,
+                     'dependent_proof_deferred': grounding_errors is not None})
                 self._json(f'impact-rejection-{impact_attempt}.json', self.record['impact_report_rejections'][-1])
-                signature = (diagnostic['category'], diagnostic['path'], diagnostic['message'])
+                signature = tuple((item['category'], item['path'], item['message']) for item in diagnostics)
                 if impact_attempt == impact_limit or (ledger and signature == previous_failure):
                     error = AssessmentError(diagnostic['message'])
                     error.diagnostic = diagnostic
+                    error.diagnostics = diagnostics
                     raise error
                 previous_failure = signature
-                impact_request = (repair_prompt(raw_report, json.dumps(diagnostic, ensure_ascii=False))
+                deferred = ('\nChecks that depend on grounded citations will run after these citations are repaired.'
+                            if grounding_errors is not None else '')
+                impact_request = (repair_prompt(raw_report, json.dumps(diagnostics, ensure_ascii=False)) + deferred
                     + seed_context(raw_report, self.run_dir / f'impact-seed-{impact_attempt}.txt')
                     + '\nThis is a backend report. Preserve all unchanged evidence and its indices. '
                       'An AFFECTED conclusion requires the full pinned-source causal proof. '
@@ -1504,6 +1533,16 @@ class AospBackportAgent(CausalityChecks):
                       'renaming or removing a behavior claim cannot resolve missing evidence. '
                       'If a material fact remains unresolved, retain that gap and UNKNOWN. '
                     + handoff_instructions)
+                if any(item['path'].endswith('/causal_chain/external_behavior_assumptions')
+                       for item in diagnostics):
+                    impact_request += (
+                        '\nFor each reported behavior premise, identify the proof step it affects. '
+                        'Starting from existing valid citations and the pinned locations, use the controlled '
+                        'read-only source tools within the current budget. Follow only relevant direct callers, '
+                        'callees, branch conditions or callbacks. Cite the implementation and the branch '
+                        'that applies in the target, and link the citation to the proof. '
+                        'If a material premise cannot be grounded, return UNKNOWN, name the unresolved '
+                        'proof step and explain the missing evidence. Do not restart repository discovery.')
             runtime.defer_schema_errors = False
             assert assessment is not None
             self.record["assessment"] = assessment
