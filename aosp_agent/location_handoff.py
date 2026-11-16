@@ -2,7 +2,7 @@
 from copy import deepcopy
 import json
 
-from .diff_prompts import ASSESSMENT_SCHEMA, EVIDENCE, LINE, STRING, TARGET, array, compact_location, obj
+from .diff_prompts import ASSESSMENT_SCHEMA, EVIDENCE, LINE, STRING, TARGET, array, compact_location, enum, obj
 from .discovery import RepositoryReadConstraintError
 from .engine import AssessmentError
 from .location_regions import donor_adds_callable, import_changes, normalize_java_target
@@ -31,6 +31,17 @@ BACKEND_SCHEMA = obj({'impact': IMPACT_SCHEMA, **EDIT_FIELDS})
 EDIT_SCHEMA = obj(EDIT_FIELDS)
 
 
+def backend_report_schema(guarded_obligations, *, reused_impact=False):
+    """Bind model-authored obligations to the controller's list for this run."""
+    schema = deepcopy(EDIT_SCHEMA if reused_impact else BACKEND_SCHEMA)
+    allowed = list(dict.fromkeys(row['id'] for row in guarded_obligations))
+    obligations = schema['properties']['repair_obligations']
+    obligations['maxItems'] = len(allowed)
+    if allowed:
+        obligations['items']['properties']['id'] = enum(*allowed)
+    return schema
+
+
 class BackendEditSelectionError(AssessmentError):
     """An invalid selection table does not itself invalidate grounded locations."""
     kind = 'BACKEND_EDIT_SELECTION_INVALID'
@@ -46,7 +57,8 @@ def backend_scope_feedback(record, location, handoff, targets):
     retry = record.get('backend_scope_retry')
     if (not isinstance(retry, dict) or retry.get('kind') != BackendEditSelectionError.kind
             or not location or handoff.get('status') != 'READY'
-            or handoff.get('scope') == 'READ_ONLY_WITH_GAPS' or handoff.get('unmapped_units')
+            or handoff.get('scope') == 'READ_ONLY_WITH_GAPS'
+            or set(handoff.get('unmapped_units', [])) - set(retry.get('verified_no_edit_units', []))
             or handoff.get('targets') != targets or retry.get('targets') != targets
             or retry.get('location_digest') != digest(location)
             or record.get('location_gaps') or record.get('scope_requests')
@@ -375,9 +387,11 @@ class BackendHandoff:
                       'scope and obligations requested by the schema.\n'
                       + json.dumps(self.accepted_impact, ensure_ascii=False)
                       if reused_impact else 'Use your usual impact analysis in the impact field.')
-        scope_feedback = ('\nCorrect the rejected backend edit selection below within the unchanged '
-                          'grounded locations. A read-only unit needs no edits entry. Return the '
-                          'requested scope schema; do not invent an edit or change the accepted impact.\n'
+        scope_feedback = ('\nCorrect the rejected backend plan below within the unchanged grounded locations. '
+                          'A read-only unit needs no edits entry. Return the requested scope schema; '
+                          'do not invent an edit or change the accepted impact. Preserve edits and '
+                          'flag_cleanup_support unless the diagnostic points to those fields. '
+                          'When correcting repair_obligations, reuse the grounded locations.\n'
                           + json.dumps(self.scope_feedback, ensure_ascii=False) if self.scope_feedback else '')
         return ('''
 The locations below are pinned candidate anchors, not a verdict. Qualify cross-project target evidence with its
@@ -387,12 +401,14 @@ If more evidence is needed, name a specific file or directory in the path argume
 search result or a timed-out read cannot establish absence.
 Check all relevant donor changes, including read-only support.
 After an AFFECTED decision, select the edits with 1-based target_indices within
-each unit. Select only candidate edit locations. List location_gaps only for
-missing required edit locations. For a missing project, return repository_requests
+each unit. Use donor unit IDs in edits, and select only candidate edit locations.
+List location_gaps only for missing required edit locations. For a missing project, return repository_requests
 with pinned evidence, and keep impact UNKNOWN if that dependency is required for
-the causal conclusion. For each guarded obligation select target indices and
-disposition edit or already_covered. Use empty edits and repair_obligations for
-UNKNOWN, NOT_AFFECTED or ALREADY_FIXED. Do not edit in this analysis turn.
+the causal conclusion. The repair_obligations IDs come only from the Guarded obligations list
+below. If that list is empty, return repair_obligations: []. For an AFFECTED edit plan, include
+each listed ID exactly once with target indices and disposition edit or already_covered.
+Use empty edits and repair_obligations for UNKNOWN, NOT_AFFECTED or ALREADY_FIXED.
+Do not edit in this analysis turn.
 If needed, select exact new_files already in the proposed scope. For a deleted aconfig
 declaration that is absent from the target, use flag_cleanup_support to link it to
 the selected production hunk(s) that remove the flag check. The controller checks
@@ -406,7 +422,7 @@ name the permitted boundary; the wider quoted range is context.
 
     def accept(self, child, impact, response, *, impact_only):
         from .exclusion_review import ExclusionReviewError, ExclusionReviewUnresolved, review_exclusions
-        from .mapped_impact import ground_repair_contract
+        from .mapped_impact import RepairContractError, ground_repair_contract
 
         controller = self.controller
         decision = impact['status']
@@ -439,6 +455,7 @@ name the permitted boundary; the wider quoted range is context.
         if impact_only:
             child.record['status'] = 'AFFECTED'
             return False
+        verified_no_edit = {}
         try:
             assessment, ids = select_edits(self.location, response)
             if not ids:
@@ -446,19 +463,27 @@ name the permitted boundary; the wider quoted range is context.
                 raise AssessmentError(' / '.join(response['location_gaps'] or gaps) or
                                       'confirmed impact requires at least one grounded edit location')
             obligations = {row['id']: row for row in controller.guarded_obligations}
+            # A verified no-edit support unit is not a missing target location.
+            verified_no_edit = ground_flag_support(controller, response.get('flag_cleanup_support', []), ids)
             repair = ground_repair_contract(controller, {row['id']: row for row in assessment['units']},
                                             obligations, response['repair_obligations'], '/repair_obligations')
-            self.flag_support = ground_flag_support(controller, response.get('flag_cleanup_support', []), ids)
-        except BackendEditSelectionError as exc:
+        except (BackendEditSelectionError, RepairContractError) as exc:
             from .assessment_repair import digest
-            controller.record['migration_scope_diagnostic'] = exc.diagnostic
+            diagnostic = (exc.diagnostic if isinstance(exc, BackendEditSelectionError) else {
+                'category': 'BACKEND_REPAIR_CONTRACT_INVALID', 'path': '/repair_obligations',
+                'message': str(exc), 'expected_ids': list(obligations),
+                'submitted_ids': [row['id'] for row in response['repair_obligations']],
+            })
+            controller.record['migration_scope_diagnostic'] = diagnostic
             controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
             location = controller.record.get('location_handoff', {})
-            if (location.get('status') == 'READY' and not location.get('unmapped_units')
+            if (location.get('status') == 'READY'
+                    and not set(location.get('unmapped_units', [])) - verified_no_edit.keys()
                     and location.get('scope') != 'READ_ONLY_WITH_GAPS'
                     and not controller.record.get('location_gaps') and not response['location_gaps']):
                 controller.record['backend_scope_retry'] = {
-                    'kind': exc.kind, 'diagnostic': exc.diagnostic,
+                    'kind': BackendEditSelectionError.kind, 'diagnostic': diagnostic,
+                    'verified_no_edit_units': sorted(verified_no_edit),
                     'targets': location['targets'], 'location_digest': digest(controller.grounded_location),
                     'report': {key: deepcopy(response[key]) for key in EDIT_FIELDS}}
                 controller.record['replan_required'] = 'BACKEND_SCOPE_CORRECTION_REQUIRED'
@@ -466,6 +491,7 @@ name the permitted boundary; the wider quoted range is context.
         except AssessmentError as exc:
             controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
             return self.unresolved(child, 'MIGRATION_SCOPE_UNRESOLVED', str(exc))
+        self.flag_support = verified_no_edit
         if repair:
             controller.record['causal_evidence'] = {'status': 'BACKEND_CONFIRMED',
                                                     'groups': [{'repair_obligations': repair}]}

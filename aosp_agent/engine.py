@@ -1397,11 +1397,12 @@ class AospBackportAgent(CausalityChecks):
         accepted_impact = None
         impact_schema = IMPACT_SCHEMA
         if handoff:
-            from .location_handoff import BACKEND_SCHEMA, EDIT_SCHEMA
+            from .location_handoff import backend_report_schema
             if handoff.accepted_impact is not None:
                 accepted_impact = self._ground_assessment(handoff.accepted_impact)
                 self.record['backend_impact_reused'] = True
-            impact_schema = EDIT_SCHEMA if accepted_impact else BACKEND_SCHEMA
+            impact_schema = backend_report_schema(handoff.controller.guarded_obligations,
+                                                  reused_impact=bool(accepted_impact))
         runtime_options = dict(events_path=self.run_dir / "sdk-events.jsonl", model=self.model,
                                model_provider=self.model_provider, turn_timeout=self.turn_timeout, env=OFFLINE_GIT_ENV)
         analysis_options = runtime_options

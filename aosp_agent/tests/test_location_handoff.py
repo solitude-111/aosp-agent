@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import subprocess
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -258,6 +259,47 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertFalse(scopes[4][1])
             record = Path(outcome['final_round_record']).parent / 'repositories/repo/run.json'
             self.assertTrue(json.loads(record.read_text())['backend_impact_reused'])
+
+    def test_bad_repair_contract_retries_only_plan_with_verified_no_edit_support(self):
+        from aosp_agent.location_handoff import BackendHandoff, backend_scope_feedback
+
+        for supported in (False, True):
+            with self.subTest(supported=supported), GitFixture() as fx:
+                located = location()
+                located['units'].append({'id': 'f002-h001', 'targets': [], 'evidence': [],
+                                         'location_notes': 'No flag declaration in target.'})
+                pins = {'repo': fx.target}
+                receipt = {'status': 'READY', 'targets': pins, 'unmapped_units': ['f002-h001']}
+                record = {'location_handoff': receipt, 'impact_analysis': {'status': 'CONFIRMED'}}
+                controller = SimpleNamespace(record=record, grounded_location=located,
+                                             guarded_obligations=[], _save=lambda: None)
+                handoff = object.__new__(BackendHandoff)
+                handoff.controller = controller
+                handoff.location = located
+                handoff.confirm = lambda *args: None
+                report = impact_reply(fx, 'AFFECTED', [{'unit_id': 'f001-h001', 'target_indices': [1]}])
+                report['repair_obligations'] = [{'id': 'f001-h001'}]
+                child = SimpleNamespace(record={})
+                flags = {'f002-h001': {'unit_id': 'f002-h001'}} if supported else {}
+                with patch('aosp_agent.location_handoff.ground_flag_support', return_value=flags):
+                    self.assertFalse(handoff.accept(child, report['impact'], report, impact_only=False))
+                    diagnostic = record['migration_scope_diagnostic']
+                    self.assertEqual(diagnostic['path'], '/repair_obligations')
+                    self.assertEqual(diagnostic['expected_ids'], [])
+                    self.assertEqual(diagnostic['submitted_ids'], ['f001-h001'])
+                    self.assertEqual(child.record['completion_blocked_by'], 'MIGRATION_SCOPE_UNRESOLVED')
+                    retry = backend_scope_feedback(record, located, receipt, pins)
+                    if not supported:
+                        self.assertEqual(record['replan_required'], 'LOCATION_SCOPE_UNRESOLVED')
+                        self.assertIsNone(retry)
+                        continue
+                    self.assertEqual(record['replan_required'], 'BACKEND_SCOPE_CORRECTION_REQUIRED')
+                    self.assertEqual(retry['diagnostic'], diagnostic)
+                    self.assertEqual(retry['previous_scope_report']['edits'], report['edits'])
+                    self.assertIsNone(backend_scope_feedback(record, located, receipt, {'repo': fx.donor}))
+                    report['repair_obligations'] = []
+                    self.assertTrue(handoff.accept(child, report['impact'], report, impact_only=False))
+                    self.assertEqual(handoff.flag_support, flags)
 
     def test_resume_reuses_the_checked_backend_impact_receipt(self):
         with GitFixture() as fx:
