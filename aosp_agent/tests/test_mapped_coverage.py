@@ -158,6 +158,31 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                     self.assertIsNone(detail)
                     self.assertIn('changed statement or field', error)
 
+    def test_cpp_signature_evidence_binds_a_unique_definition_or_prototype(self):
+        from aosp_agent.mapped_coverage import _cpp_equivalent_evidence
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for path, before, after, expected in (
+                ('port.h', 'extern int open(int mode);\n\n', 'extern int open(int mode, int mask = 0);\n\n', [1]),
+                ('mock.cc', 'int open(int mode) {\n  return mode;\n}\n',
+                 'int open(int mode, int mask) {\n  return mode;\n}\n', [1]),
+                ('port.cc', 'int open(int mode) { return mode; }\n',
+                 'int open(int mode, int mask) { return mode; }\nint open() { return 0; }\n', None),
+            ):
+                with self.subTest(path=path):
+                    (root / path).write_text(after)
+                    agent = SimpleNamespace(worktree=root, _artifact_baseline_text=lambda _: before,
+                        record={'assessment': {'evidence': [], 'causal_chain': {'target_fault_state': 'Shared state.'}}})
+                    region = {'symbol': 'open', 'line_start': 1, 'line_end': len(before.splitlines()),
+                              'relationship': 'dependency'}
+                    detail, error = _cpp_equivalent_evidence(agent, path, split_hunks(diff(path, before, after)), region)
+                    if expected:
+                        self.assertIsNone(error)
+                        self.assertEqual(detail['changed_signature_lines'], expected)
+                    else:
+                        self.assertIsNone(detail)
+                        self.assertIn('uniquely matching declaration', error)
+
 
 class MappedCoverageTest(unittest.TestCase):
     def check(self, before, after, review, *, symbol='sink', bounds=None, relationship='same_function'):
