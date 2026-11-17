@@ -333,13 +333,21 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
             bisect_right(old_lines, old_decl.start_byte), bisect_right(old_lines, old_decl.end_byte - 1) + 1)))
     if not added_lines and not removed_lines and not signature_lines:
         return None, 'C++ equivalent repair needs a changed statement or field, or a signature change, in its mapped declaration'
+    baseline_excerpt = {'first_line': bisect_right(old_lines, old[0].start_byte), 'excerpt': txt(old[0])}
+    candidate_excerpt = {'first_line': bisect_right(new_lines, fixed[0].start_byte), 'excerpt': txt(fixed[0])}
+    if field_mapping and added_lines:
+        # The parser proves the record identity. Keep the field neighborhood
+        # alongside the pinned writer and reader for review.
+        first = max(candidate_excerpt['first_line'], added_lines[0] - 2)
+        last = min(bisect_right(new_lines, fixed[0].end_byte - 1), added_lines[-1] + 2)
+        baseline_excerpt = {'first_line': start, 'excerpt': '\n'.join(baseline.splitlines()[start - 1:end])}
+        candidate_excerpt = {'first_line': first, 'excerpt': '\n'.join(edited.splitlines()[first - 1:last])}
     impact = agent.record['assessment']
     return {'kind': 'cpp_equivalent_direct_edit', 'added_executable_lines': added_lines if not field_mapping else [],
             'changed_field_lines': added_lines if field_mapping else [],
             'changed_signature_lines': signature_lines,
             'removed_baseline_lines': removed_lines,
-            'baseline': {'first_line': bisect_right(old_lines, old[0].start_byte), 'excerpt': txt(old[0])},
-            'candidate': {'first_line': bisect_right(new_lines, fixed[0].start_byte), 'excerpt': txt(fixed[0])},
+            'baseline': baseline_excerpt, 'candidate': candidate_excerpt,
             'target_fault': impact['causal_chain']['target_fault_state'],
             'target_evidence': [entry for entry in impact['evidence'] if entry['revision'] == 'target']}, None
 
