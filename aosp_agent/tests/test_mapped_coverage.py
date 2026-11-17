@@ -134,6 +134,7 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                 if runtime.calls:
                     self.assertTrue(runtime.calls[0]['read_only'])
                     self.assertIn('cpp_equivalent_direct_edit', runtime.calls[0]['prompt'])
+                    self.assertIn('"related_hunk_indices": [1]', runtime.calls[0]['prompt'])
 
     def test_cpp_field_evidence_requires_a_real_change_in_the_named_record(self):
         from aosp_agent.mapped_coverage import _cpp_equivalent_evidence

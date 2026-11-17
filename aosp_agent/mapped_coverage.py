@@ -397,11 +397,11 @@ def collect_regions(agent, claims, candidate_patch):
                     continue
                 detail, error = _cpp_equivalent_evidence(agent, path, candidate_hunks, region)
                 if detail:
-                    # Show other changed portions of this unit's admitted
-                    # implementation so the reviewer can follow cross-file flow.
+                    # Include scoped hunks from the whole unit. A wrapper can
+                    # move its implementation elsewhere in its own edit range.
                     detail['related_candidate_hunks'] = [
                         {'path': hunk['path'], 'patch': hunk['patch']} for hunk in hunks
-                        if any(peer != region and hunk['path'] == peer['path']
+                        if any(hunk['path'] == peer['path']
                                and any(peer['line_start'] <= first <= last <= peer['line_end']
                                        for first, last, _ in change_blocks(hunk['patch']))
                                for peer in mappings)
