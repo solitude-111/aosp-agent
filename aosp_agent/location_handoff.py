@@ -68,6 +68,23 @@ def backend_scope_feedback(record, location, handoff, targets):
     return {'diagnostic': retry['diagnostic'], 'previous_scope_report': retry['report']}
 
 
+def affected_fault_units(impact, units):
+    """Bind changed donor fault sites in the checked proof to migration coverage."""
+    from .impact_proof import CausalityChecks
+
+    evidence = impact['evidence']
+    causal = impact.get('causal_chain') or {}
+    anchor = [evidence[i - 1] for i in causal.get('donor_fault_evidence', [])]
+    required = set()
+    for unit in units:
+        changed = CausalityChecks._changed_hunk_lines(unit, 'source_parent')
+        if any(CausalityChecks._evidence_matches_hunk(entry, unit)
+               and any(entry['line_start'] <= line <= entry['line_end'] for line in changed)
+               for entry in anchor):
+            required.add(unit['id'])
+    return required
+
+
 def focused_impact_challenge(record, location, targets):
     """Reuse a location only when the challenged units still have grounded anchors."""
     challenge = record.get('impact_challenge')
@@ -416,6 +433,8 @@ class BackendHandoff:
         assessment = ('Use the already grounded backend AFFECTED assessment below. Return only the edit '
                       'scope and obligations requested by the schema.\n'
                       + json.dumps(self.accepted_impact, ensure_ascii=False)
+                      + '\nUnits containing the checked donor fault must retain a selected edit: '
+                      + json.dumps(sorted(affected_fault_units(self.accepted_impact, self.controller.units)))
                       if reused_impact else 'Use your usual impact analysis in the impact field.')
         scope_feedback = ('\nCorrect the rejected backend plan below within the unchanged grounded locations. '
                           'A read-only unit needs no edits entry. Return the requested scope schema; '
@@ -505,9 +524,25 @@ name the permitted boundary; the wider quoted range is context.
         if impact_only:
             child.record['status'] = 'AFFECTED'
             return False
+        required = affected_fault_units(impact, controller.units)
         verified_no_edit = {}
         try:
             assessment, ids = select_edits(self.location, response)
+            missing = required - ids
+            if missing:
+                with_edit_anchor = {unit['id'] for unit in self.location['units']
+                                    if any(target['action'] == 'edit' for target in unit['targets'])}
+                no_edit_anchor = missing - with_edit_anchor
+                if no_edit_anchor:
+                    gaps = [{'unit_id': unit_id,
+                             'error': 'the confirmed donor fault has no writable target location'}
+                            for unit_id in sorted(no_edit_anchor)]
+                    existing = controller.record.setdefault('location_gaps', [])
+                    messages = [entry['error'] for entry in existing]
+                    existing.extend(gaps)
+                    messages.append('missing edit locations for confirmed donor fault: '
+                                    + ', '.join(sorted(no_edit_anchor)))
+                    raise AssessmentError(' / '.join(messages))
             if not ids:
                 gaps = [entry['error'] for entry in controller.record.get('location_gaps', [])]
                 raise AssessmentError(' / '.join(response['location_gaps'] or gaps) or
@@ -515,6 +550,9 @@ name the permitted boundary; the wider quoted range is context.
             obligations = {row['id']: row for row in controller.guarded_obligations}
             # A verified no-edit support unit is not a missing target location.
             verified_no_edit = ground_flag_support(controller, response.get('flag_cleanup_support', []), ids)
+            if missing:
+                raise BackendEditSelectionError('edits must retain every confirmed donor fault unit: '
+                                                + ', '.join(sorted(missing)), '/edits')
             repair = ground_repair_contract(controller, {row['id']: row for row in assessment['units']},
                                             obligations, response['repair_obligations'], '/repair_obligations')
         except (BackendEditSelectionError, RepairContractError) as exc:
@@ -558,6 +596,8 @@ name the permitted boundary; the wider quoted range is context.
             child.record['location_gaps'] = self.location_gaps
         controller.record['stage'] = 'MIGRATION'
         child.mechanical_hunk_ids = ids
+        child.record['required_affected_units'] = sorted(required)
+        controller.record['required_affected_units'] = sorted(required)
         controller._save()
         return assessment
 

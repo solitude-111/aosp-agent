@@ -303,7 +303,7 @@ class LocationHandoffTest(unittest.TestCase):
                 receipt = {'status': 'READY', 'targets': pins, 'unmapped_units': ['f002-h001']}
                 record = {'location_handoff': receipt, 'impact_analysis': {'status': 'CONFIRMED'}}
                 controller = SimpleNamespace(record=record, grounded_location=located,
-                                             guarded_obligations=[], _save=lambda: None)
+                                             guarded_obligations=[], units=[], _save=lambda: None)
                 handoff = object.__new__(BackendHandoff)
                 handoff.controller = controller
                 handoff.location = located
@@ -331,6 +331,31 @@ class LocationHandoffTest(unittest.TestCase):
                     report['repair_obligations'] = []
                     self.assertTrue(handoff.accept(child, report['impact'], report, impact_only=False))
                     self.assertEqual(handoff.flag_support, flags)
+
+    def test_read_only_replan_cannot_drop_a_confirmed_fault(self):
+        with GitFixture() as fx:
+            located = location()
+            located['units'][0]['targets'][0]['action'] = 'read_dependency'
+            outcome, calls, _ = self.execute(fx, impact_reply(fx, 'AFFECTED'), located=located)
+            self.assertEqual(outcome['impact_decision'], 'AFFECTED')
+            stopped = json.loads(Path(outcome['final_round_record']).read_text())
+            self.assertEqual(stopped['completion_blocked_by'], 'MIGRATION_SCOPE_UNRESOLVED')
+            self.assertIn('missing edit locations for confirmed donor fault: f001-h001', stopped['migration_scope_error'])
+            self.assertFalse(outcome.get('patches'))
+            self.assertTrue(all(call['read_only'] for call in calls))
+
+    def test_candidate_cannot_claim_confirmed_fault_needs_no_patch(self):
+        with GitFixture() as fx:
+            response = impact_reply(fx, 'AFFECTED', [{'unit_id': 'f001-h001', 'target_indices': [1]}])
+            outcome, _, _ = self.execute(fx, response, extras=[
+                ('HUNK-RESULT f001-h001 need_not_ported evidence=already_present', write_counter(FIXED)),
+            ])
+            self.assertEqual(outcome['delivery_status'], 'BLOCKED')
+            record = Path(outcome['final_round_record']).parent / 'repositories/repo/run.json'
+            child = json.loads(record.read_text())
+            self.assertEqual(child['status'], 'VALIDATION_FAILED')
+            self.assertTrue(any('confirmed donor fault requires a covered target edit' in str(e)
+                                for e in child['events']))
 
     def test_resume_reuses_the_checked_backend_impact_receipt(self):
         with GitFixture() as fx:

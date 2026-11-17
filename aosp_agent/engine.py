@@ -749,6 +749,9 @@ class AospBackportAgent(CausalityChecks):
             if claim["id"] not in hunks:
                 contradictions.append(f"unknown hunk id: {claim['id']}")
             elif claim["status"] == "need_not_ported":
+                if claim['id'] in getattr(self, 'record', {}).get('required_affected_units', ()):
+                    contradictions.append(f"{claim['id']}: confirmed donor fault requires a covered target edit")
+                    continue
                 evidence = self._exclusion_evidence(claim, hunks.get(claim["id"]))
                 claim["reason"] = evidence.get("reason", claim["reason"])
                 if not evidence["ok"]:
