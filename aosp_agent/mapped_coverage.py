@@ -538,6 +538,9 @@ implementation, path or ordering. For COVERED use candidate_lines from added_exe
 changed_field_lines or changed_signature_lines, or cite removed_baseline_lines from the actual
 baseline removal. Check that changed signatures agree across definitions, declarations, test
 replacements and callers, including the behavior of omitted or default arguments.
+If the baseline rejected access when a security registration was absent or cleared, trace that
+path in the candidate. Distinguish an explicitly registered zero mask from missing state. Keep
+the verdict UNRESOLVED if the old rejection has no evidenced counterpart.
 A removed statement must close the faulty path, and a field must be used by the bound state
 producer and consumer. Follow the related edits to verify both.
 For each C++ region, context_index selects the 1-based entry in shared_cpp_context.
