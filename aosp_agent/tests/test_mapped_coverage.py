@@ -41,19 +41,25 @@ class CppEquivalentCoverageTest(unittest.TestCase):
         store = 'void attach_shared_state() {\n  write_global_state();\n}\n'
         unit = {'id': hunk['id'], 'status': 'AFFECTED', 'invariant': 'Keep state connection-specific.',
                 'targets': [region, dependency]}
-        for mode in ('covered', 'unresolved', 'remap', 'bad_scope_citation', 'bad_citation', 'comment_only'):
+        for mode in ('covered', 'unresolved', 'remap', 'bad_scope_citation', 'bad_citation',
+                     'comment_only', 'removed', 'bad_removed_line'):
             with self.subTest(mode=mode), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 after = before.replace('  attach_shared_state();',
                     '  // no functional change\n  attach_shared_state();' if mode == 'comment_only'
                     else '  attach_private_state();')
+                removed = mode in ('removed', 'bad_removed_line')
+                if removed:
+                    after = before.replace('  attach_shared_state();\n', '')
                 (root / path).write_text(after)
                 candidate = diff(path, before, after)
                 verdict = 'UNRESOLVED' if mode in ('unresolved', 'remap', 'bad_scope_citation') else 'COVERED'
                 review = {'regions': [{'id': hunk['id'] + ':1', 'verdict': verdict,
                     'reason': 'State effect must be established from source.',
-                    'candidate_lines': [] if verdict == 'UNRESOLVED' else
+                    'candidate_lines': [] if removed or verdict == 'UNRESOLVED' else
                                        [1 if mode == 'bad_citation' else 2]}]}
+                if removed:
+                    review['regions'][0]['removed_baseline_lines'] = [1 if mode == 'bad_removed_line' else 2]
                 if mode in ('remap', 'bad_scope_citation'):
                     review['regions'][0]['needed_target_citations'] = [1, 2, 3]
                 runtime = QueueRuntime([(review, None)])
@@ -85,7 +91,7 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                 agent._json = lambda *args: None
                 ledger = agent._check_hunk_results(f'HUNK-RESULT {hunk["id"]} implemented substitute',
                                                    [path], candidate, review_mapped=True)
-                self.assertEqual(ledger['ok'], mode == 'covered', ledger['feedback'])
+                self.assertEqual(ledger['ok'], mode in ('covered', 'removed'), ledger['feedback'])
                 result = ledger['claims'][0]['target_evidence']['regions'][0]
                 hints = result.get('reconsider_locations', [])
                 self.assertEqual([h['path'] for h in hints], ['repo/store.cc'] if mode == 'remap' else [])
@@ -94,6 +100,28 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                 if runtime.calls:
                     self.assertTrue(runtime.calls[0]['read_only'])
                     self.assertIn('cpp_equivalent_direct_edit', runtime.calls[0]['prompt'])
+
+    def test_cpp_field_evidence_requires_a_real_change_in_the_named_record(self):
+        from aosp_agent.mapped_coverage import _cpp_equivalent_evidence
+        before = 'typedef struct {\n  int mode;\n} Port;\n'
+        region = {'symbol': 'Port', 'line_start': 2, 'line_end': 3,
+                  'relationship': 'data_or_configuration'}
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            agent = SimpleNamespace(worktree=root, _artifact_baseline_text=lambda path: before,
+                record={'assessment': {'evidence': [], 'causal_chain': {'target_fault_state': 'Shared state.'}}})
+            path = 'port.h'
+            for change, expected in [('  int mode;\n  int security_mode;', [3]),
+                                     ('  int mode;  // comment', [])]:
+                after = before.replace('  int mode;', change)
+                (root / path).write_text(after)
+                detail, error = _cpp_equivalent_evidence(agent, path, split_hunks(diff(path, before, after)), region)
+                if expected:
+                    self.assertIsNone(error)
+                    self.assertEqual(detail['changed_field_lines'], expected)
+                else:
+                    self.assertIsNone(detail)
+                    self.assertIn('changed statement or field', error)
 
 
 class MappedCoverageTest(unittest.TestCase):

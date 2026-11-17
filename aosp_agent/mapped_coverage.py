@@ -22,6 +22,7 @@ REVIEW_SCHEMA = obj({'regions': array(obj({
 }))})
 REVIEW_SCHEMA['properties']['regions']['items']['properties']['state_evidence'] = array(LINE)
 REVIEW_SCHEMA['properties']['regions']['items']['properties']['needed_target_citations'] = array(LINE)
+REVIEW_SCHEMA['properties']['regions']['items']['properties']['removed_baseline_lines'] = array(LINE)
 MAX_CONTEXT = 48 * 1024
 STATEMENTS = {'if_statement', 'return_statement', 'throw_statement',
               'expression_statement', 'local_variable_declaration'}
@@ -244,7 +245,7 @@ def _member_evidence(before, after, blocks, region):
 
 
 def _cpp_equivalent_evidence(agent, path, hunks, region):
-    """Anchor a C++ substitute to changed executable code in one pinned function."""
+    """Anchor a C++ substitute to semantic changes in one pinned declaration."""
     from .activation_binding import declarator_name, parse_source
 
     baseline = agent._artifact_baseline_text(path)
@@ -257,34 +258,65 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
     _, after = parse_source(path, edited)
     start, end = region['line_start'], region['line_end']
     name = region['symbol'].split('(', 1)[0].rsplit('::', 1)[-1].strip()
+    field_mapping = region.get('relationship') == 'data_or_configuration'
 
-    def functions(tree):
-        return [node for node in walk(tree.root_node) if node.type == 'function_definition'
-                and not node.has_error and declarator_name(node.child_by_field_name('declarator')) == name]
+    def declarations(tree):
+        for node in walk(tree.root_node):
+            if node.has_error:
+                continue
+            if field_mapping:
+                if node.type == 'type_definition' and txt(node.child_by_field_name('declarator')) == name:
+                    node = node.child_by_field_name('type')
+                elif txt(node.child_by_field_name('name')) != name:
+                    continue
+                if node.type in ('struct_specifier', 'class_specifier') and node.child_by_field_name('body'):
+                    yield node
+            elif (node.type == 'function_definition'
+                  and declarator_name(node.child_by_field_name('declarator')) == name):
+                yield node
 
     # Work in UTF-8 byte offsets, as used by Tree-sitter's nodes.
     old_lines = [0, *(match.end() for match in re.finditer(b'\n', baseline.encode()))]
     new_lines = [0, *(match.end() for match in re.finditer(b'\n', edited.encode()))]
-    old = [node for node in functions(before)
+    old = [node for node in declarations(before)
            if bisect_right(old_lines, node.start_byte) <= start <= end
            <= bisect_right(old_lines, node.end_byte - 1)]
     if len(old) != 1:
-        return None, 'C++ equivalent repair needs one named function within the pinned edit region'
+        return None, 'C++ equivalent repair needs a uniquely named declaration enclosing the pinned edit region'
     signature = compact(old[0].child_by_field_name('declarator'))
-    fixed = [node for node in functions(after) if compact(node.child_by_field_name('declarator')) == signature]
+    fixed = [node for node in declarations(after)
+             if node.type == old[0].type and compact(node.child_by_field_name('declarator')) == signature]
     if len(fixed) != 1:
-        return None, 'C++ candidate does not retain a uniquely matching function signature'
-    changed = {row['new_line'] for hunk in hunks for first, last, rows in change_blocks(hunk['patch'])
-               if start <= first <= last <= end for row in rows if row['marker'] == '+'}
+        return None, 'C++ candidate does not retain a uniquely matching declaration'
+    changed_rows = [row for hunk in hunks for first, last, rows in change_blocks(hunk['patch'])
+                    if start <= first <= last <= end for row in rows]
+    added = {row['new_line'] for row in changed_rows if row['marker'] == '+'}
+    removed = {row['old_line'] for row in changed_rows if row['marker'] == '-'}
     executable = {'expression_statement', 'return_statement', 'if_statement', 'switch_statement',
                   'for_statement', 'while_statement', 'throw_statement', 'declaration'}
-    lines = sorted({line for node in walk(fixed[0].child_by_field_name('body'))
-                    if node.type in executable and not node.has_error
-                    for line in (bisect_right(new_lines, node.start_byte),) if line in changed})
-    if not lines:
-        return None, 'C++ equivalent repair needs changed executable statements inside its mapped function'
+
+    def relevant(declaration):
+        body = declaration.child_by_field_name('body')
+        if field_mapping:
+            return [node for node in body.named_children if node.type == 'field_declaration' and not node.has_error]
+        return [node for node in walk(body) if node.type in executable and not node.has_error]
+
+    old_nodes, new_nodes = relevant(old[0]), relevant(fixed[0])
+    old_counts = Counter(map(compact, old_nodes))
+    new_counts = Counter(map(compact, new_nodes))
+    added_lines = sorted({line for node in new_nodes if new_counts[compact(node)] > old_counts[compact(node)]
+                          for line in (bisect_right(new_lines, node.start_byte),) if line in added})
+    removed_lines = sorted({
+        first for node in old_nodes if old_counts[compact(node)] > new_counts[compact(node)]
+        for first in (bisect_right(old_lines, node.start_byte),)
+        if set(range(first, bisect_right(old_lines, node.end_byte - 1) + 1)) <= removed
+    })
+    if not added_lines and not removed_lines:
+        return None, 'C++ equivalent repair needs a changed statement or field inside its mapped declaration'
     impact = agent.record['assessment']
-    return {'kind': 'cpp_equivalent_direct_edit', 'added_executable_lines': lines,
+    return {'kind': 'cpp_equivalent_direct_edit', 'added_executable_lines': added_lines if not field_mapping else [],
+            'changed_field_lines': added_lines if field_mapping else [],
+            'removed_baseline_lines': removed_lines,
             'baseline': {'first_line': bisect_right(old_lines, old[0].start_byte), 'excerpt': txt(old[0])},
             'candidate': {'first_line': bisect_right(new_lines, fixed[0].start_byte), 'excerpt': txt(fixed[0])},
             'target_fault': impact['causal_chain']['target_fault_state'],
@@ -313,8 +345,10 @@ def collect_regions(agent, claims, candidate_patch):
             candidate_hunks = [h for h in hunks if h['path'] == path]
             tracked = getattr(agent, 'record', {})
             cpp_equivalent = (
-                Path(path).suffix in ('.cc', '.cpp', '.cxx')
-                and region['relationship'] in ('same_function', 'renamed', 'moved', 'caller', 'dependency')
+                (Path(path).suffix in ('.cc', '.cpp', '.cxx')
+                 and region['relationship'] in ('same_function', 'renamed', 'moved', 'caller', 'dependency')
+                 or Path(path).suffix in ('.h', '.hpp', '.cc', '.cpp', '.cxx')
+                 and region['relationship'] == 'data_or_configuration')
                 and claim['id'] in tracked.get('required_affected_units', ())
                 and tracked.get('assessment', {}).get('scope_contract', {}).get('representation_change')
                 == 'equivalent_representation'
@@ -411,7 +445,10 @@ The absence of the donor API does not establish a fix. If state is shared, check
 lifetime, the ordering of producers and consumers, overlapping calls and alternate cleanup paths.
 A change that only clears a shared key or leaves the old behavior reachable is not sufficient.
 When the supplied source does not establish the effect, use UNRESOLVED and identify the missing
-implementation, path or ordering. For COVERED cite changed added_executable_lines as for direct_edit.
+implementation, path or ordering. For COVERED use candidate_lines from added_executable_lines
+or changed_field_lines, or cite removed_baseline_lines from the actual baseline removal.
+A removed statement must close the faulty path, and a field must be used by the bound state
+producer and consumer. Follow the related edits to verify both.
 Use related_candidate_hunks when a C++ repair spans functions. For an UNRESOLVED C++ region,
 return needed_target_citations only if fixing it requires changing code outside the current
 edit scope. Give 1-based indices in target_evidence for the actual state producer, consumer
@@ -454,7 +491,11 @@ Controller evidence:\n''' + payload + ('\n' + extra if contract else '\nUse the 
             continue
         request = by_id[row['id']]
         cited = set(row['candidate_lines'])
-        if request['kind'] in ('direct_edit', 'cpp_equivalent_direct_edit'):
+        if request['kind'] == 'cpp_equivalent_direct_edit':
+            removed = set(row.get('removed_baseline_lines') or [])
+            allowed = set(request['added_executable_lines'] + request['changed_field_lines'])
+            valid = bool(cited or removed) and cited <= allowed and removed <= set(request['removed_baseline_lines'])
+        elif request['kind'] == 'direct_edit':
             allowed = set(request['added_executable_lines'])
             valid = bool(cited) and cited <= allowed
         elif request['kind'] == 'import_edit':
