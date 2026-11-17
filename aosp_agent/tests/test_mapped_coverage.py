@@ -35,7 +35,7 @@ class CppEquivalentCoverageTest(unittest.TestCase):
         path = 'old.cc'
         hunk = split_hunks(donor)[0]
         region = {'path': 'repo/' + path, 'symbol': 'connect', 'line_start': 1, 'line_end': 3,
-                  'action': 'edit', 'relationship': 'same_function', 'reason': 'Old connection path.'}
+                  'action': 'edit', 'relationship': 'moved', 'reason': 'Old connection path.'}
         dependency = {**region, 'path': 'repo/store.cc', 'symbol': 'attach_shared_state',
                       'line_end': 2, 'action': 'read_dependency', 'relationship': 'dependency'}
         store = 'void attach_shared_state() {\n  write_global_state();\n}\n'

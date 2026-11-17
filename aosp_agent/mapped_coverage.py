@@ -314,7 +314,7 @@ def collect_regions(agent, claims, candidate_patch):
             tracked = getattr(agent, 'record', {})
             cpp_equivalent = (
                 Path(path).suffix in ('.cc', '.cpp', '.cxx')
-                and region['relationship'] in ('same_function', 'caller', 'dependency')
+                and region['relationship'] in ('same_function', 'renamed', 'moved', 'caller', 'dependency')
                 and claim['id'] in tracked.get('required_affected_units', ())
                 and tracked.get('assessment', {}).get('scope_contract', {}).get('representation_change')
                 == 'equivalent_representation'
