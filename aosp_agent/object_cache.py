@@ -12,6 +12,13 @@ import time
 import uuid
 
 
+def _touch_recent(path):
+    # Linux's implicit touch can assign the same coarse kernel timestamp to
+    # several serialized hits and writes. Record the actual clock value.
+    now = time.time_ns()
+    os.utime(path, ns=(now, now), follow_symlinks=False)
+
+
 class ObjectCache:
     def __init__(self, directory, *, max_bytes=256 * 1024 * 1024,
                  max_entry_bytes=16 * 1024 * 1024, max_entries=1024):
@@ -186,7 +193,7 @@ class ObjectCache:
                     or value['returncode'] not in ((0, 1) if args[0] == 'grep' else (0,))
                     or row['sha256'] != hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()):
                 raise ValueError('invalid cached result')
-            os.utime(path, None, follow_symlinks=False)
+            _touch_recent(path)
             return subprocess.CompletedProcess(args, **value)
         except (ValueError, KeyError, TypeError):
             path.unlink(missing_ok=True)
@@ -247,6 +254,7 @@ class ObjectCache:
                     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
                     with os.fdopen(fd, 'wb') as stream:
                         stream.write(payload)
+                    _touch_recent(temporary)
                     temporary.replace(path)
                     self.observed_bytes += len(payload)
                 finally:
