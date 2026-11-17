@@ -13,7 +13,7 @@ from .git_policy import OFFLINE_GIT_ENV
 from .hunk_scope import change_blocks
 from .java_regions import JavaSource, TYPES, TYPE_DECLARATIONS, mapped_name, method_name, owner as _owner
 from .mapping_plan import _excerpt, _shape
-from .patches import split_hunks
+from .patches import split_hunks, text_hunks
 
 
 REVIEW_SCHEMA = obj({'regions': array(obj({
@@ -487,6 +487,48 @@ def collect_regions(agent, claims, candidate_patch):
     return requests
 
 
+def _compact_cpp_review(payload):
+    """Represent duplicate excerpts through the exact scoped diff."""
+    related = payload['related_candidate_hunks']
+    for region in payload['regions']:
+        if region['kind'] != 'cpp_equivalent_direct_edit':
+            continue
+        patches = [h['patch'] for i in region['related_hunk_indices']
+                   if (h := related[i - 1])['path'] == region['mapping']['path']]
+        rows = [row for patch in patches for hunk in text_hunks(patch) for row in hunk['lines']]
+        old = {r['old_line']: r['text'] for r in rows if r['marker'] in (' ', '-')}
+        new = {r['new_line']: r['text'] for r in rows if r['marker'] in (' ', '+')}
+
+        def visible(excerpt, lines):
+            first = excerpt['first_line']
+            numbers = range(first, first + len(excerpt['excerpt'].splitlines()))
+            return (all(n in lines for n in numbers)
+                    and '\n'.join(lines[n] for n in numbers).strip() == excerpt['excerpt'].strip())
+
+        baseline, candidate = region['baseline'], region['candidate']
+        restored = baseline['excerpt'].splitlines()
+        blocks = sorted((block for patch in patches for block in change_blocks(patch)),
+                        key=lambda block: block[0], reverse=True)
+        for first, _, changed in blocks:
+            index = first - baseline['first_line']
+            if not 0 <= index < len(restored):
+                continue
+            removed = [row['text'] for row in changed if row['marker'] == '-']
+            previous = restored[index:index + len(removed)]
+            if previous == removed or index == 0 and '\n'.join(previous).strip() == '\n'.join(removed).strip():
+                restored[index:index + len(removed)] = [row['text'] for row in changed if row['marker'] == '+']
+        if visible(candidate, new) or patches and '\n'.join(restored).strip() == candidate['excerpt'].strip():
+            region['candidate'] = {'first_line': candidate['first_line'], 'from_diff': True}
+        if visible(baseline, old):
+            region['baseline'] = {'first_line': baseline['first_line'], 'from_diff': True}
+
+    for index, hunk in enumerate(related):
+        lines = hunk['patch'].splitlines(keepends=True)
+        start = next((i for i, line in enumerate(lines) if line.startswith('@@ ')), 0)
+        if start and all(line.startswith(('diff --git ', '--- ', '+++ ', 'index ')) for line in lines[:start]):
+            related[index] = {**hunk, 'patch': ''.join(lines[start:])}
+
+
 def _review_payload(requests):
     """Store shared C++ evidence once without omitting any bounded excerpts."""
     if not any(r['kind'] == 'cpp_equivalent_direct_edit' for r in requests):
@@ -509,8 +551,12 @@ def _review_payload(requests):
         region['related_hunk_indices'] = [index(related_hunks, hunk)
                                           for hunk in region.pop('related_candidate_hunks', [])]
         regions.append(region)
-    return json.dumps({'regions': regions, 'shared_cpp_context': shared_context,
-                       'related_candidate_hunks': related_hunks}, ensure_ascii=False)
+    payload = {'regions': regions, 'shared_cpp_context': shared_context, 'related_candidate_hunks': related_hunks}
+    encoded = json.dumps(payload, ensure_ascii=False)
+    if len(encoded.encode()) > MAX_CONTEXT:
+        _compact_cpp_review(payload)
+        encoded = json.dumps(payload, ensure_ascii=False, separators=(',', ':'))
+    return encoded
 
 
 def _review(agent, requests, candidate_patch, contract=()):
@@ -566,8 +612,12 @@ producer and consumer. Follow the related edits to verify both.
 For each C++ region, context_index selects the 1-based entry in shared_cpp_context.
 Read that entry's target_evidence, invariant and donor_patch. For a repair spanning functions,
 read the 1-based related_hunk_indices in the top-level related_candidate_hunks list.
+If a baseline excerpt is marked from_diff, its lines are on the old side of those hunks.
+If a candidate excerpt is marked from_diff, use the baseline and those exact diff changes.
 For verification_role=test, verify that the setup and assertions exercise the intended behavior.
 Establish the security invariant from production changes.
+Explain each region's role briefly. Give the full reason for a shared blocker once and refer
+to that region from other affected entries.
 For an UNRESOLVED C++ region,
 return needed_target_citations only if fixing it requires changing code outside the current
 edit scope. Give 1-based indices in target_evidence for the actual state producer, consumer

@@ -29,6 +29,23 @@ DONOR = diff('ModernCounter.java', 'void newer() {\n    consumeNew();\n}\n',
 
 
 class CppEquivalentCoverageTest(unittest.TestCase):
+    def test_compact_cpp_review_keeps_excerpts_missing_from_scoped_diff(self):
+        from aosp_agent.mapped_coverage import _compact_cpp_review
+        before = 'void open() {\n  use_old_mask();\n}\n'
+        after = before.replace('use_old_mask', 'use_registered_mask')
+        region = {'kind': 'cpp_equivalent_direct_edit', 'mapping': {'path': 'port.cc'},
+                  'baseline': {'first_line': 1, 'excerpt': before},
+                  'candidate': {'first_line': 1, 'excerpt': after},
+                  'related_hunk_indices': [1]}
+        alternative = {**region, 'candidate': {'first_line': 1, 'excerpt': after.replace('();', '(other_port);')}}
+        payload = {'regions': [region, alternative], 'related_candidate_hunks': [
+            {'path': 'port.cc', 'patch': diff('port.cc', before, after)}]}
+        _compact_cpp_review(payload)
+        self.assertEqual(region['candidate'], {'first_line': 1, 'from_diff': True})
+        self.assertEqual(region['baseline'], {'first_line': 1, 'from_diff': True})
+        self.assertIn('other_port', alternative['candidate']['excerpt'])
+        self.assertTrue(payload['related_candidate_hunks'][0]['patch'].startswith('@@ '))
+
     def test_cpp_change_in_read_dependency_reports_its_pinned_location(self):
         from aosp_agent.mapped_coverage import _cpp_read_dependency_changes
         path = 'port.cc'
