@@ -28,7 +28,8 @@ MODEL_CONTEXT = ContextVar('aosp_model_phase', default={})
 ACTIVE_CONTROLLER_AUDIT = ContextVar('aosp_controller_audit', default=None)
 AUDIT_GRACE_SECONDS = 120
 AUDIT_GRACE_OPERATIONS = 20000
-_AUDIT_PHASES = {'engine.audit_diff', 'diff._originals_unchanged', 'build_environment._source_snapshot'}
+_AUDIT_PHASES = {'engine.audit_diff', 'diff._originals_unchanged', 'diff._audit', 'diff._audit_peers',
+                 'build_environment._source_snapshot'}
 VERSION = 1
 DEFAULT_LIMITS = {
     'candidate_turns': 6, 'model_calls': 48, 'investigation_rounds': 3,

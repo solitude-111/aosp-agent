@@ -9,7 +9,8 @@ import time
 import unittest
 from unittest.mock import patch
 
-from aosp_agent.discovery import local_git
+from aosp_agent.diff_engine import DiffBackportAgent
+from aosp_agent.discovery import local_git, Repository
 from aosp_agent.execution_budget import (AUDIT_GRACE_OPERATIONS, ExecutionBudget,
                                         controller_audit, _audit_read_command)
 from aosp_agent.lifecycle import RecoveryBlocked
@@ -109,6 +110,29 @@ with ledger.active(), ReadBudget(ledger=ledger).active():
             state = budget.snapshot()
             self.assertEqual(state['consumed']['tool_operations'], 1)
             self.assertGreater(state['audit_grace']['operations'], 0)
+
+    def test_mapped_cleanup_finishes_ignored_file_and_peer_checks_after_tool_limit(self):
+        with GitFixture() as fixture:
+            child = AospBackportAgent(fixture.source_root, fixture.run_root, fixture.case())
+            child.prepare()
+            repo = Repository('repo', fixture.repo, fixture.target, {})
+            controller = object.__new__(DiffBackportAgent)
+            controller.repos = [repo]
+            controller.before = {'repo': repo.state()}
+            controller.protected = {}
+            controller.children = {'repo': child}
+            controller.workspace = fixture.root / 'controller-workspace'
+            before = controller._candidate_hashes(except_key='other')
+            budget = ExecutionBudget(child.run_dir, 'input', limits={'tool_operations': 1})
+            with budget.active():
+                local_git(fixture.repo, 'rev-parse', 'HEAD')
+                controller._audit_peers('other', before)
+                with self.assertRaises(BudgetExceeded):
+                    budget.admit_model()
+            state = budget.snapshot()
+            self.assertEqual(state['consumed']['tool_operations'], 1)
+            self.assertGreater(state['audit_grace']['by_phase']['diff._audit'], 0)
+            self.assertGreater(state['audit_grace']['by_phase']['diff._audit_peers'], 0)
 
     def test_grace_deadline_and_command_count_survive_resume_without_renewal(self):
         with GitFixture() as fixture:

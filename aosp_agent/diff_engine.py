@@ -269,11 +269,13 @@ class DiffBackportAgent:
         return {key: hashlib.sha256(child._render_patch().encode()).hexdigest()
                 for key, child in self.children.items() if key != except_key}
 
+    @controller_audit('diff._audit_peers')
     def _audit_peers(self, key, before):
         self._audit()
         if self._candidate_hashes(except_key=key) != before:
             raise RuntimeError('repository turn modified another candidate: ' + key)
 
+    @controller_audit('diff._audit')
     def _audit(self, validation_pins=None):
         for path, digest in self.protected.items():
             if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
