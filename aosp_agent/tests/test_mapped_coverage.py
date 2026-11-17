@@ -29,6 +29,23 @@ DONOR = diff('ModernCounter.java', 'void newer() {\n    consumeNew();\n}\n',
 
 
 class CppEquivalentCoverageTest(unittest.TestCase):
+    def test_cpp_change_in_read_dependency_reports_its_pinned_location(self):
+        from aosp_agent.mapped_coverage import _cpp_read_dependency_changes
+        path = 'port.cc'
+        before = 'void connect() { open(); }\nvoid open() { store(); }\n'
+        after = before.replace('store();', 'store_private();')
+        agent = SimpleNamespace(mapping_repository='repo', _artifact_baseline_text=lambda _: before)
+        edit = {'path': path, 'line_start': 1, 'line_end': 1, 'action': 'edit'}
+        dependency = {'path': path, 'line_start': 2, 'line_end': 2, 'symbol': 'open',
+                      'action': 'read_dependency'}
+        hunks = split_hunks(diff(path, before, after))
+        gaps = _cpp_read_dependency_changes(agent, 'f001-h001', path, hunks, [edit, dependency], [edit])
+        gap, = gaps
+        self.assertEqual((gap['path'], gap['symbol'], gap['line_start']), ('repo/port.cc', 'open', 2))
+        self.assertEqual(gap['excerpt'], before.splitlines()[1])
+        self.assertEqual(_cpp_read_dependency_changes(agent, 'f001-h001', path, hunks,
+            [edit, dependency], [edit, {**dependency, 'action': 'edit'}]), [])
+
     def test_cpp_regions_share_identical_evidence_without_losing_region_references(self):
         from aosp_agent.mapped_coverage import _review_payload
         shared = {'kind': 'cpp_equivalent_direct_edit', 'target_fault': 'Shared state.',

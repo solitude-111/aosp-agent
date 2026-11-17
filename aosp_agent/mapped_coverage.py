@@ -323,6 +323,33 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
             'target_evidence': [entry for entry in impact['evidence'] if entry['revision'] == 'target']}, None
 
 
+def _cpp_read_dependency_changes(agent, unit_id, path, hunks, targets, edits):
+    """Find changes in pinned read dependencies outside the current edit ranges."""
+    blockers = []
+    for hunk in hunks:
+        for first, last, _ in change_blocks(hunk['patch']):
+            if any(edit['path'] == path and edit['line_start'] <= first <= last <= edit['line_end']
+                   for edit in edits):
+                continue
+            dependency = next((target for target in targets
+                               if target['action'] == 'read_dependency' and target['path'] == path
+                               and target['line_start'] <= first <= last <= target['line_end']), None)
+            if dependency is None:
+                continue
+            baseline = agent._artifact_baseline_text(path)
+            if baseline is None:
+                continue
+            excerpt_end = min(last, first + 7)
+            blockers.append({'unit_id': unit_id, 'path': f'{agent.mapping_repository}/{path}',
+                             'symbol': dependency['symbol'], 'line_start': first, 'line_end': excerpt_end,
+                             'excerpt': '\n'.join(baseline.splitlines()[first - 1:excerpt_end]),
+                             'error': 'The candidate changes a grounded read dependency outside its edit ranges. '
+                                      'Recheck whether the confirmed repair needs this code to be writable.'})
+            if len(blockers) == 4:
+                return blockers
+    return blockers
+
+
 def collect_regions(agent, claims, candidate_patch):
     """Return structurally grounded review inputs and update precise ledger blockers."""
     plan = agent.mapping_plan
@@ -331,12 +358,14 @@ def collect_regions(agent, claims, candidate_patch):
     units = {unit['id']: unit for unit in mapped['units']}
     donors = {hunk['id']: hunk for hunk in agent._current_hunks}
     cache, requests = {}, []
+    edits = [row for row in plan.targets(agent.mapping_repository)
+             if row['action'] == 'edit' and row['status'] == 'AFFECTED']
     for claim in claims:
         evidence = claim.get('target_evidence')
         if not evidence or evidence['ok']:
             continue
-        mappings = [row for row in plan.targets(agent.mapping_repository, unit_id=claim['id'])
-                    if row['action'] == 'edit' and row['status'] == 'AFFECTED']
+        targets = plan.targets(agent.mapping_repository, unit_id=claim['id'])
+        mappings = [row for row in edits if row['unit_id'] == claim['id']]
         for index, (region, row) in enumerate(zip(mappings, evidence.get('regions', [])), 1):
             row['mapping'] = region
             if row['ok'] or 'site_binding' in row or 'site_evidence' in row or 'control_flow_obligations' in row:
@@ -362,6 +391,10 @@ def collect_regions(agent, claims, candidate_patch):
                     continue
                 before, after, blocks = cache[path]
             if cpp_equivalent:
+                gaps = _cpp_read_dependency_changes(agent, claim['id'], path, candidate_hunks, targets, edits)
+                if gaps:
+                    row.update(reconsider_locations=gaps, error=gaps[0]['error'])
+                    continue
                 detail, error = _cpp_equivalent_evidence(agent, path, candidate_hunks, region)
                 if detail:
                     # Show other changed portions of this unit's admitted
