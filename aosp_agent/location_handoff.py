@@ -469,6 +469,8 @@ class BackendHandoff:
         self.accepted_impact = seed.get('assessment')
         self.impact_challenge = seed.get('challenge')
         self.scope_feedback = seed.get('scope_feedback') if self.accepted_impact is not None else None
+        self.coverage_feedback = (seed.get('coverage_feedback', [])[:8]
+                                  if self.accepted_impact is not None else [])
         if self.impact_challenge:
             controller.record['impact_recheck'] = {'units': [item['id'] for item in self.impact_challenge]}
 
@@ -529,9 +531,18 @@ the donor delta and target flag references. Return an empty array for either fie
 when it does not apply.
 Select a member_insertion only if a new target member is required. Its insertion_lines
 name the permitted boundary; the wider quoted range is context.
-''' + '\n' + assessment + scope_feedback + challenge + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
+''' + '\n' + assessment + scope_feedback + challenge + self.coverage_feedback_prompt()
+                + '\nGrounded locations: ' + json.dumps(self.location, ensure_ascii=False)
                 + '\nUnverified location gaps: ' + json.dumps(self.controller.record.get('location_gaps', []), ensure_ascii=False)
                 + '\nGuarded obligations: ' + json.dumps(self.controller.guarded_obligations, ensure_ascii=False))
+
+    def coverage_feedback_prompt(self):
+        if not self.coverage_feedback:
+            return ''
+        return ('\nThe previous candidate did not establish the behaviors below. Recheck the cited '
+                'state writes, consumers and ordering using pinned source. Use these diagnostics '
+                'to correct the edit plan or report a grounded location gap.\n'
+                + json.dumps(self.coverage_feedback, ensure_ascii=False))
 
     def accept(self, child, impact, response, *, impact_only):
         from .exclusion_review import (ExclusionCounterpartChallenge, ExclusionReviewError,

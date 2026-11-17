@@ -1635,6 +1635,8 @@ class AospBackportAgent(CausalityChecks):
                 base_prompt += ('\nThe controller verified these donor flag cleanups have no target counterpart. '
                                 'Use evidence=no_target_counterpart for the listed units if they require no edit.\n'
                                 + json.dumps(handoff.flag_support, ensure_ascii=False))
+            if handoff:
+                base_prompt += handoff.coverage_feedback_prompt()
             if handoff and handoff.location_gaps:
                 base_prompt += ('\nWrite a draft for the pinned edit obligations only. Do not guess at these '
                                 'unresolved locations: ' + json.dumps(handoff.location_gaps, ensure_ascii=False))

@@ -456,12 +456,14 @@ def _review(agent, requests, candidate_patch, contract=()):
     from .sdk_runtime import CodexRuntime
     factory = agent.runtime_factory or CodexRuntime
     scope = agent.model_scope(read_only=True)
-    if (contract or any(r['kind'] == 'cpp_equivalent_direct_edit' for r in requests)) and scope is not None:
+    cpp_regions = sum(r['kind'] == 'cpp_equivalent_direct_edit' for r in requests)
+    if (contract or cpp_regions) and scope is not None:
         from dataclasses import replace
         scope = replace(scope, tool_readable=(), tool_context=None, tool_repositories={})
+    review_timeout = 480 if contract else min(480, 180 + 60 * max(0, cpp_regions - 1))
     try:
         with factory(events_path=agent.run_dir / 'sdk-mapped-coverage.jsonl', model=agent.model,
-                     model_provider=agent.model_provider, turn_timeout=min(480 if contract else 180, agent.turn_timeout),
+                     model_provider=agent.model_provider, turn_timeout=min(review_timeout, agent.turn_timeout),
                      env=OFFLINE_GIT_ENV, read_scope=scope) as runtime:
             runtime.start(agent.worktree, 'Independently review candidate coverage. Strictly read only.')
             result = runtime.run('''Review every region in the controller evidence below. Use only the supplied snippets.

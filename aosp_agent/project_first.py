@@ -433,6 +433,9 @@ class ProjectFirstAgent:
                     location_seed = self.resumed_assessment.get('location')
                     location_feedback = (feedback or None) if location_seed else None
                     backend_impact_seed = self.resumed_assessment.get('backend_impact')
+                    if backend_impact_seed and feedback.get('coverage_blockers'):
+                        backend_impact_seed = {**backend_impact_seed,
+                                               'coverage_feedback': feedback['coverage_blockers']}
                     scope_feedback = (backend_scope_feedback(feedback, location_seed,
                         feedback.get('location_handoff', {}), self.resumed_assessment['targets'])
                         if backend_impact_seed else None)
@@ -552,6 +555,8 @@ class ProjectFirstAgent:
                         if hashlib.sha256(path.read_bytes()).hexdigest() != confirmed['assessment_sha256']:
                             raise RecoveryBlocked('backend impact changed after grounding')
                         backend_impact_seed = {'targets': confirmed['targets'], 'assessment': json.loads(path.read_text())}
+                        if feedback.get('coverage_blockers'):
+                            backend_impact_seed['coverage_feedback'] = feedback['coverage_blockers']
                         scope_feedback = backend_scope_feedback(result, location_seed,
                             result.get('location_handoff', {}), pins)
                         if scope_feedback is not None:

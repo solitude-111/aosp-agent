@@ -295,6 +295,23 @@ class LocationHandoffTest(unittest.TestCase):
             record = Path(outcome['final_round_record']).parent / 'repositories/repo/run.json'
             self.assertTrue(json.loads(record.read_text())['backend_impact_reused'])
 
+    def test_checked_candidate_diagnostic_reaches_planning_and_migration(self):
+        with GitFixture() as fx:
+            response = impact_reply(fx, 'AFFECTED', [{'unit_id': 'f001-h001', 'target_indices': [1]}])
+            impact = response.pop('impact')
+            targets = {'repo': fx.target}
+            error = 'The existing consumer can run before the guarded state write.'
+            seed = {'targets': targets, 'location': location(), 'revalidate': True,
+                    'backend_impact': {'assessment': impact, 'targets': targets},
+                    'feedback': {'coverage_blockers': [{'unit_id': 'f001-h001', 'error': error}]}}
+            outcome, calls, _ = self.execute(fx, response,
+                agent_options={'resumed_assessment': seed}, extras=[
+                    ('HUNK-RESULT f001-h001 implemented evidence=ordinary Fixed.', write_counter(FIXED))])
+            self.assertEqual(outcome['status'], 'PATCH_UNVERIFIED', outcome)
+            self.assertEqual([call['read_only'] for call in calls], [True, True, False])
+            for call in calls:
+                self.assertIn(error, call['prompt'])
+
     def test_bad_repair_contract_retries_only_plan_with_verified_no_edit_support(self):
         from aosp_agent.location_handoff import BackendHandoff, backend_scope_feedback
 
