@@ -1,10 +1,12 @@
 """Candidate-side proof for Java mappings whose donor spelling does not survive."""
+from bisect import bisect_right
 from collections import Counter
 import hashlib
 import json
+from pathlib import Path
 import re
 
-from .activation_flow import branches, literal_truth, ts_key, txt, walk
+from .activation_flow import branches, compact, literal_truth, ts_key, txt, walk
 from .diff_prompts import LINE, STRING, array, enum, obj
 from .engine import AssessmentError
 from .git_policy import OFFLINE_GIT_ENV
@@ -240,6 +242,54 @@ def _member_evidence(before, after, blocks, region):
             'candidate_lines': [m['first_line'] for m in members]}, None
 
 
+def _cpp_equivalent_evidence(agent, path, hunks, region):
+    """Anchor a C++ substitute to changed executable code in one pinned function."""
+    from .activation_binding import declarator_name, parse_source
+
+    baseline = agent._artifact_baseline_text(path)
+    candidate = agent.worktree / path
+    if (baseline is None or candidate.is_symlink() or not candidate.is_file()
+            or candidate.stat().st_size > 4 * 1024 * 1024):
+        return None, 'bounded baseline and candidate C++ source is required'
+    edited = candidate.read_text()
+    _, before = parse_source(path, baseline)
+    _, after = parse_source(path, edited)
+    start, end = region['line_start'], region['line_end']
+    name = region['symbol'].split('(', 1)[0].rsplit('::', 1)[-1].strip()
+
+    def functions(tree):
+        return [node for node in walk(tree.root_node) if node.type == 'function_definition'
+                and not node.has_error and declarator_name(node.child_by_field_name('declarator')) == name]
+
+    # Work in UTF-8 byte offsets, as used by Tree-sitter's nodes.
+    old_lines = [0, *(match.end() for match in re.finditer(b'\n', baseline.encode()))]
+    new_lines = [0, *(match.end() for match in re.finditer(b'\n', edited.encode()))]
+    old = [node for node in functions(before)
+           if bisect_right(old_lines, node.start_byte) <= start <= end
+           <= bisect_right(old_lines, node.end_byte - 1)]
+    if len(old) != 1:
+        return None, 'C++ equivalent repair needs one named function within the pinned edit region'
+    signature = compact(old[0].child_by_field_name('declarator'))
+    fixed = [node for node in functions(after) if compact(node.child_by_field_name('declarator')) == signature]
+    if len(fixed) != 1:
+        return None, 'C++ candidate does not retain a uniquely matching function signature'
+    changed = {row['new_line'] for hunk in hunks for first, last, rows in change_blocks(hunk['patch'])
+               if start <= first <= last <= end for row in rows if row['marker'] == '+'}
+    executable = {'expression_statement', 'return_statement', 'if_statement', 'switch_statement',
+                  'for_statement', 'while_statement', 'throw_statement', 'declaration'}
+    lines = sorted({line for node in walk(fixed[0].child_by_field_name('body'))
+                    if node.type in executable and not node.has_error
+                    for line in (bisect_right(new_lines, node.start_byte),) if line in changed})
+    if not lines:
+        return None, 'C++ equivalent repair needs changed executable statements inside its mapped function'
+    impact = agent.record['assessment']
+    return {'kind': 'cpp_equivalent_direct_edit', 'added_executable_lines': lines,
+            'baseline': {'first_line': bisect_right(old_lines, old[0].start_byte), 'excerpt': txt(old[0])},
+            'candidate': {'first_line': bisect_right(new_lines, fixed[0].start_byte), 'excerpt': txt(fixed[0])},
+            'target_fault': impact['causal_chain']['target_fault_state'],
+            'target_evidence': [entry for entry in impact['evidence'] if entry['revision'] == 'target']}, None
+
+
 def collect_regions(agent, claims, candidate_patch):
     """Return structurally grounded review inputs and update precise ledger blockers."""
     plan = agent.mapping_plan
@@ -259,14 +309,25 @@ def collect_regions(agent, claims, candidate_patch):
             if row['ok'] or 'site_binding' in row or 'site_evidence' in row or 'control_flow_obligations' in row:
                 continue  # Keep exact donor-site contradictions authoritative.
             path = region['path']
-            if path not in cache:
-                cache[path] = _parse_path(agent, path, [h for h in hunks if h['path'] == path])
-            if cache[path] is None:
-                continue
-            before, after, blocks = cache[path]
+            candidate_hunks = [h for h in hunks if h['path'] == path]
+            tracked = getattr(agent, 'record', {})
+            cpp_equivalent = (
+                Path(path).suffix in ('.cc', '.cpp', '.cxx') and region['relationship'] == 'same_function'
+                and claim['id'] in tracked.get('required_affected_units', ())
+                and tracked.get('assessment', {}).get('scope_contract', {}).get('representation_change')
+                == 'equivalent_representation'
+            )
             request = {'id': f"{claim['id']}:{index}", 'mapping': region,
                        'invariant': units[claim['id']]['invariant'], 'donor_patch': donors[claim['id']]['patch']}
-            if region.get('region_kind') == 'imports':
+            if not cpp_equivalent:
+                if path not in cache:
+                    cache[path] = _parse_path(agent, path, candidate_hunks)
+                if cache[path] is None:
+                    continue
+                before, after, blocks = cache[path]
+            if cpp_equivalent:
+                detail, error = _cpp_equivalent_evidence(agent, path, candidate_hunks, region)
+            elif region.get('region_kind') == 'imports':
                 detail, error = _import_evidence(before, after, [h for h in hunks if h['path'] == path],
                                                  region, donors[claim['id']]['patch'])
                 if detail and detail.pop('exact'):
@@ -323,7 +384,7 @@ def _review(agent, requests, candidate_patch, contract=()):
     from .sdk_runtime import CodexRuntime
     factory = agent.runtime_factory or CodexRuntime
     scope = agent.model_scope(read_only=True)
-    if contract and scope is not None:
+    if (contract or any(r['kind'] == 'cpp_equivalent_direct_edit' for r in requests)) and scope is not None:
         from dataclasses import replace
         scope = replace(scope, tool_readable=(), tool_context=None, tool_repositories={})
     try:
@@ -333,6 +394,12 @@ def _review(agent, requests, candidate_patch, contract=()):
             runtime.start(agent.worktree, 'Independently review candidate coverage. Strictly read only.')
             result = runtime.run('''Review every region in the controller evidence below. Use only the supplied snippets.
 For direct_edit, confirm the changed executable code implements that region's part of the invariant.
+For cpp_equivalent_direct_edit, compare the pinned target fault with the candidate's changed statements.
+The absence of the donor API does not establish a fix. If state is shared, check its ownership and
+lifetime, the ordering of producers and consumers, overlapping calls and alternate cleanup paths.
+A change that only clears a shared key or leaves the old behavior reachable is not sufficient.
+When the supplied source does not establish the effect, use UNRESOLVED and identify the missing
+implementation, path or ordering. For COVERED cite changed added_executable_lines as for direct_edit.
 For import_edit, compare every donor import change with the actual added/removed declarations.
 Confirm any different import binds the API needed by the target repair. Unrelated declarations
 do not count. For COVERED cite the first_line of every listed added import, or an empty list for
@@ -370,7 +437,7 @@ Controller evidence:\n''' + payload + ('\n' + extra if contract else '\nUse the 
             continue
         request = by_id[row['id']]
         cited = set(row['candidate_lines'])
-        if request['kind'] == 'direct_edit':
+        if request['kind'] in ('direct_edit', 'cpp_equivalent_direct_edit'):
             allowed = set(request['added_executable_lines'])
             valid = bool(cited) and cited <= allowed
         elif request['kind'] == 'import_edit':

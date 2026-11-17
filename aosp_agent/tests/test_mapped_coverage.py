@@ -27,6 +27,60 @@ DONOR = diff('ModernCounter.java', 'void newer() {\n    consumeNew();\n}\n',
              'void newer() {\n    if (freshPolicy) { return; }\n    consumeNew();\n}\n')
 
 
+class CppEquivalentCoverageTest(unittest.TestCase):
+    def test_cpp_substitute_requires_changed_code_and_an_independent_verdict(self):
+        before = 'void connect() {\n  attach_shared_state();\n}\n'
+        donor = diff('modern.cc', 'void modern() {\n  store_modern_global_mode();\n}\n',
+                     'void modern() {\n}\n')
+        path = 'old.cc'
+        hunk = split_hunks(donor)[0]
+        region = {'path': 'repo/' + path, 'symbol': 'connect', 'line_start': 1, 'line_end': 3,
+                  'action': 'edit', 'relationship': 'same_function', 'reason': 'Old connection path.'}
+        unit = {'id': hunk['id'], 'status': 'AFFECTED', 'invariant': 'Keep state connection-specific.',
+                'targets': [region]}
+        for mode in ('covered', 'unresolved', 'bad_citation', 'comment_only'):
+            with self.subTest(mode=mode), TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                after = before.replace('  attach_shared_state();',
+                    '  // no functional change\n  attach_shared_state();' if mode == 'comment_only'
+                    else '  attach_private_state();')
+                (root / path).write_text(after)
+                candidate = diff(path, before, after)
+                verdict = 'UNRESOLVED' if mode == 'unresolved' else 'COVERED'
+                review = {'regions': [{'id': hunk['id'] + ':1', 'verdict': verdict,
+                    'reason': 'State effect must be established from source.',
+                    'candidate_lines': [] if verdict == 'UNRESOLVED' else
+                                       [1 if mode == 'bad_citation' else 2]}]}
+                runtime = QueueRuntime([(review, None)])
+                agent = object.__new__(AospBackportAgent)
+                agent.record = {'required_affected_units': [hunk['id']], 'assessment': {
+                    'scope_contract': {'representation_change': 'equivalent_representation'},
+                    'causal_chain': {'target_fault_state': 'The old connection uses shared state.'},
+                    'evidence': []}}
+                agent.case = SimpleNamespace(files=(path,))
+                agent._current_hunks = [hunk]
+                agent.worktree = agent.run_dir = root
+                agent.mapping_plan = MappingPlan.create({'units': [unit], 'writable_paths': ['repo/' + path]},
+                    [SimpleNamespace(key='repo', head='pinned')], [hunk], {})
+                agent.mapping_repository = 'repo'
+                agent._target_baseline_lines = lambda p: before.splitlines()
+                agent._artifact_baseline_text = lambda p: before
+                agent.runtime_factory = runtime.factory
+                agent.model = agent.model_provider = None
+                agent.turn_timeout = 10
+                agent.model_scope = lambda **kwargs: None
+                agent.audit_diff = lambda: {}
+                agent._render_patch = lambda audit: candidate
+                agent._json = lambda *args: None
+                ledger = agent._check_hunk_results(f'HUNK-RESULT {hunk["id"]} implemented substitute',
+                                                   [path], candidate, review_mapped=True)
+                self.assertEqual(ledger['ok'], mode == 'covered', ledger['feedback'])
+                self.assertEqual(len(runtime.calls), 0 if mode == 'comment_only' else 1)
+                if runtime.calls:
+                    self.assertTrue(runtime.calls[0]['read_only'])
+                    self.assertIn('cpp_equivalent_direct_edit', runtime.calls[0]['prompt'])
+
+
 class MappedCoverageTest(unittest.TestCase):
     def check(self, before, after, review, *, symbol='sink', bounds=None, relationship='same_function'):
         with TemporaryDirectory() as tmp:
