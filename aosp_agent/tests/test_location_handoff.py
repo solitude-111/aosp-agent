@@ -277,8 +277,10 @@ class LocationHandoffTest(unittest.TestCase):
             incomplete['location_gaps'] = ['Locate the normalization return statement.']
             resolved = impact_reply(fx, 'AFFECTED', [{'unit_id': 'f001-h001', 'target_indices': [1]}])
             del resolved['impact']
+            demoted = location()
+            demoted['units'][0]['targets'][0]['action'] = 'read_dependency'
             outcome, calls, scopes = self.execute(fx, incomplete, max_rounds=2, turns={
-                'sdk-location-handoff.jsonl': [(location(), None), (location(), None)],
+                'sdk-location-handoff.jsonl': [(location(), None), (demoted, None)],
             }, extras=[(resolved, None),
                        ('HUNK-RESULT f001-h001 implemented evidence=ordinary Fixed.', write_counter(FIXED))])
             self.assertEqual(outcome['status'], 'PATCH_UNVERIFIED', outcome)
@@ -288,6 +290,8 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertIn('Return only the edit scope', calls[4]['prompt'])
             self.assertIn(incomplete['impact']['reasoning'], calls[5]['prompt'])
             self.assertFalse(scopes[4][1])
+            round_record = json.loads(Path(outcome['final_round_record']).read_text())
+            self.assertEqual(round_record['retained_location_units'], ['f001-h001'])
             record = Path(outcome['final_round_record']).parent / 'repositories/repo/run.json'
             self.assertTrue(json.loads(record.read_text())['backend_impact_reused'])
 

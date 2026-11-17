@@ -1,4 +1,5 @@
 """Focused regressions for mapped candidate coverage before compilation."""
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -28,6 +29,22 @@ DONOR = diff('ModernCounter.java', 'void newer() {\n    consumeNew();\n}\n',
 
 
 class CppEquivalentCoverageTest(unittest.TestCase):
+    def test_cpp_regions_share_identical_evidence_without_losing_region_references(self):
+        from aosp_agent.mapped_coverage import _review_payload
+        shared = {'kind': 'cpp_equivalent_direct_edit', 'target_fault': 'Shared state.',
+                  'target_evidence': [{'excerpt': 'store()'}], 'invariant': 'Separate owners.',
+                  'donor_patch': 'Patch excerpt.'}
+        first = {'path': 'read.cc', 'patch': 'Read changed.'}
+        second = {'path': 'write.cc', 'patch': 'Write changed.'}
+        payload = json.loads(_review_payload([
+            {**shared, 'id': 'f001-h001:1', 'related_candidate_hunks': [first, second]},
+            {**shared, 'id': 'f001-h001:2', 'related_candidate_hunks': [second]},
+        ]))
+        self.assertEqual(len(payload['shared_cpp_context']), 1)
+        self.assertEqual(payload['shared_cpp_context'][0]['target_evidence'], shared['target_evidence'])
+        self.assertEqual(payload['related_candidate_hunks'], [first, second])
+        self.assertEqual([r['related_hunk_indices'] for r in payload['regions']], [[1, 2], [2]])
+
     def test_cpp_substitute_requires_changed_code_and_an_independent_verdict(self):
         before = 'void connect() {\n  attach_shared_state();\n}\n'
         donor = diff('modern.cc', 'void modern() {\n  store_modern_global_mode();\n}\n',

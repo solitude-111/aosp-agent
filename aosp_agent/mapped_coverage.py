@@ -406,8 +406,34 @@ def collect_regions(agent, claims, candidate_patch):
     return requests
 
 
+def _review_payload(requests):
+    """Store shared C++ evidence once without omitting any bounded excerpts."""
+    if not any(r['kind'] == 'cpp_equivalent_direct_edit' for r in requests):
+        return json.dumps(requests, ensure_ascii=False)
+    shared_context, related_hunks, regions = [], [], []
+
+    def index(entries, value):
+        if value not in entries:
+            entries.append(value)
+        return entries.index(value) + 1
+
+    shared_keys = ('target_fault', 'target_evidence', 'invariant', 'donor_patch')
+    for request in requests:
+        if request['kind'] != 'cpp_equivalent_direct_edit':
+            regions.append(request)
+            continue
+        region = dict(request)
+        context = {key: region.pop(key) for key in shared_keys}
+        region['context_index'] = index(shared_context, context)
+        region['related_hunk_indices'] = [index(related_hunks, hunk)
+                                          for hunk in region.pop('related_candidate_hunks', [])]
+        regions.append(region)
+    return json.dumps({'regions': regions, 'shared_cpp_context': shared_context,
+                       'related_candidate_hunks': related_hunks}, ensure_ascii=False)
+
+
 def _review(agent, requests, candidate_patch, contract=()):
-    payload = json.dumps(requests, ensure_ascii=False)
+    payload = _review_payload(requests)
     schema, extra = REVIEW_SCHEMA, ''
     if contract:
         from .guarded_repair import REVIEW_GUIDANCE, review_source, reviewer_schema
@@ -449,7 +475,10 @@ implementation, path or ordering. For COVERED use candidate_lines from added_exe
 or changed_field_lines, or cite removed_baseline_lines from the actual baseline removal.
 A removed statement must close the faulty path, and a field must be used by the bound state
 producer and consumer. Follow the related edits to verify both.
-Use related_candidate_hunks when a C++ repair spans functions. For an UNRESOLVED C++ region,
+For each C++ region, context_index selects the 1-based entry in shared_cpp_context.
+Read that entry's target_evidence, invariant and donor_patch. For a repair spanning functions,
+read the 1-based related_hunk_indices in the top-level related_candidate_hunks list.
+For an UNRESOLVED C++ region,
 return needed_target_citations only if fixing it requires changing code outside the current
 edit scope. Give 1-based indices in target_evidence for the actual state producer, consumer
 or other required edit site. A useful read or a missing excerpt alone is no reason to request

@@ -224,6 +224,46 @@ def _read_only_locations(controller, raw, errors):
                                          'primary_repository': primary if primary in owners else min(owners)})
 
 
+def _retain_confirmed_edits(controller, raw):
+    """Keep prior candidate locations when a replan loses every edit of a proven fault."""
+    seed = controller.backend_impact_seed or {}
+    impact = seed.get('assessment') or {}
+    targets = {repo.key: repo.head for repo in controller.repos}
+    prior = controller.location_seed
+    if (not prior or impact.get('status') != 'AFFECTED' or seed.get('targets') != targets
+            or raw['repository_requests'] or raw['primary_repository'] != prior['primary_repository']):
+        return raw, []
+    required = affected_fault_units(impact, controller.units)
+    old_units = {unit['id']: unit for unit in prior['units']}
+    units, retained = [], []
+
+    def key(target):
+        return tuple(target[field] for field in ('path', 'line_start', 'line_end', 'symbol'))
+
+    for unit in raw['units']:
+        previous = old_units.get(unit['id'])
+        if (unit['id'] not in required or previous is None
+                or any(target['action'] == 'edit' for target in unit['targets'])):
+            units.append(unit)
+            continue
+        edits = [target for target in previous['targets'] if target['action'] == 'edit']
+        if not edits:
+            units.append(unit)
+            continue
+        old_keys = {key(target) for target in edits}
+        evidence = list(unit['evidence'])
+        for citation in previous['evidence']:
+            if (citation['origin'] == 'target' and citation not in evidence
+                    and any(citation['path'] == target['path']
+                            and target['line_start'] <= citation['line_start'] <= citation['line_end'] <= target['line_end']
+                            for target in edits)):
+                evidence.append(citation)
+        units.append({**unit, 'evidence': evidence,
+                      'targets': edits + [target for target in unit['targets'] if key(target) not in old_keys]})
+        retained.append(unit['id'])
+    return {**raw, 'units': units}, retained
+
+
 def locate(controller, inventory, location, max_attempts):
     from .assessment_repair import REPAIR_SCHEMA, apply_repair, repair_prompt
     from .diff_engine import _write
@@ -283,6 +323,10 @@ Do not judge affectedness, prove a vulnerability chain, or edit files.
                 errors = []
                 _write(controller.run_dir / f'location-attempt-{attempt}.json', raw)
                 grounded = ground_locations(controller, raw, unassociated=unassociated)
+                revised, retained = _retain_confirmed_edits(controller, raw)
+                if retained:
+                    grounded = ground_locations(controller, revised)
+                    controller.record['retained_location_units'] = retained
             except AssessmentError as exc:
                 grounded = None
                 controller.record.setdefault('location_rejections', []).append(str(exc))
