@@ -259,7 +259,18 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
     start, end = region['line_start'], region['line_end']
     name = region['symbol'].split('(', 1)[0].rsplit('::', 1)[-1].strip()
     field_mapping = region.get('relationship') == 'data_or_configuration'
+    test_mapping = region.get('relationship') == 'test'
     prototype = not field_mapping and Path(path).suffix in ('.h', '.hpp')
+
+    def matches(declaration):
+        declared = declarator_name(declaration)
+        if declared == name:
+            return True
+        if test_mapping and declared in ('TEST', 'TEST_F', 'TEST_P', 'TYPED_TEST', 'TYPED_TEST_P'):
+            parameters = declaration.child_by_field_name('parameters')
+            return (parameters is not None and len(parameters.named_children) == 2
+                    and txt(parameters.named_children[1]) == name)
+        return False
 
     def declarations(tree):
         for node in walk(tree.root_node):
@@ -275,7 +286,7 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
             elif node.type == ('declaration' if prototype else 'function_definition'):
                 declaration = node.child_by_field_name('declarator')
                 if (declaration is not None and (not prototype or declaration.type == 'function_declarator')
-                        and declarator_name(declaration) == name):
+                        and matches(declaration)):
                     yield node
 
     # Work in UTF-8 byte offsets, as used by Tree-sitter's nodes.
@@ -286,7 +297,7 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
     for node in before_declarations:
         first = bisect_right(old_lines, node.start_byte)
         last = bisect_right(old_lines, node.end_byte - 1)
-        if first <= start <= end <= last or prototype and first <= end and start <= last:
+        if first <= start <= end <= last or (prototype or test_mapping) and first <= end and start <= last:
             old.append(node)
     if len(old) != 1:
         return None, 'C++ equivalent repair needs a uniquely named declaration enclosing the pinned edit region'
@@ -298,6 +309,8 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
         fixed = after_declarations
     if len(fixed) != 1:
         return None, 'C++ candidate does not retain a uniquely matching declaration'
+    start = max(start, bisect_right(old_lines, old[0].start_byte))
+    end = min(end, bisect_right(old_lines, old[0].end_byte - 1))
     changed_rows = [row for hunk in hunks for first, last, rows in change_blocks(hunk['patch'])
                     if start <= first <= last <= end for row in rows]
     added = {row['new_line'] for row in changed_rows if row['marker'] == '+'}
@@ -318,6 +331,11 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
     new_counts = Counter(map(compact, new_nodes))
     added_lines = sorted({line for node in new_nodes if new_counts[compact(node)] > old_counts[compact(node)]
                           for line in (bisect_right(new_lines, node.start_byte),) if line in added})
+    if test_mapping:
+        added_lines = sorted(added.intersection({line for node in new_nodes
+                             if new_counts[compact(node)] > old_counts[compact(node)]
+                             for line in range(bisect_right(new_lines, node.start_byte),
+                                               bisect_right(new_lines, node.end_byte - 1) + 1)}))
     removed_lines = sorted({
         first for node in old_nodes if old_counts[compact(node)] > new_counts[compact(node)]
         for first in (bisect_right(old_lines, node.start_byte),)
@@ -335,9 +353,9 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
         return None, 'C++ equivalent repair needs a changed statement or field, or a signature change, in its mapped declaration'
     baseline_excerpt = {'first_line': bisect_right(old_lines, old[0].start_byte), 'excerpt': txt(old[0])}
     candidate_excerpt = {'first_line': bisect_right(new_lines, fixed[0].start_byte), 'excerpt': txt(fixed[0])}
-    if field_mapping and added_lines:
-        # The parser proves the record identity. Keep the field neighborhood
-        # alongside the pinned writer and reader for review.
+    if (field_mapping or test_mapping) and added_lines:
+        # The parser proves the named declaration. Keep the mapped neighborhood
+        # and send the complete scoped change hunks alongside it.
         first = max(candidate_excerpt['first_line'], added_lines[0] - 2)
         last = min(bisect_right(new_lines, fixed[0].end_byte - 1), added_lines[-1] + 2)
         baseline_excerpt = {'first_line': start, 'excerpt': '\n'.join(baseline.splitlines()[start - 1:end])}
@@ -347,6 +365,7 @@ def _cpp_equivalent_evidence(agent, path, hunks, region):
             'changed_field_lines': added_lines if field_mapping else [],
             'changed_signature_lines': signature_lines,
             'removed_baseline_lines': removed_lines,
+            **({'verification_role': 'test'} if test_mapping else {}),
             'baseline': baseline_excerpt, 'candidate': candidate_excerpt,
             'target_fault': impact['causal_chain']['target_fault_state'],
             'target_evidence': [entry for entry in impact['evidence'] if entry['revision'] == 'target']}, None
@@ -458,7 +477,8 @@ def collect_regions(agent, claims, candidate_patch):
                 row['error'] = error
                 continue
             request.update(detail)
-            if len(requests) >= 8 or len(json.dumps(request, ensure_ascii=False).encode()) > MAX_CONTEXT:
+            region_limit = 16 if cpp_equivalent else 8
+            if len(requests) >= region_limit or len(json.dumps(request, ensure_ascii=False).encode()) > MAX_CONTEXT:
                 row['error'] = 'mapped coverage proof exceeds its bounded source window'
                 continue
             row.update(coverage_request=request['id'], coverage_kind=detail['kind'],
@@ -546,6 +566,8 @@ producer and consumer. Follow the related edits to verify both.
 For each C++ region, context_index selects the 1-based entry in shared_cpp_context.
 Read that entry's target_evidence, invariant and donor_patch. For a repair spanning functions,
 read the 1-based related_hunk_indices in the top-level related_candidate_hunks list.
+For verification_role=test, verify that the setup and assertions exercise the intended behavior.
+Establish the security invariant from production changes.
 For an UNRESOLVED C++ region,
 return needed_target_citations only if fixing it requires changing code outside the current
 edit scope. Give 1-based indices in target_evidence for the actual state producer, consumer

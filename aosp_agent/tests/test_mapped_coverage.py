@@ -183,6 +183,22 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                         self.assertIsNone(detail)
                         self.assertIn('uniquely matching declaration', error)
 
+    def test_cpp_gtest_region_credits_a_changed_argument_in_the_named_case(self):
+        from aosp_agent.mapped_coverage import _cpp_equivalent_evidence
+        before = 'TEST_F(PortTest, MissingRegistration) {\n  EXPECT_EQ(open(\n      0), denied);\n}\n'
+        after = before.replace('      0)', '      missing)')
+        region = {'symbol': 'MissingRegistration', 'line_start': 2, 'line_end': 3, 'relationship': 'test'}
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = 'port_test.cc'
+            (root / path).write_text(after)
+            agent = SimpleNamespace(worktree=root, _artifact_baseline_text=lambda _: before,
+                record={'assessment': {'evidence': [], 'causal_chain': {'target_fault_state': 'Missing registration.'}}})
+            proof, error = _cpp_equivalent_evidence(agent, path, split_hunks(diff(path, before, after)), region)
+            self.assertIsNone(error)
+            self.assertEqual(proof['added_executable_lines'], [3])
+            self.assertEqual(proof['verification_role'], 'test')
+
 
 class MappedCoverageTest(unittest.TestCase):
     def check(self, before, after, review, *, symbol='sink', bounds=None, relationship='same_function'):
