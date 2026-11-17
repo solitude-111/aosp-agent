@@ -36,9 +36,12 @@ class CppEquivalentCoverageTest(unittest.TestCase):
         hunk = split_hunks(donor)[0]
         region = {'path': 'repo/' + path, 'symbol': 'connect', 'line_start': 1, 'line_end': 3,
                   'action': 'edit', 'relationship': 'same_function', 'reason': 'Old connection path.'}
+        dependency = {**region, 'path': 'repo/store.cc', 'symbol': 'attach_shared_state',
+                      'line_end': 2, 'action': 'read_dependency', 'relationship': 'dependency'}
+        store = 'void attach_shared_state() {\n  write_global_state();\n}\n'
         unit = {'id': hunk['id'], 'status': 'AFFECTED', 'invariant': 'Keep state connection-specific.',
-                'targets': [region]}
-        for mode in ('covered', 'unresolved', 'bad_citation', 'comment_only'):
+                'targets': [region, dependency]}
+        for mode in ('covered', 'unresolved', 'remap', 'bad_scope_citation', 'bad_citation', 'comment_only'):
             with self.subTest(mode=mode), TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 after = before.replace('  attach_shared_state();',
@@ -46,17 +49,25 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                     else '  attach_private_state();')
                 (root / path).write_text(after)
                 candidate = diff(path, before, after)
-                verdict = 'UNRESOLVED' if mode == 'unresolved' else 'COVERED'
+                verdict = 'UNRESOLVED' if mode in ('unresolved', 'remap', 'bad_scope_citation') else 'COVERED'
                 review = {'regions': [{'id': hunk['id'] + ':1', 'verdict': verdict,
                     'reason': 'State effect must be established from source.',
                     'candidate_lines': [] if verdict == 'UNRESOLVED' else
                                        [1 if mode == 'bad_citation' else 2]}]}
+                if mode in ('remap', 'bad_scope_citation'):
+                    review['regions'][0]['needed_target_citations'] = [1, 2, 3]
                 runtime = QueueRuntime([(review, None)])
                 agent = object.__new__(AospBackportAgent)
                 agent.record = {'required_affected_units': [hunk['id']], 'assessment': {
                     'scope_contract': {'representation_change': 'equivalent_representation'},
                     'causal_chain': {'target_fault_state': 'The old connection uses shared state.'},
-                    'evidence': []}}
+                    'evidence': [
+                        {'revision': 'target', 'path': 'repo/store.cc', 'line_start': 2,
+                         'line_end': 3, 'excerpt': '\n'.join(store.splitlines()[1:])
+                         if mode != 'bad_scope_citation' else 'incorrect quote'},
+                        {'revision': 'target', 'path': path, 'line_start': 2,
+                         'line_end': 2, 'excerpt': before.splitlines()[1]},
+                    ]}}
                 agent.case = SimpleNamespace(files=(path,))
                 agent._current_hunks = [hunk]
                 agent.worktree = agent.run_dir = root
@@ -64,7 +75,7 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                     [SimpleNamespace(key='repo', head='pinned')], [hunk], {})
                 agent.mapping_repository = 'repo'
                 agent._target_baseline_lines = lambda p: before.splitlines()
-                agent._artifact_baseline_text = lambda p: before
+                agent._artifact_baseline_text = lambda p: store if p == 'store.cc' else before
                 agent.runtime_factory = runtime.factory
                 agent.model = agent.model_provider = None
                 agent.turn_timeout = 10
@@ -75,6 +86,10 @@ class CppEquivalentCoverageTest(unittest.TestCase):
                 ledger = agent._check_hunk_results(f'HUNK-RESULT {hunk["id"]} implemented substitute',
                                                    [path], candidate, review_mapped=True)
                 self.assertEqual(ledger['ok'], mode == 'covered', ledger['feedback'])
+                result = ledger['claims'][0]['target_evidence']['regions'][0]
+                hints = result.get('reconsider_locations', [])
+                self.assertEqual([h['path'] for h in hints], ['repo/store.cc'] if mode == 'remap' else [])
+                self.assertEqual(agent.mapping_plan.files('repo'), (path,))
                 self.assertEqual(len(runtime.calls), 0 if mode == 'comment_only' else 1)
                 if runtime.calls:
                     self.assertTrue(runtime.calls[0]['read_only'])

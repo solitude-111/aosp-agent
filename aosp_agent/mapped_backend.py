@@ -157,6 +157,9 @@ def run_backends(controller, assessment, *, verify, max_attempts, impact_only, m
                     if region['ok'] or not mapping:
                         continue
                     blockers = controller.record.setdefault('coverage_blockers', [])
+                    for location in region.get('reconsider_locations', []):
+                        if len(blockers) < 16 and location not in blockers:
+                            blockers.append(location)
                     if len(blockers) < 16:
                         blockers.append({'unit_id': claim['id'], 'path': f"{key}/{mapping['path']}",
                             'line_start': mapping['line_start'], 'line_end': mapping['line_end'],

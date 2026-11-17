@@ -51,6 +51,15 @@ class BackendEditSelectionError(AssessmentError):
         self.diagnostic = {'category': self.kind, 'path': path, 'message': message}
 
 
+class BackendLocationGap(AssessmentError):
+    def __init__(self, unit_id, targets):
+        super().__init__('backend edit exceeds grounded location scope: ' + unit_id)
+        self.gaps = [{'unit_id': unit_id, **{field: target[field] for field in
+                     ('path', 'line_start', 'line_end', 'symbol')},
+                     'error': 'The edit plan needs a location currently grounded for reading only.'}
+                     for target in targets]
+
+
 def backend_scope_feedback(record, location, handoff, targets):
     """Admit only a selection-only retry bound to the same checked location/pins."""
     from .assessment_repair import digest
@@ -359,8 +368,9 @@ def select_edits(location, response):
                                                 pointer + f'/target_indices/{index}')
         if len(indices) != len(set(indices)):
             raise BackendEditSelectionError('edits require unique target indices', pointer + '/target_indices')
-        if any(targets[i - 1]['action'] != 'edit' for i in indices):
-            raise AssessmentError('backend edit exceeds grounded location scope: ' + ident)
+        read_targets = [targets[i - 1] for i in indices if targets[i - 1]['action'] != 'edit']
+        if read_targets:
+            raise BackendLocationGap(ident, read_targets)
         selected[ident] = set(indices)
     writable = set()
     for ident, row in units.items():
@@ -457,6 +467,10 @@ search result or a timed-out read cannot establish absence.
 Check all relevant donor changes, including read-only support.
 After an AFFECTED decision, select the edits with 1-based target_indices within
 each unit. Use donor unit IDs in edits, and select only candidate edit locations.
+Check that the selected regions can change the confirmed fault. For a shared-state
+fault, check where the target stores and consumes that state before selecting edits.
+If the needed change is in a read-only location, identify the unit, path and range
+in location_gaps so the location checker can reconsider it.
 List location_gaps only for missing required edit locations. For a missing project, return repository_requests
 with pinned evidence, and keep impact UNKNOWN if that dependency is required for
 the causal conclusion. The repair_obligations IDs come only from the Guarded obligations list
@@ -575,6 +589,10 @@ name the permitted boundary; the wider quoted range is context.
                     'targets': location['targets'], 'location_digest': digest(controller.grounded_location),
                     'report': {key: deepcopy(response[key]) for key in EDIT_FIELDS}}
                 controller.record['replan_required'] = 'BACKEND_SCOPE_CORRECTION_REQUIRED'
+            return self.unresolved(child, 'MIGRATION_SCOPE_UNRESOLVED', str(exc))
+        except BackendLocationGap as exc:
+            controller.record.setdefault('location_gaps', []).extend(exc.gaps)
+            controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'
             return self.unresolved(child, 'MIGRATION_SCOPE_UNRESOLVED', str(exc))
         except AssessmentError as exc:
             controller.record['replan_required'] = 'LOCATION_SCOPE_UNRESOLVED'

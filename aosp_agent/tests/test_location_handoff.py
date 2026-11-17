@@ -344,6 +344,22 @@ class LocationHandoffTest(unittest.TestCase):
             self.assertFalse(outcome.get('patches'))
             self.assertTrue(all(call['read_only'] for call in calls))
 
+    def test_selected_read_dependency_reaches_location_replan_with_pinned_coordinates(self):
+        with GitFixture() as fx:
+            located = location()
+            target = located['units'][0]['targets'][0]
+            target['action'] = 'read_dependency'
+            response = impact_reply(fx, 'AFFECTED', [{'unit_id': 'f001-h001', 'target_indices': [1]}])
+            outcome, calls, _ = self.execute(fx, response, located=located)
+            self.assertEqual(outcome['impact_decision'], 'AFFECTED')
+            self.assertFalse(outcome.get('patches'))
+            self.assertTrue(all(call['read_only'] for call in calls))
+            gap, = outcome['location_gaps']
+            self.assertEqual(gap['unit_id'], 'f001-h001')
+            self.assertEqual(gap['path'], target['path'])
+            self.assertEqual((gap['line_start'], gap['line_end']),
+                             (target['line_start'], target['line_end']))
+
     def test_candidate_cannot_claim_confirmed_fault_needs_no_patch(self):
         with GitFixture() as fx:
             response = impact_reply(fx, 'AFFECTED', [{'unit_id': 'f001-h001', 'target_indices': [1]}])

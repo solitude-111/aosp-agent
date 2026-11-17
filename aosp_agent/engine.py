@@ -1765,6 +1765,10 @@ class AospBackportAgent(CausalityChecks):
                         "status": "NOT_RUN", "blocked_by": "HUNK_LEDGER",
                         "patch_sha256": self.record["patch_sha256"], "commands": []}
                     self.record["final_verification"] = self.record["attempt_verifications"][str(attempt)]
+                    if handoff and any(region.get('reconsider_locations')
+                            for claim in claims['claims']
+                            for region in claim.get('target_evidence', {}).get('regions', [])):
+                        return  # Further edits need a new, grounded write scope.
                     claim_feedback = claims["feedback"]
                     diagnosis_json = None
                     obligation_review = self.record.get('repair_obligation_review')

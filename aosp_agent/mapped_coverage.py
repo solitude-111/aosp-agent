@@ -1,4 +1,4 @@
-"""Candidate-side proof for Java mappings whose donor spelling does not survive."""
+"""Candidate-side proof for mappings whose donor spelling does not survive."""
 from bisect import bisect_right
 from collections import Counter
 import hashlib
@@ -12,7 +12,7 @@ from .engine import AssessmentError
 from .git_policy import OFFLINE_GIT_ENV
 from .hunk_scope import change_blocks
 from .java_regions import JavaSource, TYPES, TYPE_DECLARATIONS, mapped_name, method_name, owner as _owner
-from .mapping_plan import _shape
+from .mapping_plan import _excerpt, _shape
 from .patches import split_hunks
 
 
@@ -21,6 +21,7 @@ REVIEW_SCHEMA = obj({'regions': array(obj({
     'candidate_lines': array(LINE),
 }))})
 REVIEW_SCHEMA['properties']['regions']['items']['properties']['state_evidence'] = array(LINE)
+REVIEW_SCHEMA['properties']['regions']['items']['properties']['needed_target_citations'] = array(LINE)
 MAX_CONTEXT = 48 * 1024
 STATEMENTS = {'if_statement', 'return_statement', 'throw_statement',
               'expression_statement', 'local_variable_declaration'}
@@ -312,7 +313,8 @@ def collect_regions(agent, claims, candidate_patch):
             candidate_hunks = [h for h in hunks if h['path'] == path]
             tracked = getattr(agent, 'record', {})
             cpp_equivalent = (
-                Path(path).suffix in ('.cc', '.cpp', '.cxx') and region['relationship'] == 'same_function'
+                Path(path).suffix in ('.cc', '.cpp', '.cxx')
+                and region['relationship'] in ('same_function', 'caller', 'dependency')
                 and claim['id'] in tracked.get('required_affected_units', ())
                 and tracked.get('assessment', {}).get('scope_contract', {}).get('representation_change')
                 == 'equivalent_representation'
@@ -327,6 +329,16 @@ def collect_regions(agent, claims, candidate_patch):
                 before, after, blocks = cache[path]
             if cpp_equivalent:
                 detail, error = _cpp_equivalent_evidence(agent, path, candidate_hunks, region)
+                if detail:
+                    # Show other changed portions of this unit's admitted
+                    # implementation so the reviewer can follow cross-file flow.
+                    detail['related_candidate_hunks'] = [
+                        {'path': hunk['path'], 'patch': hunk['patch']} for hunk in hunks
+                        if any(peer != region and hunk['path'] == peer['path']
+                               and any(peer['line_start'] <= first <= last <= peer['line_end']
+                                       for first, last, _ in change_blocks(hunk['patch']))
+                               for peer in mappings)
+                    ]
             elif region.get('region_kind') == 'imports':
                 detail, error = _import_evidence(before, after, [h for h in hunks if h['path'] == path],
                                                  region, donors[claim['id']]['patch'])
@@ -400,6 +412,11 @@ lifetime, the ordering of producers and consumers, overlapping calls and alterna
 A change that only clears a shared key or leaves the old behavior reachable is not sufficient.
 When the supplied source does not establish the effect, use UNRESOLVED and identify the missing
 implementation, path or ordering. For COVERED cite changed added_executable_lines as for direct_edit.
+Use related_candidate_hunks when a C++ repair spans functions. For an UNRESOLVED C++ region,
+return needed_target_citations only if fixing it requires changing code outside the current
+edit scope. Give 1-based indices in target_evidence for the actual state producer, consumer
+or other required edit site. A useful read or a missing excerpt alone is no reason to request
+write scope. Explain why the current scope cannot implement the invariant.
 For import_edit, compare every donor import change with the actual added/removed declarations.
 Confirm any different import binds the API needed by the target repair. Unrelated declarations
 do not count. For COVERED cite the first_line of every listed added import, or an empty list for
@@ -475,6 +492,46 @@ Controller evidence:\n''' + payload + ('\n' + extra if contract else '\nUse the 
     return review
 
 
+def _reconsider_locations(agent, unit_id, request, result):
+    """Route a cited, grounded read dependency back to the location checker."""
+    if request['kind'] != 'cpp_equivalent_direct_edit' or result['verdict'] != 'UNRESOLVED':
+        return []
+    evidence = request['target_evidence']
+    mappings = agent.mapping_plan.targets(agent.mapping_repository, unit_id=unit_id)
+    prefix = agent.mapping_repository + '/'
+    locations = []
+    for index in dict.fromkeys(result.get('needed_target_citations', [])):
+        if not 1 <= index <= len(evidence):
+            continue
+        citation = evidence[index - 1]
+        path = citation['path'].removeprefix(prefix)
+        start, end = citation['line_start'], citation['line_end']
+        if any(m['path'] == path and m['action'] == 'edit'
+               and m['line_start'] <= end and start <= m['line_end'] for m in mappings):
+            continue
+        for m in mappings:
+            if (m['action'] == 'read_dependency' and m['path'] == path
+                    and m['line_start'] <= end and start <= m['line_end']):
+                # The impact excerpt can extend past the read anchor. Verify
+                # the whole citation at the pin before returning it to location.
+                baseline = agent._artifact_baseline_text(path)
+                if baseline is None:
+                    break
+                try:
+                    _excerpt(baseline.splitlines(), citation)
+                except AssessmentError:
+                    break
+                location = {'unit_id': unit_id, 'path': prefix + path, 'symbol': m['symbol'],
+                            'line_start': start, 'line_end': end, 'excerpt': citation['excerpt'],
+                            'error': 'Recheck required edit scope: ' + result['reason'][:500]}
+                if location not in locations:
+                    locations.append(location)
+                break
+        if len(locations) == 4:
+            break
+    return locations
+
+
 def review_regions(agent, claims, candidate_patch):
     pending = [claim for claim in claims if claim.get('target_evidence', {}).get('ok') is False]
     if not candidate_patch or not agent.mapping_plan:
@@ -494,6 +551,7 @@ def review_regions(agent, claims, candidate_patch):
         if contract:
             agent.record['repair_obligation_review'] = {'status': 'UNRESOLVED', 'error': str(exc)}
         return
+    by_id = {request['id']: request for request in requests}
     for row in rows:
         result = review.get(row['coverage_request'])
         if result is None:
@@ -501,6 +559,10 @@ def review_regions(agent, claims, candidate_patch):
         else:
             row['review'] = result
             row.update(ok=result['verdict'] == 'COVERED', error=None if result['verdict'] == 'COVERED' else result['reason'])
+            locations = _reconsider_locations(agent, row['coverage_request'].split(':', 1)[0],
+                                               by_id[row['coverage_request']], result)
+            if locations:
+                row['reconsider_locations'] = locations
     for claim in pending:
         evidence = claim['target_evidence']
         if evidence.get('regions') and all(r['ok'] for r in evidence['regions']):
